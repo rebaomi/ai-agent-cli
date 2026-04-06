@@ -82,33 +82,47 @@ You can help with:
 - Debugging issues
 - Writing tests and documentation
 
-## Tool Usage Guidelines
-When the user asks you to:
-- "read", "show", "display" a file → use read_file tool
-- "write", "create", "save" a file → use write_file tool
-- "edit", "modify", "change" code → use edit_file tool
-- "delete", "remove" a file → use delete_file tool
-- "list", "show files in" a directory → use list_directory tool
-- "find", "search" for files → use search_files or glob tool
-- "run", "execute", "build" a command → use execute_command tool
-- "create folder", "make directory" → use create_directory tool
+## Tool Usage (IMPORTANT - Read Carefully)
 
-## Response Style
-- Be concise but thorough
-- Show code with syntax highlighting in markdown
-- Explain what you're doing before doing it
-- If something fails, explain why and suggest alternatives
-- Ask clarifying questions if the request is ambiguous
+When you need to use a tool, you MUST respond with this EXACT format:
 
-## Important Rules
-1. ALWAYS use tools when the task requires file operations or command execution
-2. Prefer built-in tools over execute_command for file operations
-3. Be careful with delete_file - it cannot be undone
-4. When editing files, be precise with old_string to ensure exact match
-5. If a tool fails, try to understand why and suggest solutions
+\`\`\`
+<tool_call>
+{"name": "tool_name", "arguments": {"param1": "value1", "param2": "value2"}}
+</tool_call>
+\`\`\`
 
-## Workspace Context
-You are working in a development environment. Keep track of the files you create and modify.`;
+For example:
+- To read a file: <tool_call>{"name": "read_file", "arguments": {"path": "src/index.ts"}}</tool_call>
+- To list directory: <tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>
+- To run command: <tool_call>{"name": "execute_command", "arguments": {"command": "npm install"}}</tool_call>
+
+## Available Tools
+- read_file(path) - Read file contents
+- write_file(path, content) - Write content to file
+- edit_file(path, old_string, new_string) - Edit file
+- delete_file(path) - Delete file
+- list_directory(path) - List directory contents
+- create_directory(path) - Create directory
+- search_files(path, pattern, content) - Search files
+- glob(pattern, cwd) - Find files by pattern
+- execute_command(command) - Execute shell command
+- read_multiple_files(paths) - Read multiple files
+
+## Response Rules
+1. FIRST decide if you need to use a tool
+2. If yes, respond ONLY with the <tool_call> block, nothing else
+3. After seeing the tool result, provide your response
+4. NEVER use markdown code blocks for tool calls - use <tool_call> tags
+5. Be concise and helpful
+
+## Workflow Example
+User: "Read the package.json file"
+You: <tool_call>{"name": "read_file", "arguments": {"path": "package.json"}}</tool_call>
+
+[You receive result]
+
+You: "Here's the content of package.json..."`;
   }
 
   async chat(input: string): Promise<string> {
@@ -135,22 +149,26 @@ You are working in a development environment. Keep track of the files you create
       try {
         const stream = this.ollama.chatStream(allMessages);
         let accumulatedContent = '';
-        let toolCalls: ToolCall[] | undefined;
 
         for await (const chunk of stream) {
           accumulatedContent += chunk.content;
-          if (chunk.toolCalls) {
-            toolCalls = chunk.toolCalls;
-          }
           this.onEvent?.({ type: 'response', content: chunk.content });
         }
 
         fullResponse = accumulatedContent;
 
-        if (toolCalls && toolCalls.length > 0) {
-          this.messages.push({ role: 'assistant', content: fullResponse, tool_calls: toolCalls });
+        const parsedToolCalls = this.parseToolCalls(fullResponse);
 
-          for (const toolCall of toolCalls) {
+        if (parsedToolCalls.length > 0) {
+          let cleanResponse = fullResponse
+            .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+            .trim();
+
+          if (cleanResponse) {
+            this.messages.push({ role: 'assistant', content: cleanResponse });
+          }
+
+          for (const toolCall of parsedToolCalls) {
             this.onEvent?.({
               type: 'tool_call',
               content: `Calling tool: ${toolCall.function.name}`,
@@ -223,6 +241,34 @@ You are working in a development environment. Keep track of the files you create
     }
 
     return this.builtInTools.executeTool(name, args);
+  }
+
+  private parseToolCalls(content: string): ToolCall[] {
+    const toolCalls: ToolCall[] = [];
+    const regex = /<tool_call>\s*({[\s\S]*?})\s*<\/tool_call>/gi;
+    let match;
+
+    while ((match = regex.exec(content)) !== null) {
+      try {
+        const jsonStr = match[1];
+        if (!jsonStr) continue;
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.name && parsed.arguments) {
+          toolCalls.push({
+            id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            type: 'function',
+            function: {
+              name: parsed.name,
+              arguments: JSON.stringify(parsed.arguments),
+            },
+          });
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return toolCalls;
   }
 
   getMessages(): Message[] {
