@@ -85,16 +85,24 @@ npm run dev       # 开发模式
 
 ### 配置
 
-在 `~/.ai-agent-cli/config.yaml` 创建配置文件：
+首次使用会自动创建默认配置。如需自定义，编辑 `~/.ai-agent-cli/config.yaml`：
 
 ```yaml
 ollama:
   baseUrl: http://localhost:11434
   model: qwen3.5:9b  # 选择你的模型
   temperature: 0.7
+  maxTokens: 4096
+
+workspace: .
+maxIterations: 100
+
+sandbox:
+  enabled: true
+  timeout: 30000
 ```
 
-> 注意：首次使用需要先启动 Ollama 服务 `ollama serve` 并下载模型 `ollama pull qwen3.5:9b`
+> 配置文件示例：`config/example.yaml`
 
 ### 命令
 
@@ -921,16 +929,24 @@ npm run dev       # development mode
 
 ### Configuration
 
-Create `~/.ai-agent-cli/config.yaml`:
+Default config is created automatically. To customize, edit `~/.ai-agent-cli/config.yaml`:
 
 ```yaml
 ollama:
   baseUrl: http://localhost:11434
   model: qwen3.5:9b
   temperature: 0.7
+  maxTokens: 4096
+
+workspace: .
+maxIterations: 100
+
+sandbox:
+  enabled: true
+  timeout: 30000
 ```
 
-> Note: Start Ollama service first with `ollama serve` and download models with `ollama pull qwen3.5:9b`
+> Example config: `config/example.yaml`
 
 ### Commands
 
