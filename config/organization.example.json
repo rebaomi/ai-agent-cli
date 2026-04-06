@@ -1,0 +1,76 @@
+{
+  "name": "AI开发团队",
+  "description": "模仿企业组织架构的多Agent协作系统",
+  "agents": [
+    {
+      "id": "orchestrator_1",
+      "name": "产品经理",
+      "role": "orchestrator",
+      "description": "任务分解专家，负责分析需求并拆分成可执行的子任务",
+      "status": "idle",
+      "capabilities": ["需求分析", "任务分解", "优先级排序"]
+    },
+    {
+      "id": "dispatcher_1",
+      "name": "项目经理",
+      "role": "dispatcher",
+      "description": "任务分派专家，负责将子任务分配给最合适的执行者",
+      "status": "idle",
+      "capabilities": ["资源分配", "任务调度", "团队协调"]
+    },
+    {
+      "id": "executor_1",
+      "name": "高级工程师",
+      "role": "executor",
+      "description": "后端开发专家，负责服务器端任务执行",
+      "status": "idle",
+      "capabilities": ["后端开发", "API设计", "数据库"]
+    },
+    {
+      "id": "executor_2",
+      "name": "前端工程师",
+      "role": "executor",
+      "description": "前端开发专家，负责界面和交互任务",
+      "status": "idle",
+      "capabilities": ["前端开发", "UI设计", "用户体验"]
+    },
+    {
+      "id": "executor_3",
+      "name": "全栈工程师",
+      "role": "executor",
+      "description": "全栈开发专家，处理综合性任务",
+      "status": "idle",
+      "capabilities": ["全栈开发", "DevOps", "测试"]
+    },
+    {
+      "id": "supervisor_1",
+      "name": "技术总监",
+      "role": "supervisor",
+      "description": "决策监督专家，负责监督任务执行并在必要时干预",
+      "status": "idle",
+      "capabilities": ["技术决策", "代码审查", "架构设计"]
+    },
+    {
+      "id": "tester_1",
+      "name": "测试工程师",
+      "role": "tester",
+      "description": "验收测试专家，负责验证任务结果的正确性和质量",
+      "status": "idle",
+      "capabilities": ["功能测试", "性能测试", "质量把控"]
+    },
+    {
+      "id": "fallback_1",
+      "name": "技术顾问",
+      "role": "fallback",
+      "description": "备用专家，当主流程失败时提供备选方案",
+      "status": "idle",
+      "capabilities": ["问题诊断", "方案设计", "风险评估"]
+    }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "dispatcher", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true
+  }
+}

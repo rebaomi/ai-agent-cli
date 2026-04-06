@@ -1,0 +1,37 @@
+# 组织架构配置文件
+# 保存为 ~/.ai-agent-cli/organization.json
+
+{
+  "name": "你的团队名称",
+  "description": "团队描述",
+  
+  "agents": [
+    {
+      "id": "agent_1",
+      "name": "角色名称",
+      "role": "orchestrator|dispatcher|executor|supervisor|tester|fallback",
+      "description": "角色描述",
+      "status": "idle",
+      "capabilities": ["能力1", "能力2"]
+    }
+  ],
+  
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "dispatcher", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true
+  }
+}
+
+# 角色说明：
+# - orchestrator: 任务分解专家
+# - dispatcher: 任务分派专家
+# - executor: 任务执行专家
+# - supervisor: 决策监督专家
+# - tester: 验收测试专家
+# - fallback: 备用专家
+
+# workflow.defaultFlow 定义工作流程顺序
+# autoSupervise: 启用监督
+# allowFallback: 允许失败时使用备用方案

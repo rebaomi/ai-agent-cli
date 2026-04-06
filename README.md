@@ -20,6 +20,7 @@
 - 🌊 **流式输出** - AI 回复逐字显示，打字机效果
 - ⚡ **智能工具调用** - AI 自动调用合适工具完成任务
 - 📊 **任务规划器** - 复杂任务自动拆分成步骤执行，逐步完成
+- 🏢 **多 Agent 组织架构** - 模拟企业团队协作，多角色 Agent 协同工作
 
 ### 安装
 
@@ -68,6 +69,7 @@ ollama:
 | `/tools` | 列出可用工具 |
 | `/config` | 显示配置 |
 | `/skill` | 管理 Skills |
+| `/org` | 管理组织架构/团队 |
 | `/mcp` | 管理 MCP 服务器 |
 | `/sessions` | 查看历史会话 |
 | `/load <id>` | 加载历史会话 |
@@ -153,6 +155,84 @@ AI：自动调用 fetch_url 工具抓取网页
 ```
 用户：搜索我的笔记库中关于 "学习方法" 的笔记
 AI：自动调用 Obsidian 搜索工具
+```
+
+### 多 Agent 组织架构
+
+coolAI 支持多 Agent 协作系统，模拟企业团队的工作方式。用户可以定义不同的角色（产品经理、项目经理、工程师、测试等），让它们协同完成复杂任务。
+
+#### 角色说明
+
+| 角色 | 说明 |
+|------|------|
+| `orchestrator` | 任务分解专家，分析需求并拆分成子任务 |
+| `dispatcher` | 任务分派专家，将任务分配给最合适的执行者 |
+| `executor` | 任务执行专家，负责具体执行任务 |
+| `supervisor` | 决策监督专家，监督执行并在必要时干预 |
+| `tester` | 验收测试专家，验证结果质量 |
+| `fallback` | 备用专家，提供备选方案 |
+
+#### 快速开始
+
+```bash
+# 在 CLI 中加载默认组织架构
+/org load
+
+# 查看组织结构
+/org view
+
+# 启用组织模式
+/org mode on
+
+# 查看工作流程
+/org workflow
+```
+
+#### 自定义组织架构
+
+编辑 `~/.ai-agent-cli/organization.json` 配置文件：
+
+```json
+{
+  "name": "AI开发团队",
+  "agents": [
+    { "id": "pm_1", "name": "产品经理", "role": "orchestrator" },
+    { "id": "tl_1", "name": "项目经理", "role": "dispatcher" },
+    { "id": "dev_1", "name": "后端工程师", "role": "executor" },
+    { "id": "qa_1", "name": "测试工程师", "role": "tester" }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "dispatcher", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true
+  }
+}
+```
+
+#### 组织模式示例
+
+```
+用户：帮我完成这个项目：1) 创建 API 2) 编写前端 3) 写测试
+
+🏢 组织模式激活
+✓ 产品经理 (orchestrator) 已就绪
+✓ 项目经理 (dispatcher) 已就绪
+✓ 后端工程师 (executor) 已就绪
+✓ 测试工程师 (tester) 已就绪
+
+🔄 产品经理 分析任务中...
+   任务已分解为 3 个子任务
+
+🔄 项目经理 分配任务中...
+   后端工程师 → 创建 API
+   后端工程师 → 编写前端
+   测试工程师 → 编写测试
+
+🔄 后端工程师 执行中...
+🔄 测试工程师 验收中...
+
+✅ 任务完成！
 ```
 
 ### 安装 Ollama 模型
@@ -452,6 +532,7 @@ An intelligent coding assistant CLI tool powered by Ollama, with support for MCP
 - 🌊 **Streaming Output** - Typewriter effect for AI responses
 - ⚡ **Smart Tool Calling** - AI automatically calls appropriate tools to complete tasks
 - 📊 **Task Planner** - Complex tasks automatically split into steps for sequential execution
+- 🏢 **Multi-Agent Organization** - Simulate enterprise team collaboration with multiple agent roles
 
 ### Installation
 
@@ -498,6 +579,7 @@ ollama:
 | `/tools` | List available tools |
 | `/config` | Show configuration |
 | `/skill` | Manage Skills |
+| `/org` | Manage organization/team |
 | `/mcp` | Manage MCP servers |
 | `/sessions` | List conversation sessions |
 | `/load <id>` | Load a previous session |
@@ -559,6 +641,59 @@ With Obsidian MCP configured:
 ```
 User: Search my notes about "learning methods"
 AI: Automatically calls Obsidian search tool
+```
+
+### Multi-Agent Organization
+
+coolAI supports multi-agent collaboration system that simulates enterprise team workflows. You can define different roles (product manager, project manager, engineers, QA, etc.) and let them work together on complex tasks.
+
+#### Role Descriptions
+
+| Role | Description |
+|------|-------------|
+| `orchestrator` | Task decomposition expert, analyzes requirements and splits into subtasks |
+| `dispatcher` | Task distribution expert, assigns tasks to the most suitable executor |
+| `executor` | Task execution expert, responsible for executing tasks |
+| `supervisor` | Decision supervision expert, monitors execution and intervenes when necessary |
+| `tester` | Acceptance testing expert, verifies result quality |
+| `fallback` | Backup specialist, provides alternative solutions |
+
+#### Quick Start
+
+```bash
+# Load default organization in CLI
+/org load
+
+# View organization structure
+/org view
+
+# Enable organization mode
+/org mode on
+
+# View workflow
+/org workflow
+```
+
+#### Custom Organization
+
+Edit `~/.ai-agent-cli/organization.json` config file:
+
+```json
+{
+  "name": "AI Development Team",
+  "agents": [
+    { "id": "pm_1", "name": "Product Manager", "role": "orchestrator" },
+    { "id": "tl_1", "name": "Project Lead", "role": "dispatcher" },
+    { "id": "dev_1", "name": "Backend Engineer", "role": "executor" },
+    { "id": "qa_1", "name": "QA Engineer", "role": "tester" }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "dispatcher", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true
+  }
+}
 ```
 
 ### Skills Extension

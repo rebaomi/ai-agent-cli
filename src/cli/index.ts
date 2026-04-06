@@ -1,5 +1,8 @@
 import chalk from 'chalk';
 import { Command } from 'commander';
+import { promises as fs } from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { configManager } from '../core/config.js';
 import { createMemoryManager, MemoryManager } from '../core/memory.js';
 import { createSkillManager } from '../core/skills.js';
@@ -10,6 +13,8 @@ import { Sandbox } from '../sandbox/executor.js';
 import { BuiltInTools } from '../tools/builtin.js';
 import { Agent, createAgent } from '../core/agent.js';
 import type { AgentEvent } from '../core/agent.js';
+import { createAgentFactory, createOrganization, loadOrganization } from '../core/organization/index.js';
+import type { Organization } from '../core/organization/index.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import * as readline from 'readline';
 
@@ -34,6 +39,8 @@ export class CLI {
   private cmdHistory: string[] = [];
   private historyIndex = -1;
   private streamingOutput?: StreamingOutput;
+  private organization?: Organization;
+  private organizationMode = false;
 
   constructor() {
     this.mcpManager = new MCPManager();
@@ -231,6 +238,10 @@ export class CLI {
       case 'skills':
         await this.handleSkillCommand(args);
         break;
+      case 'org':
+      case 'team':
+        await this.handleOrgCommand(args);
+        break;
       default:
         console.log(chalk.yellow(`Unknown command: ${command}. Type /? for help.`));
     }
@@ -239,6 +250,11 @@ export class CLI {
   private async handleMessage(input: string): Promise<void> {
     this.cmdHistory.push(input);
     this.historyIndex = this.cmdHistory.length;
+
+    if (this.organizationMode && this.organization) {
+      await this.handleOrganizationMessage(input);
+      return;
+    }
 
     if (!this.ollama) {
       printError('Ollama not connected. Please check your configuration.');
@@ -296,6 +312,27 @@ export class CLI {
   private async streamResponse(text: string): Promise<void> {
     const output = createStreamingOutput({ color: 'cyan', speed: 5 });
     await output.stream(text);
+  }
+
+  private async handleOrganizationMessage(input: string): Promise<void> {
+    if (!this.organization) {
+      printError('Organization not loaded');
+      return;
+    }
+
+    console.log(chalk.cyan('\n🏢 Organization Mode Active'));
+    console.log(chalk.gray('Team: ' + this.organization.getConfig().name + '\n'));
+
+    try {
+      const response = await this.organization.processUserInput(input);
+      this.streamingOutput?.clear();
+      console.log(chalk.green('\n--- Result ---\n'));
+      await this.streamResponse(response);
+    } catch (error) {
+      printError('Organization processing failed: ' + (error instanceof Error ? error.message : String(error)));
+    }
+
+    console.log();
   }
 
   private async showSessions(): Promise<void> {
@@ -363,6 +400,7 @@ ${chalk.cyan('/load')} <id>        Load a previous session
 ${chalk.cyan('/mcp')}              Manage MCP servers
 ${chalk.cyan('/lsp')}              Manage LSP servers
 ${chalk.cyan('/skill')}            Manage skills
+${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
 `);
   }
 
@@ -548,6 +586,135 @@ ${chalk.cyan('/skill')}            Manage skills
       default:
         console.log(chalk.yellow('Usage: /skill [list|install|uninstall|enable|disable]'));
     }
+  }
+
+  private async handleOrgCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase();
+
+    switch (subcommand) {
+      case 'view':
+      case 'v':
+        this.viewOrganization();
+        break;
+      case 'load':
+        await this.loadOrganization(args[1]);
+        break;
+      case 'mode':
+        this.toggleOrganizationMode(args[1]);
+        break;
+      case 'workflow':
+      case 'w':
+        this.viewWorkflow();
+        break;
+      case 'help':
+        this.showOrgHelp();
+        break;
+      default:
+        this.showOrgHelp();
+    }
+  }
+
+  private viewOrganization(): void {
+    if (!this.organization) {
+      console.log(chalk.yellow('No organization loaded. Use /org load <config-file> to load one.'));
+      return;
+    }
+    this.organization.printOrganization();
+  }
+
+  private async loadOrganization(configPath?: string): Promise<void> {
+    if (!this.ollama) {
+      printError('Ollama not initialized');
+      return;
+    }
+
+    const defaultConfigPath = path.join(os.homedir(), '.ai-agent-cli', 'organization.json');
+    const targetPath = configPath || defaultConfigPath;
+
+    try {
+      await fs.access(targetPath);
+    } catch {
+      console.log(chalk.cyan('Creating default organization...'));
+      const examplePath = path.join(process.cwd(), 'config', 'organization.example.json');
+      try {
+        await fs.copyFile(examplePath, defaultConfigPath);
+        console.log(chalk.green(`Default organization config created at: ${defaultConfigPath}`));
+        console.log(chalk.gray('Please edit this file to customize your team structure.'));
+        return;
+      } catch {
+        printError('Failed to create default organization config');
+        return;
+      }
+    }
+
+    try {
+      const factory = createAgentFactory({
+        ollama: this.ollama,
+        mcpManager: this.mcpManager,
+        lspManager: this.lspManager,
+        sandbox: this.sandbox,
+      });
+
+      this.organization = await loadOrganization(targetPath, factory);
+      printSuccess(`Organization loaded: ${this.organization.getConfig().name}`);
+      this.organization.printOrganization();
+      this.organizationMode = true;
+    } catch (error) {
+      printError('Failed to load organization: ' + (error instanceof Error ? error.message : String(error)));
+    }
+  }
+
+  private toggleOrganizationMode(mode?: string): void {
+    if (mode === 'on') {
+      if (!this.organization) {
+        console.log(chalk.yellow('No organization loaded. Use /org load first.'));
+        return;
+      }
+      this.organizationMode = true;
+      printSuccess('Organization mode enabled');
+    } else if (mode === 'off') {
+      this.organizationMode = false;
+      printSuccess('Organization mode disabled');
+    } else {
+      const status = this.organizationMode ? chalk.green('ON') : chalk.gray('OFF');
+      console.log(chalk.bold('\nOrganization Mode:') + ` ${status}`);
+      if (this.organization) {
+        console.log(`Team: ${chalk.cyan(this.organization.getConfig().name)}`);
+        console.log(`Agents: ${this.organization.getMembers().length}`);
+      } else {
+        console.log(chalk.gray('No organization loaded.'));
+      }
+      console.log();
+      console.log(chalk.gray('Usage: /org mode [on|off]'));
+    }
+  }
+
+  private viewWorkflow(): void {
+    if (!this.organization) {
+      console.log(chalk.yellow('No organization loaded.'));
+      return;
+    }
+    this.organization.printWorkflow();
+  }
+
+  private showOrgHelp(): void {
+    console.log(`
+${chalk.bold('Organization Commands:')}
+
+${chalk.cyan('/org view')}        ${chalk.gray('Show organization structure')}
+${chalk.cyan('/org load')} [path] ${chalk.gray('Load organization config (default: ~/.ai-agent-cli/organization.json)')}
+${chalk.cyan('/org mode')} [on|off] ${chalk.gray('Enable/disable organization mode')}
+${chalk.cyan('/org workflow')}    ${chalk.gray('Show workflow configuration')}
+${chalk.cyan('/org help')}        ${chalk.gray('Show this help')}
+
+${chalk.bold('Organization Roles:')}
+  • orchestrator  ${chalk.gray('- Task decomposition expert')}
+  • dispatcher    ${chalk.gray('- Task distribution expert')}
+  • executor      ${chalk.gray('- Task execution expert')}
+  • supervisor    ${chalk.gray('- Decision supervision expert')}
+  • tester        ${chalk.gray('- Acceptance testing expert')}
+  • fallback      ${chalk.gray('- Backup specialist')}
+`);
   }
 
   async shutdown(): Promise<void> {
