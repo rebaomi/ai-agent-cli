@@ -405,21 +405,28 @@ coolAI 支持多种大模型提供商，可以同时使用多个模型：
 #### 配置示例
 
 ```yaml
-llm:
-  default: ollama
-  providers:
-    ollama:
-      enabled: true
-      baseUrl: http://localhost:11434
-      model: qwen3.5:9b
-    deepseek:
-      enabled: true
-      apiKey: your-api-key
-      model: deepseek-chat
-    kimi:
-      enabled: true
-      apiKey: your-api-key
-      model: moonshot-v1-128k
+# 默认模型（必须配置一个）
+defaultProvider: ollama
+
+# Ollama（本地模型）
+ollama:
+  enabled: true
+  baseUrl: http://localhost:11434
+  model: qwen3.5:9b
+
+# DeepSeek（云端模型）
+deepseek:
+  enabled: false
+  apiKey: your-api-key
+  model: deepseek-chat
+  baseUrl: https://api.deepseek.com
+
+# Kimi（月之暗面）
+kimi:
+  enabled: false
+  apiKey: your-api-key
+  model: moonshot-v1-8k
+  baseUrl: https://api.moonshot.cn/v1
 ```
 
 ### 多模型对比
