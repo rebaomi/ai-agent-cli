@@ -12,7 +12,8 @@
     "build": "tsc",
     "dev": "tsx watch src/cli/index.ts",
     "start": "node dist/cli/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build"
   },
   "keywords": [
     "ai",

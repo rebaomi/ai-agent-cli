@@ -3,8 +3,11 @@
 import { spawn } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { existsSync } from 'fs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 const args = process.argv.slice(2);
 
 function showBanner() {
@@ -16,16 +19,45 @@ function showBanner() {
 `);
 }
 
+function findScriptPath() {
+  const distPath = join(__dirname, '..', 'dist', 'cli', 'index.js');
+  const srcPath = join(__dirname, '..', 'src', 'cli', 'index.ts');
+  
+  if (existsSync(distPath)) {
+    return { path: distPath, isTs: false };
+  }
+  
+  if (existsSync(srcPath)) {
+    return { path: srcPath, isTs: true };
+  }
+  
+  return null;
+}
+
 if (args.length === 0 || args[0] === 'run' || args[0] === 'chat') {
   showBanner();
   
+  const scriptInfo = findScriptPath();
+  
+  if (!scriptInfo) {
+    console.error('Error: Cannot find script. Please run: npm install && npm run build');
+    process.exit(1);
+  }
+  
   const nodePath = process.execPath;
-  const scriptPath = join(__dirname, '..', 'dist', 'cli', 'index.js');
-  const nodeArgs = [scriptPath];
+  let nodeArgs;
+  
+  if (scriptInfo.isTs) {
+    nodeArgs = ['--import', 'tsx', scriptInfo.path];
+  } else {
+    nodeArgs = [scriptInfo.path];
+  }
   
   if (args[0] === 'run' || args[0] === 'chat') {
     nodeArgs.push(...args.slice(1));
   }
+  
+  console.log(`\n\x1b[36mRunning from: ${scriptInfo.isTs ? 'source' : 'dist'}\x1b[0m\n`);
   
   const child = spawn(nodePath, nodeArgs, {
     stdio: 'inherit',

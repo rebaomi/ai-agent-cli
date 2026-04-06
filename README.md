@@ -44,9 +44,11 @@ ollama pull qwen3.5:9b  # 下载模型
 
 **2. 运行 coolAI**
 ```bash
-npm install
-npm link
-coolAI
+git clone https://github.com/rebaomi/ai-agent-cli.git
+cd ai-agent-cli
+npm install    # 安装依赖并自动构建
+npm link       # 创建全局命令
+coolAI         # 启动
 ```
 
 ### 使用
@@ -862,8 +864,11 @@ An intelligent coding assistant CLI tool powered by Ollama, with support for MCP
 ### Installation
 
 ```bash
-npm install
-npm link
+git clone https://github.com/rebaomi/ai-agent-cli.git
+cd ai-agent-cli
+npm install    # Install dependencies and auto-build
+npm link       # Create global command
+coolAI         # Launch
 ```
 
 ### Usage
