@@ -1,8 +1,108 @@
 # AI Agent CLI
 
+**[English](https://github.com/rebaomi/ai-agent-cli#english) | [简体中文](#简体中文)**
+
+---
+
+## English
+
+An intelligent coding assistant CLI tool powered by Ollama, with support for MCP, LSP, and Skills extensions.
+
+### Features
+
+- 🤖 **Ollama Local Models** - Support all Ollama models, no cloud API needed
+- 🔌 **MCP Protocol** - Connect to Model Context Protocol servers
+- 📝 **LSP Support** - Language Server Protocol for code intelligence
+- 🎯 **Skills System** - Install and manage third-party skill extensions
+- 🛡️ **Secure Sandbox** - Code execution in controlled environment
+- 💬 **Interactive Chat** - Claude Code-like command line interface
+- 💾 **Memory Management** - Persistent conversation history with session switching
+- 🌊 **Streaming Output** - Typewriter effect for AI responses
+- ⚡ **Smart Tool Calling** - AI automatically calls appropriate tools to complete tasks
+
+### Installation
+
+```bash
+npm install
+npm link
+```
+
+### Usage
+
+Run in any directory:
+
+```bash
+coolAI
+```
+
+### Commands
+
+| Command | Description |
+|--------|-------------|
+| `/？` | Show quick help |
+| `/quit` | Exit |
+| `/model` | Show/change model |
+| `/tools` | List available tools |
+| `/sessions` | List conversation sessions |
+| `/reset` | Clear conversation |
+
+### Configuration
+
+Create `~/.ai-agent-cli/config.yaml`:
+
+```yaml
+ollama:
+  baseUrl: http://localhost:11434
+  model: qwen3.5:9b
+  temperature: 0.7
+```
+
+### Intelligent Tool Calling Examples
+
+The AI can automatically call tools to complete various tasks:
+
+#### File Operations
+```
+User: Read the src/index.ts file
+AI: Automatically calls read_file tool
+
+User: Create a new React component
+AI: Automatically calls write_file tool
+```
+
+#### Command Execution
+```
+User: Run npm install
+AI: Automatically calls execute_command
+```
+
+#### MCP Extensions
+With Obsidian MCP configured:
+```
+User: Search my notes about "learning methods"
+AI: Automatically calls Obsidian search tool
+```
+
+### MCP Servers
+
+```yaml
+mcp:
+  - name: obsidian
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-obsidian
+    env:
+      OBSIDIAN_VAULT_PATH: /path/to/your/vault
+```
+
+---
+
+## 简体中文
+
 一个基于 Ollama 的智能编程助手 CLI 工具，支持 MCP、LSP 和 Skills 扩展。
 
-## 特性
+### 特性
 
 - 🤖 **Ollama 本地模型** - 支持所有 Ollama 模型，无需云端 API
 - 🔌 **MCP 协议** - 接入 Model Context Protocol 服务器
