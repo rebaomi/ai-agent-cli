@@ -66,6 +66,44 @@ ollama:
 | `/load <id>` | 加载历史会话 |
 | `/reset` | 清空对话 |
 
+## 智能工具调用示例
+
+AI 可以自动调用工具完成各种任务：
+
+### 文件操作
+```
+用户：帮我读取 src/index.ts 文件
+AI：自动调用 read_file 工具读取文件
+
+用户：创建一个新的 React 组件
+AI：自动调用 write_file 工具创建文件
+```
+
+### 命令执行
+```
+用户：帮我运行 npm install
+AI：自动调用 execute_command 执行命令
+```
+
+### 目录操作
+```
+用户：列出当前目录的文件
+AI：自动调用 list_directory 工具
+```
+
+### 代码搜索
+```
+用户：在 src 目录下搜索包含 "hello" 的文件
+AI：自动调用 search_files 或 glob 工具
+```
+
+### 配合 MCP 扩展
+如果配置了 Obsidian MCP：
+```
+用户：搜索我的笔记库中关于 "学习方法" 的笔记
+AI：自动调用 Obsidian 搜索工具
+```
+
 ## 安装 Ollama 模型
 
 ```bash
@@ -237,7 +275,53 @@ mcp:
       BRAVE_API_KEY: your-api-key
 ```
 
-更多 MCP 服务器：https://modelcontextprotocol.io/servers
+更多 MCP 服务器请搜索 npm 上的 `@modelcontextprotocol/server-*` 包。
+
+### IM 集成（飞书、钉钉、Telegram）
+
+#### 飞书（Lark）
+```yaml
+mcp:
+  - name: lark
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-lark
+    env:
+      LARK_APP_ID: your-app-id
+      LARK_APP_SECRET: your-app-secret
+```
+
+#### 钉钉（DingTalk）
+```yaml
+mcp:
+  - name: dingtalk
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-dingtalk
+    env:
+      DINGTALK_ROBOT_TOKEN: your-robot-token
+      DINGTALK_ROBOT_SECRET: your-robot-secret
+```
+
+#### Telegram
+```yaml
+mcp:
+  - name: telegram
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-telegram
+    env:
+      TELEGRAM_BOT_TOKEN: your-bot-token
+```
+
+配置完成后，你可以让 AI：
+- 发送消息到群组或频道
+- 查询消息历史
+- 管理群组成员
+- 定时发送通知
 
 ## 内置工具
 
