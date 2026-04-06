@@ -365,7 +365,7 @@ You: "Here's the content of package.json..."`;
       }
     }
 
-    if (name.includes('_')) {
+    if (this.isMcpTool(name)) {
       const parts = name.split('_');
       const server = parts[0] || '';
       const toolName = parts.slice(1).join('_');
@@ -385,6 +385,25 @@ You: "Here's the content of package.json..."`;
     }
 
     return this.builtInTools.executeTool(name, args);
+  }
+
+  private isMcpTool(name: string): boolean {
+    const builtInTools = [
+      'read_file', 'write_file', 'edit_file', 'delete_file',
+      'copy_file', 'move_file', 'file_info',
+      'list_directory', 'create_directory',
+      'search_files', 'grep', 'execute_command',
+      'glob', 'read_multiple_files',
+      'get_current_time', 'calculate',
+      'web_search', 'fetch_url', 'open_browser',
+      'lsp_complete', 'lsp_diagnostics', 'lsp_definition',
+    ];
+    
+    if (builtInTools.includes(name)) {
+      return false;
+    }
+    
+    return name.includes('_');
   }
 
   private parseToolCalls(content: string): ToolCall[] {
