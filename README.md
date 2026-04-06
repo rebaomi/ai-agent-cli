@@ -75,13 +75,100 @@ ollama list
 
 ## Skills 扩展
 
-安装第三方技能：
+Skills 扩展 coolAI 的能力，让 AI 可以执行自定义命令和工具。
+
+### 管理 Skills
+
+在 CLI 中使用以下命令：
 
 ```bash
-# 在 CLI 中
-/skill install npm:package-name
-/skill install github:owner/repo
-/skill install ./local/path
+/skill list              # 查看已安装的 skills
+/skill install npm:xxx   # 从 npm 安装
+/skill install github:xxx/xxx  # 从 GitHub 安装
+/skill install ./path    # 从本地路径安装
+/skill uninstall xxx     # 卸载 skill
+/skill enable xxx       # 启用 skill
+/skill disable xxx       # 禁用 skill
+```
+
+### 开发自己的 Skill
+
+创建一个 skill 目录，添加 `skill.json` 配置文件：
+
+```json
+{
+  "name": "my-skill",
+  "version": "1.0.0",
+  "description": "我的自定义技能",
+  "main": "index.js"
+}
+```
+
+编写 `index.js`：
+
+```javascript
+export default async function createSkill() {
+  return {
+    name: 'my-skill',
+    version: '1.0.0',
+    description: '我的自定义技能',
+    
+    // 自定义命令
+    commands: [
+      {
+        name: 'hello',
+        description: '打招呼',
+        handler: async (args, ctx) => {
+          const name = args[0] || 'World';
+          return `Hello, ${name}!`;
+        }
+      }
+    ],
+
+    // 自定义工具（AI 可调用）
+    tools: [
+      {
+        name: 'get_weather',
+        description: '获取天气信息',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            city: { type: 'string', description: '城市名称' }
+          }
+        },
+        handler: async (args, ctx) => {
+          const { city } = args;
+          return {
+            content: [{ type: 'text', text: `${city} 今天晴天，25度` }]
+          };
+        }
+      }
+    ],
+
+    // 钩子函数
+    hooks: {
+      onStart: async (ctx) => {
+        console.log('Skill loaded!');
+      },
+      onMessage: async (message, ctx) => {
+        // 拦截消息处理
+        return null; // 返回 null 表示不拦截
+      }
+    }
+  };
+}
+```
+
+### Skill 目录结构
+
+```
+~/.ai-agent-cli/skills/
+├── skill-1/
+│   ├── skill.json
+│   └── index.js
+└── skill-2/
+    ├── skill.json
+    └── index.js
 ```
 
 ## MCP 服务器
