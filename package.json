@@ -14,7 +14,14 @@
     "start": "node dist/cli/index.js",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": ["ai", "agent", "cli", "mcp", "ollama", "lsp"],
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "mcp",
+    "ollama",
+    "lsp"
+  ],
   "license": "MIT",
   "dependencies": {
     "chalk": "^5.3.0",
