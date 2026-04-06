@@ -1,20 +1,126 @@
 # AI Agent CLI 配置说明
 
-## Ollama 配置
-Ollama 是必须的本地 LLM 服务。
+## 多模型支持
 
-### 安装 Ollama
-1. 访问 https://ollama.ai 下载安装
-2. 启动服务：`ollama serve`
-3. 下载模型：`ollama pull llama3.2`
+coolAI 支持多种大模型提供商：
+- **Ollama** (本地)
+- **DeepSeek** 
+- **Kimi** (月之暗面)
+- **GLM** (智谱)
+- **Doubao** (字节豆包)
+- **MiniMax** (稀宇)
+- **OpenAI** (GPT)
+- **Claude** (Anthropic)
+- **Gemini** (Google)
 
-### Ollama 配置项
+## 配置示例
+
+### Ollama 配置 (必须，本地模型)
 ```yaml
-ollama:
-  baseUrl: http://localhost:11434  # Ollama 服务地址
-  model: llama3.2                   # 默认模型
-  temperature: 0.7                  # 温度参数 (0-1)
-  maxTokens: 4096                   # 最大生成 token 数
+llm:
+  default: ollama
+  providers:
+    ollama:
+      enabled: true
+      baseUrl: http://localhost:11434
+      model: qwen3.5:9b
+      temperature: 0.7
+```
+
+### DeepSeek 配置
+```yaml
+llm:
+  providers:
+    deepseek:
+      enabled: true
+      apiKey: your-deepseek-api-key
+      baseUrl: https://api.deepseek.com
+      model: deepseek-chat
+      temperature: 0.7
+```
+
+### Kimi 配置 (月之暗面)
+```yaml
+llm:
+  providers:
+    kimi:
+      enabled: true
+      apiKey: your-kimi-api-key
+      baseUrl: https://api.moonshot.cn/v1
+      model: moonshot-v1-128k
+      temperature: 0.7
+```
+
+### GLM 配置 (智谱)
+```yaml
+llm:
+  providers:
+    glm:
+      enabled: true
+      apiKey: your-glm-api-key
+      baseUrl: https://open.bigmodel.cn/api/paas/v4
+      model: glm-4
+      temperature: 0.7
+```
+
+### Doubao 配置 (字节豆包)
+```yaml
+llm:
+  providers:
+    doubao:
+      enabled: true
+      apiKey: your-doubao-api-key
+      baseUrl: https://ark.cn-beijing.volces.com/api/v3
+      model: doubao-pro-32k
+      temperature: 0.7
+```
+
+### MiniMax 配置
+```yaml
+llm:
+  providers:
+    minimax:
+      enabled: true
+      apiKey: your-minimax-api-key
+      baseUrl: https://api.minimax.chat/v
+      model: abab6.5s-chat
+      temperature: 0.7
+```
+
+### OpenAI 配置 (GPT)
+```yaml
+llm:
+  providers:
+    openai:
+      enabled: true
+      apiKey: your-openai-api-key
+      baseUrl: https://api.openai.com/v1
+      model: gpt-4o
+      temperature: 0.7
+```
+
+### Claude 配置 (Anthropic)
+```yaml
+llm:
+  providers:
+    claude:
+      enabled: true
+      apiKey: your-claude-api-key
+      baseUrl: https://api.anthropic.com/v1
+      model: claude-3-5-sonnet-20241022
+      temperature: 0.7
+```
+
+### Gemini 配置 (Google)
+```yaml
+llm:
+  providers:
+    gemini:
+      enabled: true
+      apiKey: your-gemini-api-key
+      baseUrl: https://generativelanguage.googleapis.com/v1beta
+      model: gemini-2.0-flash
+      temperature: 0.7
 ```
 
 ## MCP 配置 (可选)
@@ -22,13 +128,13 @@ MCP (Model Context Protocol) 服务器，用于扩展功能。
 
 ```yaml
 mcp:
-  - name: filesystem                  # MCP 服务器名称
-    command: npx                     # 启动命令
-    args:                            # 命令参数
+  - name: filesystem
+    command: npx
+    args:
       - -y
       - @modelcontextprotocol/server-filesystem
     env:
-      ROOT_DIR: .                    # 环境变量
+      ROOT_DIR: .
 ```
 
 常用 MCP 服务器：
@@ -55,12 +161,12 @@ lsp:
 
 ```yaml
 sandbox:
-  enabled: true       # 是否启用沙箱
-  timeout: 30000     # 执行超时 (毫秒)
-  allowedPaths:       # 允许访问的目录
+  enabled: true
+  timeout: 30000
+  allowedPaths:
     - .
     - ./src
-  deniedPaths:       # 禁止访问的目录
+  deniedPaths:
     - /etc
     - /sys
 ```
@@ -68,9 +174,9 @@ sandbox:
 ## 其他配置
 
 ```yaml
-workspace: .          # 工作目录
-maxIterations: 100    # Agent 最大迭代次数
-toolTimeout: 60000    # 工具调用超时 (毫秒)
+workspace: .
+maxIterations: 100
+toolTimeout: 60000
 ```
 
 ## 配置位置

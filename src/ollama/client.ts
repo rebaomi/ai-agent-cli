@@ -48,6 +48,7 @@ export interface OllamaShow {
 }
 
 export class OllamaClient {
+  readonly provider: 'ollama' = 'ollama';
   private baseUrl: string;
   private model: string;
   private temperature: number;

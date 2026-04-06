@@ -10,7 +10,7 @@
 
 ### 特性
 
-- 🤖 **Ollama 本地模型** - 支持所有 Ollama 模型，无需云端 API
+- 🤖 **多模型支持** - 支持 Ollama、DeepSeek、Kimi、GLM、Doubao、MiniMax、GPT、Claude、Gemini 等
 - 🔌 **MCP 协议** - 接入 Model Context Protocol 服务器
 - 📝 **LSP 支持** - Language Server Protocol 代码智能提示
 - 🎯 **Skills 系统** - 安装和管理第三方技能扩展
@@ -23,6 +23,8 @@
 - 🏢 **多 Agent 组织架构** - 模拟企业团队协作，多角色 Agent 协同工作
 - 🐱 **AgentCat 电子宠物** - 健康提醒助手，提醒喝水、休息、运动
 - 📋 **任务进度追踪** - 实时查看任务执行进度和状态
+- 🎭 **智能接待系统** - 自动识别话题、加载技能、切换 Agent
+- 🔄 **多模型对比** - 同时调用多个模型，综合分析给出最佳答案
 
 ### 安装
 
@@ -335,6 +337,101 @@ AgentCat 会按时提醒：
   当前: 编写后端 API
   已完成: 需求分析, 数据库设计, 创建用户表
 ```
+
+### 多模型支持
+
+coolAI 支持多种大模型提供商，可以同时使用多个模型：
+
+#### 支持的模型
+
+| 提供商 | 模型示例 | 说明 |
+|--------|----------|------|
+| Ollama | qwen3.5:9b, llama3.2 | 本地运行，无需 API key |
+| DeepSeek | deepseek-chat | 深度求索 |
+| Kimi | moonshot-v1-128k | 月之暗面，长上下文 |
+| GLM | glm-4, glm-4-flash | 智谱 AI |
+| Doubao | doubao-pro-32k | 字节豆包 |
+| MiniMax | abab6.5s-chat | 稀宇科技 |
+| OpenAI | gpt-4o, gpt-4o-mini | GPT 系列 |
+| Claude | claude-3-5-sonnet | Anthropic |
+| Gemini | gemini-2.0-flash | Google |
+
+#### 配置示例
+
+```yaml
+llm:
+  default: ollama
+  providers:
+    ollama:
+      enabled: true
+      baseUrl: http://localhost:11434
+      model: qwen3.5:9b
+    deepseek:
+      enabled: true
+      apiKey: your-api-key
+      model: deepseek-chat
+    kimi:
+      enabled: true
+      apiKey: your-api-key
+      model: moonshot-v1-128k
+```
+
+### 多模型对比
+
+coolAI 可以同时调用多个模型进行对比分析：
+
+```bash
+/compare model1:deepseek model2:kimi model3:glm 帮我分析这段代码
+```
+
+输出示例：
+```
+📊 模型对比结果
+
+🥇 deepseek-chat (deepseek)
+   耗时: 1500ms | Token: 500
+   评分: 8.5/10
+   响应: 根据代码分析...
+
+🥈 moonshot-v1-128k (kimi)
+   耗时: 2000ms | Token: 600
+   评分: 7.8/10
+   响应: 从多个角度分析...
+
+🥉 glm-4 (glm)
+   耗时: 1200ms | Token: 450
+   评分: 7.2/10
+   响应: 代码结构分析...
+```
+
+### 智能接待系统
+
+接待 Agent 会自动识别用户话题并创建对应的专业 Agent：
+
+#### 支持的话题
+
+| 话题 | 关键词 | 创建的 Agent |
+|------|--------|--------------|
+| 美食 | 好吃、餐厅、菜谱 | 美食专家 |
+| 旅游 | 旅游、景点、酒店 | 旅游顾问 |
+| 金融 | 股票、基金、理财 | 财经顾问 |
+| 编程 | 代码、bug、API | 编程助手 |
+| 健康 | 健康、运动、健身 | 健康顾问 |
+
+#### 接待员性格
+
+```
+/reception personality humorous  # 幽默风格
+/reception personality gentle   # 温柔风格
+/reception personality professional  # 专业风格
+```
+
+性格选项：
+- `professional` - 专业、礼貌
+- `friendly` - 友好、热情
+- `humorous` - 幽默、风趣
+- `gentle` - 温柔、耐心
+- `energetic` - 活力、积极
 
 ### 安装 Ollama 模型
 
