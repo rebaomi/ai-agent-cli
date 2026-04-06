@@ -1,100 +1,6 @@
 # AI Agent CLI
 
-**[English](https://github.com/rebaomi/ai-agent-cli#english) | [简体中文](#简体中文)**
-
----
-
-## English
-
-An intelligent coding assistant CLI tool powered by Ollama, with support for MCP, LSP, and Skills extensions.
-
-### Features
-
-- 🤖 **Ollama Local Models** - Support all Ollama models, no cloud API needed
-- 🔌 **MCP Protocol** - Connect to Model Context Protocol servers
-- 📝 **LSP Support** - Language Server Protocol for code intelligence
-- 🎯 **Skills System** - Install and manage third-party skill extensions
-- 🛡️ **Secure Sandbox** - Code execution in controlled environment
-- 💬 **Interactive Chat** - Claude Code-like command line interface
-- 💾 **Memory Management** - Persistent conversation history with session switching
-- 🌊 **Streaming Output** - Typewriter effect for AI responses
-- ⚡ **Smart Tool Calling** - AI automatically calls appropriate tools to complete tasks
-
-### Installation
-
-```bash
-npm install
-npm link
-```
-
-### Usage
-
-Run in any directory:
-
-```bash
-coolAI
-```
-
-### Commands
-
-| Command | Description |
-|--------|-------------|
-| `/？` | Show quick help |
-| `/quit` | Exit |
-| `/model` | Show/change model |
-| `/tools` | List available tools |
-| `/sessions` | List conversation sessions |
-| `/reset` | Clear conversation |
-
-### Configuration
-
-Create `~/.ai-agent-cli/config.yaml`:
-
-```yaml
-ollama:
-  baseUrl: http://localhost:11434
-  model: qwen3.5:9b
-  temperature: 0.7
-```
-
-### Intelligent Tool Calling Examples
-
-The AI can automatically call tools to complete various tasks:
-
-#### File Operations
-```
-User: Read the src/index.ts file
-AI: Automatically calls read_file tool
-
-User: Create a new React component
-AI: Automatically calls write_file tool
-```
-
-#### Command Execution
-```
-User: Run npm install
-AI: Automatically calls execute_command
-```
-
-#### MCP Extensions
-With Obsidian MCP configured:
-```
-User: Search my notes about "learning methods"
-AI: Automatically calls Obsidian search tool
-```
-
-### MCP Servers
-
-```yaml
-mcp:
-  - name: obsidian
-    command: npx
-    args:
-      - -y
-      - @modelcontextprotocol/server-obsidian
-    env:
-      OBSIDIAN_VAULT_PATH: /path/to/your/vault
-```
+**[简体中文](#简体中文) | [English](#english)**
 
 ---
 
@@ -114,14 +20,14 @@ mcp:
 - 🌊 **流式输出** - AI 回复逐字显示，打字机效果
 - ⚡ **智能工具调用** - AI 自动调用合适工具完成任务
 
-## 安装
+### 安装
 
 ```bash
 npm install
 npm link
 ```
 
-## 使用
+### 使用
 
 安装后，在任意目录运行：
 
@@ -136,7 +42,7 @@ node dist/cli/index.js  # 直接运行
 npm run dev       # 开发模式
 ```
 
-## 配置
+### 配置
 
 在 `~/.ai-agent-cli/config.yaml` 创建配置文件：
 
@@ -149,7 +55,7 @@ ollama:
 
 > 注意：首次使用需要先启动 Ollama 服务 `ollama serve` 并下载模型 `ollama pull qwen3.5:9b`
 
-## 命令
+### 命令
 
 在 CLI 中输入以下命令：
 
@@ -166,11 +72,11 @@ ollama:
 | `/load <id>` | 加载历史会话 |
 | `/reset` | 清空对话 |
 
-## 智能工具调用示例
+### 智能工具调用示例
 
 AI 可以自动调用工具完成各种任务：
 
-### 文件操作
+#### 文件操作
 ```
 用户：帮我读取 src/index.ts 文件
 AI：自动调用 read_file 工具读取文件
@@ -179,32 +85,32 @@ AI：自动调用 read_file 工具读取文件
 AI：自动调用 write_file 工具创建文件
 ```
 
-### 命令执行
+#### 命令执行
 ```
 用户：帮我运行 npm install
 AI：自动调用 execute_command 执行命令
 ```
 
-### 目录操作
+#### 目录操作
 ```
 用户：列出当前目录的文件
 AI：自动调用 list_directory 工具
 ```
 
-### 代码搜索
+#### 代码搜索
 ```
 用户：在 src 目录下搜索包含 "hello" 的文件
 AI：自动调用 search_files 或 glob 工具
 ```
 
-### 配合 MCP 扩展
+#### 配合 MCP 扩展
 如果配置了 Obsidian MCP：
 ```
 用户：搜索我的笔记库中关于 "学习方法" 的笔记
 AI：自动调用 Obsidian 搜索工具
 ```
 
-## 安装 Ollama 模型
+### 安装 Ollama 模型
 
 ```bash
 # 下载模型
@@ -216,11 +122,11 @@ ollama pull gemma4:3b
 ollama list
 ```
 
-## Skills 扩展
+### Skills 扩展
 
 Skills 扩展 coolAI 的能力，让 AI 可以执行自定义命令和工具。
 
-### 管理 Skills
+#### 管理 Skills
 
 在 CLI 中使用以下命令：
 
@@ -234,7 +140,7 @@ Skills 扩展 coolAI 的能力，让 AI 可以执行自定义命令和工具。
 /skill disable xxx       # 禁用 skill
 ```
 
-### 开发自己的 Skill
+#### 开发自己的 Skill
 
 创建一个 skill 目录，添加 `skill.json` 配置文件：
 
@@ -302,7 +208,7 @@ export default async function createSkill() {
 }
 ```
 
-### Skill 目录结构
+#### Skill 目录结构
 
 ```
 ~/.ai-agent-cli/skills/
@@ -314,13 +220,13 @@ export default async function createSkill() {
     └── index.js
 ```
 
-## MCP 服务器
+### MCP 服务器
 
 MCP (Model Context Protocol) 服务器可以扩展 AI 的能力。
 
-### 常用 MCP 服务器
+#### 常用 MCP 服务器
 
-#### 文件系统
+##### 文件系统
 ```yaml
 mcp:
   - name: filesystem
@@ -332,7 +238,7 @@ mcp:
       ROOT_DIR: .
 ```
 
-#### Obsidian 笔记
+##### Obsidian 笔记
 接入你的 Obsidian 笔记库，让 AI 可以搜索和管理笔记：
 ```yaml
 mcp:
@@ -351,7 +257,7 @@ mcp:
 ```
 AI 会自动调用 Obsidian MCP 工具搜索你的笔记库。
 
-#### GitHub
+##### GitHub
 ```yaml
 mcp:
   - name: github
@@ -363,7 +269,7 @@ mcp:
       GITHUB_TOKEN: your-github-token
 ```
 
-#### Brave 搜索
+##### Brave 搜索
 ```yaml
 mcp:
   - name: brave-search
@@ -377,9 +283,11 @@ mcp:
 
 更多 MCP 服务器请搜索 npm 上的 `@modelcontextprotocol/server-*` 包。
 
-### IM 集成（飞书、钉钉、Telegram）
+#### IM 集成（飞书、钉钉、Telegram）
 
-#### 飞书（Lark）
+##### 飞书（Lark）
+
+方式一：使用飞书开放平台应用
 ```yaml
 mcp:
   - name: lark
@@ -392,7 +300,29 @@ mcp:
       LARK_APP_SECRET: your-app-secret
 ```
 
-#### 钉钉（DingTalk）
+方式二：使用飞书 CLI（本地调试更方便）
+```yaml
+mcp:
+  - name: lark-cli
+    command: lark-oapi
+    args:
+      - mcp
+      - --config
+      - /path/to/your/lark-config.json
+    env:
+      DEBUG: "false"
+```
+
+飞书 CLI 配置文件示例 `lark-config.json`：
+```json
+{
+  "appId": "your-app-id",
+  "appSecret": "your-app-secret",
+  "botName": "AI助手"
+}
+```
+
+##### 钉钉（DingTalk）
 ```yaml
 mcp:
   - name: dingtalk
@@ -405,7 +335,7 @@ mcp:
       DINGTALK_ROBOT_SECRET: your-robot-secret
 ```
 
-#### Telegram
+##### Telegram
 ```yaml
 mcp:
   - name: telegram
@@ -423,7 +353,7 @@ mcp:
 - 管理群组成员
 - 定时发送通知
 
-## 内置工具
+### 内置工具
 
 - `read_file` - 读取文件
 - `write_file` - 写入文件
@@ -435,7 +365,7 @@ mcp:
 - `lsp_complete` - 代码补全
 - `lsp_diagnostics` - 代码诊断
 
-## 技术栈
+### 技术栈
 
 - TypeScript
 - Node.js 20+
@@ -443,6 +373,153 @@ mcp:
 - MCP Protocol
 - LSP Protocol
 
-## License
+### License
+
+MIT
+
+---
+
+## English
+
+An intelligent coding assistant CLI tool powered by Ollama, with support for MCP, LSP, and Skills extensions.
+
+### Features
+
+- 🤖 **Ollama Local Models** - Support all Ollama models, no cloud API needed
+- 🔌 **MCP Protocol** - Connect to Model Context Protocol servers
+- 📝 **LSP Support** - Language Server Protocol for code intelligence
+- 🎯 **Skills System** - Install and manage third-party skill extensions
+- 🛡️ **Secure Sandbox** - Code execution in controlled environment
+- 💬 **Interactive Chat** - Claude Code-like command line interface
+- 💾 **Memory Management** - Persistent conversation history with session switching
+- 🌊 **Streaming Output** - Typewriter effect for AI responses
+- ⚡ **Smart Tool Calling** - AI automatically calls appropriate tools to complete tasks
+
+### Installation
+
+```bash
+npm install
+npm link
+```
+
+### Usage
+
+Run in any directory:
+
+```bash
+coolAI
+```
+
+Other options:
+```bash
+ai-agent          # alternative command
+node dist/cli/index.js  # direct run
+npm run dev       # development mode
+```
+
+### Configuration
+
+Create `~/.ai-agent-cli/config.yaml`:
+
+```yaml
+ollama:
+  baseUrl: http://localhost:11434
+  model: qwen3.5:9b
+  temperature: 0.7
+```
+
+> Note: Start Ollama service first with `ollama serve` and download models with `ollama pull qwen3.5:9b`
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/？` | Show quick help |
+| `/quit` | Exit |
+| `/model` | Show/change model |
+| `/tools` | List available tools |
+| `/config` | Show configuration |
+| `/skill` | Manage Skills |
+| `/mcp` | Manage MCP servers |
+| `/sessions` | List conversation sessions |
+| `/load <id>` | Load a previous session |
+| `/reset` | Clear conversation |
+
+### Intelligent Tool Calling Examples
+
+The AI can automatically call tools to complete various tasks:
+
+#### File Operations
+```
+User: Read the src/index.ts file
+AI: Automatically calls read_file tool
+
+User: Create a new React component
+AI: Automatically calls write_file tool
+```
+
+#### Command Execution
+```
+User: Run npm install
+AI: Automatically calls execute_command
+```
+
+#### MCP Extensions
+With Obsidian MCP configured:
+```
+User: Search my notes about "learning methods"
+AI: Automatically calls Obsidian search tool
+```
+
+### Skills Extension
+
+Skills extend coolAI's capabilities.
+
+#### Manage Skills
+
+```bash
+/skill list              # List installed skills
+/skill install npm:xxx   # Install from npm
+/skill install github:xxx/xxx  # Install from GitHub
+/skill install ./path    # Install from local path
+/skill uninstall xxx     # Uninstall skill
+/skill enable xxx        # Enable skill
+/skill disable xxx       # Disable skill
+```
+
+### MCP Servers
+
+```yaml
+mcp:
+  - name: obsidian
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-obsidian
+    env:
+      OBSIDIAN_VAULT_PATH: /path/to/your/vault
+```
+
+### Built-in Tools
+
+- `read_file` - Read file contents
+- `write_file` - Write content to file
+- `edit_file` - Edit file
+- `delete_file` - Delete file
+- `list_directory` - List directory contents
+- `glob` - Find files by pattern
+- `execute_command` - Execute shell command
+- `lsp_complete` - Code completion
+- `lsp_diagnostics` - Code diagnostics
+
+### Tech Stack
+
+- TypeScript
+- Node.js 20+
+- Ollama API
+- MCP Protocol
+- LSP Protocol
+
+### License
 
 MIT
