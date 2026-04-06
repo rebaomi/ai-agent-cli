@@ -19,6 +19,7 @@ export interface AgentOptions {
   builtInTools?: BuiltInTools;
   systemPrompt?: string;
   maxIterations?: number;
+  planner?: Planner;
 }
 
 export interface AgentEvent {
@@ -50,6 +51,7 @@ export class Agent {
     this.builtInTools = options.builtInTools ?? new BuiltInTools(this.sandbox, this.lspManager);
     this.systemPrompt = options.systemPrompt ?? this.getDefaultSystemPrompt();
     this.maxIterations = options.maxIterations ?? 100;
+    this.planner = options.planner;
 
     this.initializeTools();
   }

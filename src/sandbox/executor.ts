@@ -196,6 +196,12 @@ export class Sandbox {
     this.enabled = enabled;
   }
 
+  addAllowedPath(allowedPath: string): void {
+    if (!this.allowedPaths.includes(allowedPath)) {
+      this.allowedPaths.push(allowedPath);
+    }
+  }
+
   async cleanup(): Promise<void> {
     try {
       const files = await fs.readdir(this.tempDir);

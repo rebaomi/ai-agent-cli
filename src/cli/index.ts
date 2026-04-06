@@ -22,6 +22,7 @@ import { createAgentCat, AgentCat } from '../core/companion/index.js';
 import { UserProfileManager, userProfileManager } from '../core/user-profile.js';
 import { ContentModerator, contentModerator } from '../core/content-moderator.js';
 import { PermissionManager, permissionManager } from '../core/permission-manager.js';
+import { Planner } from '../core/planner.js';
 import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import * as readline from 'readline';
@@ -132,6 +133,12 @@ export class CLI {
     if (!sandboxConfig.allowedPaths) {
       sandboxConfig.allowedPaths = [config.workspace || process.cwd()];
     }
+    const permConfig = this.permissionMgr.getConfig();
+    for (const allowedPath of permConfig.allowedPaths) {
+      if (!sandboxConfig.allowedPaths.includes(allowedPath)) {
+        sandboxConfig.allowedPaths.push(allowedPath);
+      }
+    }
     this.sandbox = new Sandbox(sandboxConfig);
     await this.sandbox.initialize();
     printSuccess('Sandbox ready');
@@ -176,6 +183,7 @@ export class CLI {
       sandbox: this.sandbox,
       builtInTools: this.builtInTools,
       maxIterations: config.maxIterations,
+      planner: new Planner({ llm: this.llm! }),
     });
 
     console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
@@ -286,7 +294,9 @@ export class CLI {
         break;
       case 'model':
       case 'm':
-        if (args[0]) {
+        if (args[0] === 'switch' && args[1]) {
+          await this.switchProvider(args[1]);
+        } else if (args[0]) {
           await this.changeModel(args[0]);
         } else {
           this.showModels();
@@ -779,6 +789,7 @@ ${chalk.cyan('/profile style [type]')}  设置沟通风格 (concise/normal/detai
       case 'allow':
         if (args[1]) {
           this.permissionMgr.addAllowedPath(args[1]);
+          this.sandbox.addAllowedPath(args[1]);
           printSuccess('Added allowed path: ' + args[1]);
         }
         break;
@@ -1129,7 +1140,8 @@ ${chalk.cyan('/clear, /cls')}      Clear the screen
 ${chalk.cyan('/history, /hi')}      Show command history
 ${chalk.cyan('/tools, /t')}        List available tools
 ${chalk.cyan('/config, /c')}       Show current configuration
-${chalk.cyan('/model, /m')} [name] Show or change the model
+${chalk.cyan('/model, /m')} [name]     Show or change model
+${chalk.cyan('/model switch')} <name> Switch default provider
 ${chalk.cyan('/workspace, /w')}    Show or change workspace
 ${chalk.cyan('/reset, /r')}        Reset conversation
 ${chalk.cyan('/new')}              Create new session (archive old)
@@ -1225,6 +1237,42 @@ ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
         printSuccess('Model changed to: ' + model);
       } else {
         printError('Failed to verify model. Please ensure the model is available.');
+      }
+    } catch (error) {
+      printError('Error: ' + (error instanceof Error ? error.message : String(error)));
+    }
+  }
+
+  private async switchProvider(provider: string): Promise<void> {
+    const normalizedProvider = provider.toLowerCase();
+    const config = configManager.getAgentConfig();
+    const providerConfig = configManager.get(normalizedProvider as any);
+
+    if (!providerConfig) {
+      printError(`Provider not found: ${provider}. Use /model to see available providers.`);
+      return;
+    }
+
+    if (!providerConfig.enabled) {
+      printError(`Provider "${provider}" is disabled. Please enable it in config first.`);
+      return;
+    }
+
+    try {
+      configManager.set('defaultProvider', normalizedProvider);
+      const configPath = configManager.getConfigPath();
+      if (configPath) {
+        await configManager.saveToFile(configPath);
+      }
+
+      this.currentProvider = normalizedProvider;
+      this.llm = this.createLLMClient(configManager.getAgentConfig());
+      const connected = await this.llm.checkConnection();
+
+      if (connected) {
+        printSuccess(`Switched to provider: ${normalizedProvider} (${this.llm.getModel()})`);
+      } else {
+        printWarning(`Switched to ${normalizedProvider}, but connection failed.`);
       }
     } catch (error) {
       printError('Error: ' + (error instanceof Error ? error.message : String(error)));

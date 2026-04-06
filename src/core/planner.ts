@@ -1,5 +1,5 @@
 import type { Message } from '../types/index.js';
-import { OllamaClient } from '../ollama/client.js';
+import type { LLMProviderInterface } from '../llm/types.js';
 
 export interface PlanStep {
   id: string;
@@ -18,7 +18,7 @@ export interface Plan {
 }
 
 export interface PlannerOptions {
-  ollama: OllamaClient;
+  llm: LLMProviderInterface;
   maxSteps?: number;
 }
 
@@ -47,12 +47,12 @@ const PLANNER_PROMPT = `你是一个任务规划专家。当用户提出复杂�
 - 只返回 JSON，不要其他内容`;
 
 export class Planner {
-  private ollama: OllamaClient;
+  private llm: LLMProviderInterface;
   private maxSteps: number;
   private currentPlan?: Plan;
 
   constructor(options: PlannerOptions) {
-    this.ollama = options.ollama;
+    this.llm = options.llm;
     this.maxSteps = options.maxSteps ?? 10;
   }
 
@@ -68,7 +68,7 @@ export class Planner {
     };
 
     try {
-      const response = await this.ollama.generate([
+      const response = await this.llm.generate([
         { role: 'system', content: PLANNER_PROMPT },
         { role: 'user', content: `请规划这个任务：${task}` }
       ]);

@@ -14,10 +14,17 @@ export class GLMClient extends BaseLLMClient {
       },
       body: JSON.stringify({
         model: this.model,
-        messages: messages.map(m => ({
-          role: m.role,
-          content: m.content,
-        })),
+        messages: messages.map(m => {
+          const msg: any = {
+            role: m.role,
+            content: m.content,
+          };
+          if (m.role === 'tool') {
+            msg.tool_call_id = m.tool_call_id;
+            if (m.name) msg.name = m.name;
+          }
+          return msg;
+        }),
         temperature: this.temperature,
         max_tokens: this.maxTokens,
       }),
