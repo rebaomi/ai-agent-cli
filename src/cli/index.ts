@@ -117,7 +117,11 @@ export class CLI {
       printSuccess('Connected to Ollama (' + config.ollama.model + ')');
     }
 
-    this.sandbox = new Sandbox(config.sandbox);
+    const sandboxConfig = config.sandbox || { enabled: true, timeout: 30000 };
+    if (!sandboxConfig.allowedPaths) {
+      sandboxConfig.allowedPaths = [config.workspace || process.cwd()];
+    }
+    this.sandbox = new Sandbox(sandboxConfig);
     await this.sandbox.initialize();
     printSuccess('Sandbox ready');
 

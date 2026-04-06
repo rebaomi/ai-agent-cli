@@ -14,8 +14,8 @@ export class Sandbox {
 
   constructor(config: SandboxConfig = { enabled: true }) {
     this.enabled = config.enabled ?? true;
-    this.allowedPaths = config.allowedPaths ?? [process.cwd()];
-    this.deniedPaths = config.deniedPaths ?? ['/etc', '/sys', '/proc', 'C:\\Windows', 'C:\\Program Files'];
+    this.allowedPaths = config.allowedPaths ?? [];
+    this.deniedPaths = config.deniedPaths ?? ['/etc', '/sys', '/root', '/proc', 'C:\\Windows', 'C:\\Program Files'];
     this.timeout = config.timeout ?? 30000;
     this.maxMemory = config.maxMemory;
     this.tempDir = path.join(os.tmpdir(), 'ai-agent-sandbox');
