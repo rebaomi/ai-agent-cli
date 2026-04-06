@@ -19,6 +19,7 @@ import type { Organization } from '../core/organization/index.js';
 import { createAgentCat, AgentCat } from '../core/companion/index.js';
 import { UserProfileManager, userProfileManager } from '../core/user-profile.js';
 import { ContentModerator, contentModerator } from '../core/content-moderator.js';
+import { PermissionManager, permissionManager } from '../core/permission-manager.js';
 import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import * as readline from 'readline';
@@ -51,7 +52,9 @@ export class CLI {
   private agentCat?: AgentCat;
   private userProfile?: UserProfileManager;
   private moderator?: ContentModerator;
+  private permissionMgr?: PermissionManager;
   private isFirstInteraction = true;
+  private permissionHandlerSetup = false;
 
   constructor() {
     this.mcpManager = new MCPManager();
@@ -80,6 +83,10 @@ export class CLI {
     }
 
     this.moderator = contentModerator;
+
+    this.permissionMgr = permissionManager;
+    await this.permissionMgr.initialize();
+    this.setupPermissionHandler();
 
     this.ollama = new OllamaClient(config.ollama);
     
@@ -158,6 +165,34 @@ export class CLI {
     });
 
     console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
+  }
+
+  private setupPermissionHandler(): void {
+    if (this.permissionHandlerSetup || !this.permissionMgr) return;
+    this.permissionHandlerSetup = true;
+
+    this.permissionMgr.onPermissionRequest(async (request) => {
+      console.log(this.permissionMgr!.showPermissionRequest(request));
+      
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      
+      return new Promise((resolve) => {
+        rl.question(chalk.blue('> '), (answer) => {
+          rl.close();
+          if (answer.toLowerCase() === 'yes' || answer.toLowerCase() === 'y') {
+            resolve(true);
+          } else if (answer.toLowerCase() === 'all') {
+            this.permissionMgr!.grantPermission(request.type, request.resource);
+            resolve(true);
+          } else {
+            resolve(false);
+          }
+        });
+      });
+    });
   }
 
   async run(): Promise<void> {
@@ -289,6 +324,10 @@ export class CLI {
         break;
       case 'profile':
         this.handleProfileCommand(args);
+        break;
+      case 'perm':
+      case 'permission':
+        this.handlePermissionCommand(args);
         break;
       default:
         console.log(chalk.yellow(`Unknown command: ${command}. Type /? for help.`));
@@ -674,6 +713,104 @@ ${chalk.cyan('/profile style [type]')}  设置沟通风格 (concise/normal/detai
 
     this.userProfile?.updatePreferences({ communicationStyle: style as any });
     printSuccess('沟通风格已设置为: ' + style);
+  }
+
+  private handlePermissionCommand(args: string[]): void {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.permissionMgr) {
+      printError('Permission manager not initialized');
+      return;
+    }
+
+    switch (subcommand) {
+      case 'view':
+      case undefined:
+        this.permissionMgr.printPermissions();
+        break;
+      case 'grant':
+        this.grantPermission(args[1], args[2]);
+        break;
+      case 'revoke':
+        this.revokePermission(args[1], args[2]);
+        break;
+      case 'revokeall':
+        this.permissionMgr.revokeAll();
+        printSuccess('All permissions revoked');
+        break;
+      case 'trust':
+        if (args[1]) {
+          this.permissionMgr.addTrustedCommand(args[1]);
+          printSuccess('Added trusted command: ' + args[1]);
+        }
+        break;
+      case 'allow':
+        if (args[1]) {
+          this.permissionMgr.addAllowedPath(args[1]);
+          printSuccess('Added allowed path: ' + args[1]);
+        }
+        break;
+      case 'deny':
+        if (args[1]) {
+          this.permissionMgr.addDeniedPath(args[1]);
+          printSuccess('Added denied path: ' + args[1]);
+        }
+        break;
+      case 'auto':
+        const enabled = args[1]?.toLowerCase() === 'on';
+        this.permissionMgr.setAutoGrantDangerous(enabled);
+        printSuccess(`Auto-grant dangerous operations: ${enabled ? 'ON' : 'OFF'}`);
+        break;
+      case 'ask':
+        const askEnabled = args[1]?.toLowerCase() !== 'off';
+        this.permissionMgr.setAskForPermissions(askEnabled);
+        printSuccess(`Ask for permissions: ${askEnabled ? 'ON' : 'OFF'}`);
+        break;
+      default:
+        console.log(`
+${chalk.bold('权限管理命令:')}
+${chalk.cyan('/perm')}             查看权限设置
+${chalk.cyan('/perm view')}        查看当前权限
+${chalk.cyan('/perm grant')} <type> [resource] 授予权限
+${chalk.cyan('/perm revoke')} <type> [resource] 撤销权限
+${chalk.cyan('/perm revokeall')}    撤销所有权限
+${chalk.cyan('/perm trust')} <cmd>  添加可信命令
+${chalk.cyan('/perm allow')} <path> 添加允许路径
+${chalk.cyan('/perm deny')} <path>  添加禁止路径
+${chalk.cyan('/perm auto')} [on|off] 自动授权危险操作
+${chalk.cyan('/perm ask')} [on|off] 询问权限
+
+${chalk.gray('权限类型:')}
+  file_read, file_write, file_delete, command_execute
+  network_request, browser_open, mcp_access, tool_execute
+`);
+    }
+  }
+
+  private grantPermission(type?: string, resource?: string): void {
+    if (!type) {
+      printError('Usage: /perm grant <type> [resource]');
+      return;
+    }
+
+    const validTypes = ['file_read', 'file_write', 'file_delete', 'command_execute', 'network_request', 'browser_open', 'mcp_access', 'tool_execute'];
+    if (!validTypes.includes(type)) {
+      printError('Invalid type. Choose from: ' + validTypes.join(', '));
+      return;
+    }
+
+    this.permissionMgr?.grantPermission(type as any, resource);
+    printSuccess(`Granted: ${type}${resource ? ` (${resource})` : ''}`);
+  }
+
+  private revokePermission(type?: string, resource?: string): void {
+    if (!type) {
+      printError('Usage: /perm revoke <type> [resource]');
+      return;
+    }
+
+    this.permissionMgr?.revokePermission(type as any, resource);
+    printSuccess(`Revoked: ${type}${resource ? ` (${resource})` : ''}`);
   }
 
   private async showTemplates(): Promise<void> {

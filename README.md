@@ -27,6 +27,7 @@
 - 🔄 **多模型对比** - 同时调用多个模型，综合分析给出最佳答案
 - 👤 **用户画像系统** - 记住用户偏好，完善用户画像，提供个性化服务
 - 🛡️ **内容安全过滤** - 自动过滤不当内容，维护健康交流环境
+- 🔐 **权限管理系统** - 细粒度控制文件、网络、命令执行权限，交互式授权确认
 
 ### 🚀 快速开始
 
@@ -92,6 +93,7 @@ ollama:
 | `/memory` | 记忆管理 |
 | `/templates` | 查看组织架构模板 |
 | `/mcp` | 管理 MCP 服务器 |
+| `/perm` | 权限管理 |
 | `/sessions` | 查看历史会话 |
 | `/load <id>` | 加载历史会话 |
 | `/reset` | 清空对话 |
@@ -476,6 +478,35 @@ coolAI 内置内容安全过滤：
 
 多次发送违规内容会被记录。
 
+### 权限管理
+
+coolAI 权限管理系统确保操作安全可控：
+
+```bash
+/perm                      # 查看权限设置
+/perm view                # 查看当前权限状态
+/perm grant <type> [resource]  # 授予权限
+/perm revoke <type> [resource] # 撤销权限
+/perm revokeall           # 撤销所有权限
+/perm trust <cmd>         # 添加可信命令（如 git, npm）
+/perm allow <path>        # 添加允许路径
+/perm deny <path>         # 添加禁止路径
+/perm auto [on|off]       # 自动授权危险操作
+/perm ask [on|off]        # 询问权限（默认开启）
+```
+
+**权限类型：**
+- `file_read` - 读取文件
+- `file_write` - 写入文件
+- `file_delete` - 删除文件
+- `command_execute` - 执行命令
+- `network_request` - 网络请求
+- `browser_open` - 打开浏览器
+- `mcp_access` - 访问 MCP 服务
+- `tool_execute` - 执行工具
+
+执行危险操作时会自动弹出授权确认，输入 `yes` 授权，`no` 拒绝，`all` 永久授权此类操作。
+
 ### 任务进度显示
 
 任务执行时会实时显示进度：
@@ -793,6 +824,7 @@ An intelligent coding assistant CLI tool powered by Ollama, with support for MCP
 - 🏢 **Multi-Agent Organization** - Simulate enterprise team collaboration with multiple agent roles
 - 🐱 **AgentCat Companion** - Health reminder assistant for water, rest, and exercise
 - 📋 **Task Progress Tracking** - Real-time task execution progress and status
+- 🔐 **Permission Management** - Fine-grained control over file, network, command execution permissions
 
 ### Installation
 
@@ -845,6 +877,7 @@ ollama:
 | `/memory` | Memory management |
 | `/templates` | List organization templates |
 | `/mcp` | Manage MCP servers |
+| `/perm` | Permission management |
 | `/sessions` | List conversation sessions |
 | `/load <id>` | Load a previous session |
 | `/reset` | Clear conversation |
@@ -988,6 +1021,35 @@ mcp:
     env:
       OBSIDIAN_VAULT_PATH: /path/to/your/vault
 ```
+
+### Permission Management
+
+coolAI's permission system ensures operations are safe and controllable:
+
+```bash
+/perm                      # View permission settings
+/perm view                # View current permissions
+/perm grant <type> [resource]  # Grant permission
+/perm revoke <type> [resource] # Revoke permission
+/perm revokeall           # Revoke all permissions
+/perm trust <cmd>         # Add trusted command (e.g., git, npm)
+/perm allow <path>        # Add allowed path
+/perm deny <path>         # Add denied path
+/perm auto [on|off]       # Auto-grant dangerous operations
+/perm ask [on|off]        # Ask for permissions (default: on)
+```
+
+**Permission Types:**
+- `file_read` - Read files
+- `file_write` - Write files
+- `file_delete` - Delete files
+- `command_execute` - Execute commands
+- `network_request` - Network requests
+- `browser_open` - Open browser
+- `mcp_access` - Access MCP services
+- `tool_execute` - Execute tools
+
+Dangerous operations prompt for confirmation. Enter `yes` to grant, `no` to deny, `all` to permanently grant this type of operation.
 
 ### Built-in Tools
 
