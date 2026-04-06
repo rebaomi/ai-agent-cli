@@ -115,6 +115,7 @@ export class Sandbox {
         env: { ...process.env, ...options.env },
         shell: true,
         windowsHide: true,
+        windowsVerbatimArguments: true,
       });
 
       let stdout = '';
