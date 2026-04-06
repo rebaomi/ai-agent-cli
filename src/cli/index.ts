@@ -182,14 +182,18 @@ export class CLI {
       return new Promise((resolve) => {
         rl.question(chalk.blue('> '), (answer) => {
           rl.close();
-          if (answer.toLowerCase() === 'yes' || answer.toLowerCase() === 'y') {
-            resolve(true);
-          } else if (answer.toLowerCase() === 'all') {
-            this.permissionMgr!.grantPermission(request.type, request.resource);
-            resolve(true);
-          } else {
-            resolve(false);
+          
+          const result = this.permissionMgr!.parsePermissionAnswer(answer);
+          
+          if (result.granted) {
+            if (result.permanent) {
+              this.permissionMgr!.grantPermission(request.type, request.resource);
+            } else if (result.expiresInMs) {
+              this.permissionMgr!.grantPermission(request.type, request.resource, result.expiresInMs);
+            }
           }
+          
+          resolve(result.granted);
         });
       });
     });
@@ -736,7 +740,7 @@ ${chalk.cyan('/profile style [type]')}  设置沟通风格 (concise/normal/detai
         this.permissionMgr.printPermissions();
         break;
       case 'grant':
-        this.grantPermission(args[1], args[2]);
+        this.grantPermission(args[1], args[2], args[3]);
         break;
       case 'revoke':
         this.revokePermission(args[1], args[2]);
@@ -744,6 +748,13 @@ ${chalk.cyan('/profile style [type]')}  设置沟通风格 (concise/normal/detai
       case 'revokeall':
         this.permissionMgr.revokeAll();
         printSuccess('All permissions revoked');
+        break;
+      case 'group':
+        this.handleGroupCommand(args[1], args[2]);
+        break;
+      case 'audit':
+        const limit = parseInt(args[1] || '20');
+        this.permissionMgr.printAuditLog(limit);
         break;
       case 'trust':
         if (args[1]) {
@@ -778,9 +789,13 @@ ${chalk.cyan('/profile style [type]')}  设置沟通风格 (concise/normal/detai
 ${chalk.bold('权限管理命令:')}
 ${chalk.cyan('/perm')}             查看权限设置
 ${chalk.cyan('/perm view')}        查看当前权限
-${chalk.cyan('/perm grant')} <type> [resource] 授予权限
+${chalk.cyan('/perm grant')} <type> [resource] [10m|1h|24h] 授予权限(可选过期时间)
 ${chalk.cyan('/perm revoke')} <type> [resource] 撤销权限
 ${chalk.cyan('/perm revokeall')}    撤销所有权限
+${chalk.cyan('/perm group')}        查看权限组
+${chalk.cyan('/perm group grant')} <groupId> 授予权限组
+${chalk.cyan('/perm group revoke')} <groupId> 撤销权限组
+${chalk.cyan('/perm audit')} [n]    查看审计日志(默认20条)
 ${chalk.cyan('/perm trust')} <cmd>  添加可信命令
 ${chalk.cyan('/perm allow')} <path> 添加允许路径
 ${chalk.cyan('/perm deny')} <path>  添加禁止路径
@@ -788,26 +803,52 @@ ${chalk.cyan('/perm auto')} [on|off] 自动授权危险操作
 ${chalk.cyan('/perm ask')} [on|off] 询问权限
 
 ${chalk.gray('权限类型:')}
-  file_read, file_write, file_delete, command_execute
+  file_read, file_write, file_delete, file_copy, file_move
+  directory_list, directory_create, command_execute
   network_request, browser_open, mcp_access, tool_execute
+  env_read, process_list, clipboard_read, clipboard_write
+
+${chalk.gray('权限组:')}
+  file_ops - 基础文件操作(读写列表创建)
+  file_dangerous - 危险文件操作(删除复制移动)
+  network - 网络操作(请求和浏览器)
+  system - 系统操作(命令执行环境进程)
 `);
     }
   }
 
-  private grantPermission(type?: string, resource?: string): void {
+  private grantPermission(type?: string, resource?: string, expiresIn?: string): void {
     if (!type) {
-      printError('Usage: /perm grant <type> [resource]');
+      printError('Usage: /perm grant <type> [resource] [10m|1h|24h]');
       return;
     }
 
-    const validTypes = ['file_read', 'file_write', 'file_delete', 'command_execute', 'network_request', 'browser_open', 'mcp_access', 'tool_execute'];
+    const validTypes = ['file_read', 'file_write', 'file_delete', 'file_copy', 'file_move',
+      'directory_list', 'directory_create', 'command_execute', 'network_request',
+      'browser_open', 'mcp_access', 'tool_execute', 'env_read', 'process_list'];
     if (!validTypes.includes(type)) {
       printError('Invalid type. Choose from: ' + validTypes.join(', '));
       return;
     }
 
-    this.permissionMgr?.grantPermission(type as any, resource);
-    printSuccess(`Granted: ${type}${resource ? ` (${resource})` : ''}`);
+    let expiresMs: number | undefined;
+    if (expiresIn) {
+      const match = expiresIn.match(/^(\d+)(m|h|d)$/);
+      if (match) {
+        const numStr = match[1];
+        const unit = match[2];
+        if (numStr && unit) {
+          const value = parseInt(numStr);
+          if (unit === 'm') expiresMs = value * 60 * 1000;
+          else if (unit === 'h') expiresMs = value * 60 * 60 * 1000;
+          else if (unit === 'd') expiresMs = value * 24 * 60 * 60 * 1000;
+        }
+      }
+    }
+
+    this.permissionMgr?.grantPermission(type as any, resource, expiresMs);
+    const expText = expiresMs ? ` (${expiresIn})` : ' (永久)';
+    printSuccess(`Granted: ${type}${resource ? ` (${resource})` : ''}${expText}`);
   }
 
   private revokePermission(type?: string, resource?: string): void {
@@ -818,6 +859,35 @@ ${chalk.gray('权限类型:')}
 
     this.permissionMgr?.revokePermission(type as any, resource);
     printSuccess(`Revoked: ${type}${resource ? ` (${resource})` : ''}`);
+  }
+
+  private handleGroupCommand(action?: string, groupId?: string): void {
+    if (!action || action === 'list') {
+      console.log(chalk.bold('\n📦 权限组\n'));
+      const groups = this.permissionMgr?.getGroups() || [];
+      for (const group of groups) {
+        const hasAll = group.permissions.every(p => this.permissionMgr?.isGranted(p));
+        const status = hasAll ? chalk.green('✓') : chalk.gray('○');
+        console.log(`${status} ${chalk.cyan(group.id)} - ${group.name}`);
+        console.log(chalk.gray(`   ${group.description}`));
+        console.log(chalk.gray(`   权限: ${group.permissions.join(', ')}\n`));
+      }
+      return;
+    }
+
+    if (action === 'grant' && groupId) {
+      this.permissionMgr?.grantGroup(groupId);
+      printSuccess(`Granted group: ${groupId}`);
+      return;
+    }
+
+    if (action === 'revoke' && groupId) {
+      this.permissionMgr?.revokeGroup(groupId);
+      printSuccess(`Revoked group: ${groupId}`);
+      return;
+    }
+
+    printInfo('Usage: /perm group [list|grant <groupId>|revoke <groupId>]');
   }
 
   private createNewSession(): void {

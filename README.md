@@ -508,8 +508,37 @@ coolAI 权限管理系统确保操作安全可控：
 - `browser_open` - 打开浏览器
 - `mcp_access` - 访问 MCP 服务
 - `tool_execute` - 执行工具
+- `env_read` - 读取环境变量
+- `process_list` - 查看进程列表
+- `clipboard_read` - 读取剪贴板
+- `clipboard_write` - 写入剪贴板
 
-执行危险操作时会自动弹出授权确认，输入 `yes` 授权，`no` 拒绝，`all` 永久授权此类操作。
+执行危险操作时会自动弹出授权确认：
+
+| 输入 | 说明 |
+|------|------|
+| `yes` / `y` | 授权本次 |
+| `all` | 永久授权此类操作 |
+| `10m` | 授权 10 分钟 |
+| `1h` | 授权 1 小时 |
+| `24h` | 授权 24 小时 |
+| `no` / `n` | 拒绝 |
+
+#### 权限组
+
+```
+/perm group              # 查看权限组
+/perm group grant <id>   # 授予权限组
+/perm group revoke <id>  # 撤销权限组
+```
+
+可用权限组：`file_ops`（基础文件）、`file_dangerous`（危险文件）、`network`（网络）、`system`（系统）
+
+#### 审计日志
+
+```
+/perm audit [n]           # 查看最近 n 条审计日志（默认 20 条）
+```
 
 ### 任务进度显示
 
@@ -1035,9 +1064,13 @@ coolAI's permission system ensures operations are safe and controllable:
 ```bash
 /perm                      # View permission settings
 /perm view                # View current permissions
-/perm grant <type> [resource]  # Grant permission
+/perm grant <type> [resource] [10m|1h|24h]  # Grant permission with optional expiry
 /perm revoke <type> [resource] # Revoke permission
 /perm revokeall           # Revoke all permissions
+/perm group               # View permission groups
+/perm group grant <id>    # Grant permission group
+/perm group revoke <id>    # Revoke permission group
+/perm audit [n]           # View audit log (default 20 entries)
 /perm trust <cmd>         # Add trusted command (e.g., git, npm)
 /perm allow <path>        # Add allowed path
 /perm deny <path>         # Add denied path
@@ -1049,13 +1082,44 @@ coolAI's permission system ensures operations are safe and controllable:
 - `file_read` - Read files
 - `file_write` - Write files
 - `file_delete` - Delete files
+- `file_copy` - Copy files
+- `file_move` - Move files
+- `directory_list` - List directories
+- `directory_create` - Create directories
 - `command_execute` - Execute commands
 - `network_request` - Network requests
 - `browser_open` - Open browser
 - `mcp_access` - Access MCP services
 - `tool_execute` - Execute tools
+- `env_read` - Read environment variables
+- `process_list` - List processes
 
-Dangerous operations prompt for confirmation. Enter `yes` to grant, `no` to deny, `all` to permanently grant this type of operation.
+Dangerous operations prompt for confirmation:
+
+| Input | Description |
+|-------|-------------|
+| `yes` / `y` | Grant this time |
+| `all` | Permanently grant |
+| `10m` | Grant for 10 minutes |
+| `1h` | Grant for 1 hour |
+| `24h` | Grant for 24 hours |
+| `no` / `n` | Deny |
+
+#### Permission Groups
+
+```
+/perm group              # View permission groups
+/perm group grant <id>   # Grant permission group
+/perm group revoke <id>  # Revoke permission group
+```
+
+Available groups: `file_ops` (basic file), `file_dangerous` (dangerous file), `network`, `system`
+
+#### Audit Log
+
+```
+/perm audit [n]           # View last n audit entries (default 20)
+```
 
 ### Built-in Tools
 

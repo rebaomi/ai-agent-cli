@@ -7,6 +7,8 @@ import { LSPManager } from '../lsp/client.js';
 import { Sandbox } from '../sandbox/executor.js';
 import { BuiltInTools } from '../tools/builtin.js';
 import { Planner, Plan, PlanStep, createPlanner } from './planner.js';
+import { permissionManager } from './permission-manager.js';
+import { getToolPermission, extractResource } from './tool-permissions.js';
 
 export interface AgentOptions {
   ollama: OllamaClient;
@@ -16,6 +18,7 @@ export interface AgentOptions {
   builtInTools?: BuiltInTools;
   systemPrompt?: string;
   maxIterations?: number;
+  permissionManager?: typeof permissionManager;
 }
 
 export interface AgentEvent {
@@ -340,6 +343,26 @@ You: "Here's the content of package.json..."`;
       args = JSON.parse(argsStr);
     } catch {
       return { tool_call_id: toolCall.id, output: 'Invalid JSON arguments', is_error: true };
+    }
+
+    const toolPerm = getToolPermission(name);
+    if (toolPerm) {
+      const resource = extractResource(name, args) || toolPerm.resourceExtractor?.(args);
+      const description = `${name}${resource ? ` on ${resource}` : ''}`;
+      
+      const granted = await permissionManager.requestPermission(
+        toolPerm.permissionType,
+        resource,
+        description
+      );
+      
+      if (!granted) {
+        return {
+          tool_call_id: toolCall.id,
+          output: `Permission denied: ${toolPerm.permissionType}${resource ? ` (${resource})` : ''}\n需要授权才能执行此操作。输入 /perm 查看权限设置。`,
+          is_error: true,
+        };
+      }
     }
 
     if (name.includes('_')) {
