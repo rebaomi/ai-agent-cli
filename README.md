@@ -388,15 +388,24 @@ mcp:
 
 ### 内置工具
 
-- `read_file` - 读取文件
-- `write_file` - 写入文件
-- `edit_file` - 编辑文件
-- `delete_file` - 删除文件
-- `list_directory` - 列出目录
-- `glob` - 文件匹配
-- `execute_command` - 执行命令
-- `lsp_complete` - 代码补全
-- `lsp_diagnostics` - 代码诊断
+| 工具 | 说明 |
+|------|------|
+| `read_file` | 读取文件 |
+| `write_file` | 写入文件 |
+| `edit_file` | 编辑文件 |
+| `delete_file` | 删除文件 |
+| `copy_file` | 复制文件 |
+| `move_file` | 移动/重命名文件 |
+| `file_info` | 获取文件信息（大小、时间等） |
+| `list_directory` | 列出目录 |
+| `glob` | 文件匹配 |
+| `grep` | 正则搜索文件内容 |
+| `execute_command` | 执行命令 |
+| `get_current_time` | 获取当前时间 |
+| `calculate` | 数学计算 |
+| `lsp_complete` | 代码补全 |
+| `lsp_diagnostics` | 代码诊断 |
+| `lsp_definition` | 跳转到定义 |
 
 ### 技术栈
 
@@ -568,15 +577,24 @@ mcp:
 
 ### Built-in Tools
 
-- `read_file` - Read file contents
-- `write_file` - Write content to file
-- `edit_file` - Edit file
-- `delete_file` - Delete file
-- `list_directory` - List directory contents
-- `glob` - Find files by pattern
-- `execute_command` - Execute shell command
-- `lsp_complete` - Code completion
-- `lsp_diagnostics` - Code diagnostics
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read file contents |
+| `write_file` | Write content to file |
+| `edit_file` | Edit file |
+| `delete_file` | Delete file |
+| `copy_file` | Copy file |
+| `move_file` | Move/rename file |
+| `file_info` | Get file info (size, dates) |
+| `list_directory` | List directory contents |
+| `glob` | Find files by pattern |
+| `grep` | Regex search file contents |
+| `execute_command` | Execute shell command |
+| `get_current_time` | Get current time |
+| `calculate` | Math calculator |
+| `lsp_complete` | Code completion |
+| `lsp_diagnostics` | Code diagnostics |
+| `lsp_definition` | Go to definition |
 
 ### Tech Stack
 

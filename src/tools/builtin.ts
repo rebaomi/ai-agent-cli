@@ -19,12 +19,18 @@ export class BuiltInTools {
       this.writeFileTool(),
       this.editFileTool(),
       this.deleteFileTool(),
+      this.copyFileTool(),
+      this.moveFileTool(),
+      this.fileInfoTool(),
       this.listDirectoryTool(),
       this.createDirectoryTool(),
       this.searchFilesTool(),
+      this.grepTool(),
       this.executeCommandTool(),
       this.globTool(),
       this.readMultipleFilesTool(),
+      this.getCurrentTimeTool(),
+      this.calculateTool(),
       this.lspCompleteTool(),
       this.lspDiagnosticsTool(),
       this.lspDefinitionTool(),
@@ -297,6 +303,94 @@ export class BuiltInTools {
     };
   }
 
+  private copyFileTool(): Tool {
+    return {
+      name: 'copy_file',
+      description: 'Copy a file or directory to a new location',
+      input_schema: {
+        type: 'object',
+        properties: {
+          source: { type: 'string', description: 'Source path' },
+          destination: { type: 'string', description: 'Destination path' },
+        },
+        required: ['source', 'destination'],
+      },
+    };
+  }
+
+  private moveFileTool(): Tool {
+    return {
+      name: 'move_file',
+      description: 'Move or rename a file or directory',
+      input_schema: {
+        type: 'object',
+        properties: {
+          source: { type: 'string', description: 'Source path' },
+          destination: { type: 'string', description: 'Destination path' },
+        },
+        required: ['source', 'destination'],
+      },
+    };
+  }
+
+  private fileInfoTool(): Tool {
+    return {
+      name: 'file_info',
+      description: 'Get information about a file or directory',
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path to file or directory' },
+        },
+        required: ['path'],
+      },
+    };
+  }
+
+  private grepTool(): Tool {
+    return {
+      name: 'grep',
+      description: 'Search for text in files using regular expressions',
+      input_schema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Regex pattern to search for' },
+          path: { type: 'string', description: 'Directory to search in' },
+          include: { type: 'string', description: 'File pattern to include (e.g., "*.ts")' },
+        },
+        required: ['pattern', 'path'],
+      },
+    };
+  }
+
+  private getCurrentTimeTool(): Tool {
+    return {
+      name: 'get_current_time',
+      description: 'Get the current date and time',
+      input_schema: {
+        type: 'object',
+        properties: {
+          timezone: { type: 'string', description: 'Timezone (e.g., "Asia/Shanghai", "America/New_York")' },
+          format: { type: 'string', description: 'Date format (default: "YYYY-MM-DD HH:mm:ss")' },
+        },
+      },
+    };
+  }
+
+  private calculateTool(): Tool {
+    return {
+      name: 'calculate',
+      description: 'Evaluate a mathematical expression',
+      input_schema: {
+        type: 'object',
+        properties: {
+          expression: { type: 'string', description: 'Mathematical expression (e.g., "2 + 2", "sqrt(16)")' },
+        },
+        required: ['expression'],
+      },
+    };
+  }
+
   async executeTool(name: string, args: unknown): Promise<ToolResult> {
     try {
       let result: string;
@@ -388,6 +482,53 @@ export class BuiltInTools {
           const { uri, line, character } = args as { uri: string; line: number; character: number };
           const definition = await this.lspDefinition(uri, line, character);
           result = JSON.stringify(definition, null, 2);
+          break;
+        }
+
+        case 'copy_file': {
+          const { source, destination } = args as { source: string; destination: string };
+          await fs.copyFile(source, destination);
+          result = `Copied: ${source} -> ${destination}`;
+          break;
+        }
+
+        case 'move_file': {
+          const { source, destination } = args as { source: string; destination: string };
+          await fs.rename(source, destination);
+          result = `Moved: ${source} -> ${destination}`;
+          break;
+        }
+
+        case 'file_info': {
+          const { path: filePath } = args as { path: string };
+          const stats = await fs.stat(filePath);
+          result = JSON.stringify({
+            path: filePath,
+            size: stats.size,
+            isDirectory: stats.isDirectory(),
+            isFile: stats.isFile(),
+            created: stats.birthtime,
+            modified: stats.mtime,
+            accessed: stats.atime,
+          }, null, 2);
+          break;
+        }
+
+        case 'grep': {
+          const { pattern, path: searchPath, include } = args as { pattern: string; path: string; include?: string };
+          result = await this.grep(searchPath, pattern, include);
+          break;
+        }
+
+        case 'get_current_time': {
+          const { timezone, format } = args as { timezone?: string; format?: string };
+          result = this.getCurrentTime(timezone, format);
+          break;
+        }
+
+        case 'calculate': {
+          const { expression } = args as { expression: string };
+          result = this.calculate(expression);
           break;
         }
 
@@ -498,6 +639,93 @@ export class BuiltInTools {
     const client = this.lspManager.getClientForUri(uri);
     if (!client) return null;
     return client.definition(uri, { line, character });
+  }
+
+  private async grep(dir: string, pattern: string, include?: string): Promise<string> {
+    const results: string[] = [];
+    const regex = new RegExp(pattern, 'gi');
+
+    async function search(currentDir: string): Promise<void> {
+      const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const fullPath = path.join(currentDir, entry.name);
+
+        if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+          await search(fullPath);
+        } else if (entry.isFile()) {
+          if (include && !entry.name.match(include.replace('*', '.*'))) {
+            continue;
+          }
+          try {
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const lines = content.split('\n');
+            lines.forEach((line, index) => {
+              if (regex.test(line)) {
+                results.push(`${fullPath}:${index + 1}: ${line.trim()}`);
+              }
+              regex.lastIndex = 0;
+            });
+          } catch { /* ignore */ }
+        }
+      }
+    }
+
+    await search(dir);
+    return results.length > 0 ? results.join('\n') : 'No matches found';
+  }
+
+  private getCurrentTime(timezone?: string, format?: string): string {
+    const now = new Date();
+    if (timezone) {
+      try {
+        const formatter = new Intl.DateTimeFormat('en-US', {
+          timeZone: timezone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        });
+        return formatter.format(now);
+      } catch {
+        return now.toISOString();
+      }
+    }
+
+    if (format) {
+      return format
+        .replace('YYYY', String(now.getFullYear()))
+        .replace('MM', String(now.getMonth() + 1).padStart(2, '0'))
+        .replace('DD', String(now.getDate()).padStart(2, '0'))
+        .replace('HH', String(now.getHours()).padStart(2, '0'))
+        .replace('mm', String(now.getMinutes()).padStart(2, '0'))
+        .replace('ss', String(now.getSeconds()).padStart(2, '0'));
+    }
+
+    return now.toISOString();
+  }
+
+  private calculate(expression: string): string {
+    try {
+      const sanitized = expression
+        .replace(/[^0-9+\-*/().sqrt,\s]/gi, '')
+        .replace(/sqrt\(/gi, 'Math.sqrt(')
+        .replace(/pow\(/gi, 'Math.pow(')
+        .replace(/abs\(/gi, 'Math.abs(')
+        .replace(/floor\(/gi, 'Math.floor(')
+        .replace(/ceil\(/gi, 'Math.ceil(')
+        .replace(/round\(/gi, 'Math.round(')
+        .replace(/pi/gi, 'Math.PI')
+        .replace(/e(?![xp])/gi, 'Math.E');
+
+      const result = new Function(`return ${sanitized}`)();
+      return `${expression} = ${result}`;
+    } catch (error) {
+      return `Error: ${error instanceof Error ? error.message : 'Invalid expression'}`;
+    }
   }
 }
 
