@@ -11,15 +11,29 @@
 - 🛡️ **安全沙箱** - 代码执行在受控环境中运行
 - 💬 **交互式对话** - 类 Claude Code 的命令行界面
 
-## 快速开始
-
-### 安装依赖
+## 安装
 
 ```bash
 npm install
+npm link
 ```
 
-### 配置
+## 使用
+
+安装后，在任意目录运行：
+
+```bash
+coolAI
+```
+
+其他启动方式：
+```bash
+ai-agent          # 也可以用这个命令
+node dist/cli/index.js  # 直接运行
+npm run dev       # 开发模式
+```
+
+## 配置
 
 在 `~/.ai-agent-cli/config.yaml` 创建配置文件：
 
@@ -30,17 +44,7 @@ ollama:
   temperature: 0.7
 ```
 
-### 运行
-
-```bash
-node dist/cli/index.js
-```
-
-或者开发模式：
-
-```bash
-npm run dev
-```
+> 注意：首次使用需要先启动 Ollama 服务 `ollama serve` 并下载模型 `ollama pull qwen3.5:9b`
 
 ## 命令
 
