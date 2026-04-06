@@ -1,15 +1,84 @@
 # coolAI 配置文件示例
 # 复制到 ~/.ai-agent-cli/config.yaml
 
+# ===========================================
+# LLM 配置（至少配置一个）
+# ===========================================
+
+# Ollama（本地模型，默认）
 ollama:
   baseUrl: http://localhost:11434
   model: qwen3.5:9b
   temperature: 0.7
   maxTokens: 4096
 
+# DeepSeek
+# deepseek:
+#   apiKey: your-deepseek-api-key
+#   model: deepseek-chat
+#   baseUrl: https://api.deepseek.com
+#   temperature: 0.7
+
+# Kimi（月之暗面）
+# kimi:
+#   apiKey: your-kimi-api-key
+#   model: moonshot-v1-8k
+#   baseUrl: https://api.moonshot.cn/v1
+#   temperature: 0.7
+
+# 智谱 GLM
+# glm:
+#   apiKey: your-glm-api-key
+#   model: glm-4
+#   baseUrl: https://open.bigmodel.cn/api/paas/v4
+#   temperature: 0.7
+
+# 字节豆包
+# doubao:
+#   apiKey: your-doubao-api-key
+#   model: doubao-pro
+#   baseUrl: https://ark.cn-beijing.volces.com/api/v3
+#   temperature: 0.7
+
+# MiniMax
+# minimax:
+#   apiKey: your-minimax-api-key
+#   model: MiniMax-Text-01
+#   baseUrl: https://api.minimax.chat/v1
+#   temperature: 0.7
+
+# OpenAI
+# openai:
+#   apiKey: your-openai-api-key
+#   model: gpt-4
+#   baseUrl: https://api.openai.com/v1
+#   temperature: 0.7
+
+# Anthropic Claude
+# claude:
+#   apiKey: your-claude-api-key
+#   model: claude-sonnet-4-20250514
+#   baseUrl: https://api.anthropic.com
+#   temperature: 0.7
+
+# Google Gemini
+# gemini:
+#   apiKey: your-gemini-api-key
+#   model: gemini-2.0-flash
+#   baseUrl: https://generativelanguage.googleapis.com/v1beta
+#   temperature: 0.7
+
+# ===========================================
+# 基础配置
+# ===========================================
+
 workspace: .
 maxIterations: 100
 toolTimeout: 60000
+
+# ===========================================
+# 沙箱配置
+# ===========================================
 
 sandbox:
   enabled: true
@@ -25,19 +94,158 @@ sandbox:
     - C:\Windows
     - C:\Program Files
 
-# MCP 服务器配置（可选）
-# mcp:
-#   - name: filesystem
-#     command: npx
-#     args:
-#       - -y
-#       - @modelcontextprotocol/server-filesystem
-#     env:
-#       ALLOWED_DIRECTORY: /tmp
+# ===========================================
+# MCP 服务器配置
+# ===========================================
 
-# LSP 服务器配置（可选）
-# lsp:
-#   - name: typescript
-#     command: typescript-language-server
-#     args:
-#       - --stdio
+mcp:
+  # 文件系统服务器
+  # - name: filesystem
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-filesystem
+  #   env:
+  #     ALLOWED_DIRECTORY: /tmp
+
+  # 飞书服务器
+  # - name: feishu
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-feishu
+  #   env:
+  #     FEISHU_APP_ID: your-app-id
+  #     FEISHU_APP_SECRET: your-app-secret
+
+  # 钉钉服务器
+  # - name: dingtalk
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-dingtalk
+  #   env:
+  #     DINGTALK_APP_KEY: your-app-key
+  #     DINGTALK_APP_SECRET: your-app-secret
+
+  # Telegram 服务器
+  # - name: telegram
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-telegram
+  #   env:
+  #     TELEGRAM_BOT_TOKEN: your-bot-token
+
+  # GitHub 服务器
+  # - name: github
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-github
+  #   env:
+  #     GITHUB_TOKEN: your-github-token
+
+  # Slack 服务器
+  # - name: slack
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-slack
+  #   env:
+  #     SLACK_BOT_TOKEN: xoxb-your-token
+  #     SLACK_TEAM_ID: your-team-id
+
+  # Brave 搜索服务器
+  # - name: brave-search
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-brave-search
+  #   env:
+  #     BRAVE_API_KEY: your-brave-api-key
+
+  # Fetch 网页获取服务器
+  # - name: fetch
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-fetch
+
+  # Google Maps 服务器
+  # - name: google-maps
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-google-maps
+  #   env:
+  #     GOOGLE_MAPS_API_KEY: your-api-key
+
+  # SQLite 数据库服务器
+  # - name: sqlite
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-sqlite
+  #   env:
+  #     DATABASE_PATH: ./data.db
+
+  # 时间服务器
+  # - name: time
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-time
+
+  # EverArt 图像生成服务器
+  # - name: everart
+  #   command: npx
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-everart
+  #   env:
+  #     EVERART_API_TOKEN: your-token
+
+# ===========================================
+# LSP 服务器配置
+# ===========================================
+
+lsp:
+  # TypeScript/JavaScript
+  # - name: typescript
+  #   command: typescript-language-server
+  #   args:
+  #     - --stdio
+  #   languages:
+  #     - typescript
+  #     - javascript
+  #   rootPatterns:
+  #     - tsconfig.json
+  #     - package.json
+
+  # Python
+  # - name: python
+  #   command: pyright-langserver
+  #   args:
+  #     - --stdio
+  #   languages:
+  #     - python
+  #   rootPatterns:
+  #     - pyproject.toml
+  #     - setup.py
+
+  # Rust
+  # - name: rust
+  #   command: rust-analyzer
+  #   languages:
+  #     - rust
+  #   rootPatterns:
+  #     - Cargo.toml
+
+  # Go
+  # - name: go
+  #   command: gopls
+  #   languages:
+  #     - go
+  #   rootPatterns:
+  #     - go.mod
