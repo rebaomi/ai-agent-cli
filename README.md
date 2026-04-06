@@ -136,6 +136,18 @@ AI：📋 任务规划已创建
 - 逐步执行每个步骤
 - 汇总最终结果
 
+#### 联网搜索和浏览器
+```
+用户：搜索一下最新的 AI 新闻
+AI：自动调用 web_search 工具获取搜索结果
+
+用户：帮我打开 GitHub 首页
+AI：自动调用 open_browser 工具打开浏览器
+
+用户：获取这个网页的内容 https://example.com
+AI：自动调用 fetch_url 工具抓取网页
+```
+
 #### 配合 MCP 扩展
 如果配置了 Obsidian MCP：
 ```
@@ -403,6 +415,9 @@ mcp:
 | `execute_command` | 执行命令 |
 | `get_current_time` | 获取当前时间 |
 | `calculate` | 数学计算 |
+| `web_search` | 联网搜索（DuckDuckGo，无需 API key） |
+| `fetch_url` | 获取网页内容 |
+| `open_browser` | 打开浏览器 |
 | `lsp_complete` | 代码补全 |
 | `lsp_diagnostics` | 代码诊断 |
 | `lsp_definition` | 跳转到定义 |
@@ -592,6 +607,9 @@ mcp:
 | `execute_command` | Execute shell command |
 | `get_current_time` | Get current time |
 | `calculate` | Math calculator |
+| `web_search` | Web search (DuckDuckGo, no API key needed) |
+| `fetch_url` | Fetch webpage content |
+| `open_browser` | Open URL in browser |
 | `lsp_complete` | Code completion |
 | `lsp_diagnostics` | Code diagnostics |
 | `lsp_definition` | Go to definition |

@@ -1,8 +1,12 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import type { Tool, ToolResult } from '../types/index.js';
 import { Sandbox } from '../sandbox/executor.js';
 import { LSPManager } from '../lsp/client.js';
+
+const execAsync = promisify(exec);
 
 export class BuiltInTools {
   private sandbox: Sandbox;
@@ -31,6 +35,9 @@ export class BuiltInTools {
       this.readMultipleFilesTool(),
       this.getCurrentTimeTool(),
       this.calculateTool(),
+      this.webSearchTool(),
+      this.fetchUrlTool(),
+      this.openBrowserTool(),
       this.lspCompleteTool(),
       this.lspDiagnosticsTool(),
       this.lspDefinitionTool(),
@@ -391,6 +398,51 @@ export class BuiltInTools {
     };
   }
 
+  private webSearchTool(): Tool {
+    return {
+      name: 'web_search',
+      description: 'Search the web using DuckDuckGo (no API key required)',
+      input_schema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query' },
+          numResults: { type: 'number', description: 'Number of results (default: 5)' },
+        },
+        required: ['query'],
+      },
+    };
+  }
+
+  private fetchUrlTool(): Tool {
+    return {
+      name: 'fetch_url',
+      description: 'Fetch and extract text content from a webpage',
+      input_schema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'URL to fetch' },
+          maxLength: { type: 'number', description: 'Max content length (default: 10000)' },
+        },
+        required: ['url'],
+      },
+    };
+  }
+
+  private openBrowserTool(): Tool {
+    return {
+      name: 'open_browser',
+      description: 'Open a URL in the default browser',
+      input_schema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'URL to open' },
+          background: { type: 'boolean', description: 'Open in background without focusing (default: false)' },
+        },
+        required: ['url'],
+      },
+    };
+  }
+
   async executeTool(name: string, args: unknown): Promise<ToolResult> {
     try {
       let result: string;
@@ -529,6 +581,24 @@ export class BuiltInTools {
         case 'calculate': {
           const { expression } = args as { expression: string };
           result = this.calculate(expression);
+          break;
+        }
+
+        case 'web_search': {
+          const { query, numResults } = args as { query: string; numResults?: number };
+          result = await this.webSearch(query, numResults ?? 5);
+          break;
+        }
+
+        case 'fetch_url': {
+          const { url, maxLength } = args as { url: string; maxLength?: number };
+          result = await this.fetchUrl(url, maxLength ?? 10000);
+          break;
+        }
+
+        case 'open_browser': {
+          const { url, background } = args as { url: string; background?: boolean };
+          result = await this.openBrowser(url, background ?? false);
           break;
         }
 
@@ -725,6 +795,140 @@ export class BuiltInTools {
       return `${expression} = ${result}`;
     } catch (error) {
       return `Error: ${error instanceof Error ? error.message : 'Invalid expression'}`;
+    }
+  }
+
+  private async webSearch(query: string, numResults: number): Promise<string> {
+    try {
+      const encodedQuery = encodeURIComponent(query);
+      const url = `https://html.duckduckgo.com/html/?q=${encodedQuery}&kl=wt-wt`;
+
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+      });
+
+      if (!response.ok) {
+        return `Search failed: HTTP ${response.status}`;
+      }
+
+      const html = await response.text();
+
+      const results: string[] = [];
+      const linkRegex = /<a[^>]+href="([^"]+)"[^>]*class="result__a"[^>]*>([\s\S]*?)<\/a>/gi;
+      const snippetRegex = /<a[^>]+class="result__a"[^>]*>[\s\S]*?<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+
+      let match;
+      let count = 0;
+
+      while ((match = linkRegex.exec(html)) !== null && count < numResults) {
+        const href = match[1] || '';
+        const titleMatch = match[0]?.match(/>([^<]+)<\/a>/);
+        const title = titleMatch?.[1]?.trim() || 'No title';
+
+        if (href.startsWith('http') && !href.includes('duckduckgo')) {
+          results.push(`${count + 1}. ${title}\n   URL: ${href}`);
+          count++;
+        }
+      }
+
+      if (results.length === 0) {
+        const simpleRegex = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+        while ((match = simpleRegex.exec(html)) !== null && count < numResults) {
+          const href = match[1] || '';
+          const title = (match[2] || '').trim().replace(/<[^>]+>/g, '');
+
+          if (!href.includes('duckduckgo') && !href.includes('html.duckduckgo')) {
+            results.push(`${count + 1}. ${title}\n   URL: ${href}`);
+            count++;
+          }
+        }
+      }
+
+      if (results.length === 0) {
+        return `No results found for: ${query}`;
+      }
+
+      return `Search results for "${query}":\n\n${results.join('\n\n')}`;
+    } catch (error) {
+      return `Search error: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async fetchUrl(url: string, maxLength: number): Promise<string> {
+    try {
+      const parsedUrl = new URL(url);
+
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,text/plain',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+
+      if (!response.ok) {
+        return `Failed to fetch: HTTP ${response.status}`;
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+
+      if (!contentType.includes('text/html') && !contentType.includes('text/plain')) {
+        return `Unsupported content type: ${contentType}`;
+      }
+
+      let text = await response.text();
+
+      text = text
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+        .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
+        .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+        .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+        .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (text.length > maxLength) {
+        text = text.substring(0, maxLength) + '...[truncated]';
+      }
+
+      return `Fetched from: ${parsedUrl.hostname}\n\n${text}`;
+    } catch (error) {
+      return `Fetch error: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async openBrowser(url: string, background: boolean): Promise<string> {
+    try {
+      let command: string;
+      const isWindows = process.platform === 'win32';
+      const isMac = process.platform === 'darwin';
+      const isLinux = process.platform === 'linux';
+
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'https://' + url;
+      }
+
+      if (isWindows) {
+        command = background
+          ? `start "" "${url}"`
+          : `start "" "${url}"`;
+      } else if (isMac) {
+        command = `open ${background ? '-g ' : ''}"${url}"`;
+      } else {
+        command = background
+          ? `xdg-open "${url}" > /dev/null 2>&1 &`
+          : `xdg-open "${url}"`;
+      }
+
+      await execAsync(command);
+
+      return `Opened in browser: ${url}`;
+    } catch (error) {
+      return `Failed to open browser: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
 }
