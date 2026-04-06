@@ -90,7 +90,7 @@ npm run dev       # 开发模式
 ```yaml
 ollama:
   baseUrl: http://localhost:11434
-  model: qwen3.5:9b  # 选择你的模型
+  model: qwen3.5:9b
   temperature: 0.7
   maxTokens: 4096
 
@@ -102,7 +102,7 @@ sandbox:
   timeout: 30000
 ```
 
-> 配置文件示例：`config/example.yaml`
+> 完整配置示例：`config/example.yaml`
 
 ### 命令
 
@@ -946,7 +946,7 @@ sandbox:
   timeout: 30000
 ```
 
-> Example config: `config/example.yaml`
+> Full example: `config/example.yaml`
 
 ### Commands
 
