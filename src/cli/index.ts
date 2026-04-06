@@ -8,6 +8,8 @@ import { createMemoryManager, MemoryManager } from '../core/memory.js';
 import { createEnhancedMemoryManager, EnhancedMemoryManager } from '../core/memory-enhanced.js';
 import { createSkillManager } from '../core/skills.js';
 import { OllamaClient } from '../ollama/client.js';
+import { LLMFactory } from '../llm/factory.js';
+import type { LLMProviderInterface } from '../llm/types.js';
 import { MCPManager } from '../mcp/client.js';
 import { LSPManager } from '../lsp/client.js';
 import { Sandbox } from '../sandbox/executor.js';
@@ -33,7 +35,8 @@ const logo = `
 
 export class CLI {
   private agent?: Agent;
-  private ollama?: OllamaClient;
+  private llm?: LLMProviderInterface;
+  private currentProvider = 'ollama';
   private mcpManager: MCPManager;
   private lspManager: LSPManager;
   private sandbox!: Sandbox;
@@ -88,33 +91,41 @@ export class CLI {
     await this.permissionMgr.initialize();
     this.setupPermissionHandler();
 
-    this.ollama = new OllamaClient(config.ollama);
+    this.currentProvider = config.defaultProvider || 'ollama';
+    
+    this.llm = this.createLLMClient(config);
     
     let connected = false;
+    let connectionError = '';
+    
     try {
       connected = await Promise.race([
-        this.ollama.checkConnection(),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000))
+        this.llm.checkConnection(),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000))
       ]);
     } catch (error) {
-      printWarning('Failed to connect to Ollama: ' + (error instanceof Error ? error.message : String(error)));
+      connectionError = error instanceof Error ? error.message : String(error);
+      printWarning(`Failed to connect to ${this.currentProvider}: ${connectionError}`);
     }
     
     if (!connected) {
-      console.log(chalk.yellow('\n⚠️  Ollama 未连接'));
-      console.log(chalk.cyan('  ┌─────────────────────────────────────────────┐'));
-      console.log(chalk.cyan('  │  请在另一个终端运行以下命令启动 Ollama:       │'));
-      console.log(chalk.cyan('  │                                             │'));
-      console.log(chalk.cyan('  │  ') + chalk.bold('ollama serve') + chalk.cyan('                              │'));
-      console.log(chalk.cyan('  │                                             │'));
-      console.log(chalk.cyan('  │  如未安装 Ollama，请访问:                  │'));
-      console.log(chalk.cyan('  │  https://ollama.ai                         │'));
-      console.log(chalk.cyan('  │                                             │'));
-      console.log(chalk.cyan('  │  下载模型: ollama pull qwen3.5:9b         │'));
-      console.log(chalk.cyan('  └─────────────────────────────────────────────┘\n'));
-      console.log(chalk.gray('  或者配置其他模型提供商 (DeepSeek/Kimi/GLM 等)\n'));
+      if (this.currentProvider === 'ollama') {
+        console.log(chalk.yellow('\n⚠️  Ollama 未连接'));
+        console.log(chalk.cyan('  ┌─────────────────────────────────────────────┐'));
+        console.log(chalk.cyan('  │  请在另一个终端运行以下命令启动 Ollama:       │'));
+        console.log(chalk.cyan('  │                                             │'));
+        console.log(chalk.cyan('  │  ') + chalk.bold('ollama serve') + chalk.cyan('                              │'));
+        console.log(chalk.cyan('  │                                             │'));
+        console.log(chalk.cyan('  │  如未安装 Ollama，请访问:                  │'));
+        console.log(chalk.cyan('  │  https://ollama.ai                         │'));
+        console.log(chalk.cyan('  │                                             │'));
+        console.log(chalk.cyan('  │  下载模型: ollama pull qwen3.5:9b         │'));
+        console.log(chalk.cyan('  └─────────────────────────────────────────────┘\n'));
+      } else {
+        console.log(chalk.yellow(`\n⚠️  ${this.currentProvider} 未连接: ${connectionError}`));
+      }
     } else {
-      printSuccess('Connected to Ollama (' + config.ollama.model + ')');
+      printSuccess(`Connected to ${this.currentProvider} (${this.llm.getModel()})`);
     }
 
     const sandboxConfig = config.sandbox || { enabled: true, timeout: 30000 };
@@ -159,12 +170,11 @@ export class CLI {
     }
 
     this.agent = createAgent({
-      ollama: this.ollama,
+      llm: this.llm!,
       mcpManager: this.mcpManager,
       lspManager: this.lspManager,
       sandbox: this.sandbox,
       builtInTools: this.builtInTools,
-      systemPrompt: config.ollama.systemPrompt,
       maxIterations: config.maxIterations,
     });
 
@@ -379,8 +389,8 @@ export class CLI {
       return;
     }
 
-    if (!this.ollama) {
-      printError('Ollama not connected. Please check your configuration.');
+    if (!this.llm) {
+      printError(`${this.currentProvider} not connected. Please check your configuration.`);
       return;
     }
 
@@ -992,6 +1002,110 @@ ${chalk.gray('权限组:')}
     }
   }
 
+  private createLLMClient(config: any): LLMProviderInterface {
+    const provider = config.defaultProvider || 'ollama';
+    
+    switch (provider) {
+      case 'ollama':
+        if (!config.ollama?.enabled) {
+          printWarning('Ollama not enabled, falling back to default config');
+        }
+        return LLMFactory.create({
+          provider: 'ollama',
+          baseUrl: config.ollama?.baseUrl || 'http://localhost:11434',
+          model: config.ollama?.model || 'llama3.2',
+          temperature: config.ollama?.temperature || 0.7,
+          maxTokens: config.ollama?.maxTokens || 4096,
+        });
+        
+      case 'deepseek':
+        if (!config.deepseek?.enabled) {
+          printWarning('DeepSeek not enabled in config');
+        }
+        return LLMFactory.create({
+          provider: 'deepseek',
+          apiKey: config.deepseek?.apiKey || '',
+          baseUrl: config.deepseek?.baseUrl || 'https://api.deepseek.com',
+          model: config.deepseek?.model || 'deepseek-chat',
+          temperature: config.deepseek?.temperature || 0.7,
+        });
+        
+      case 'kimi':
+        if (!config.kimi?.enabled) {
+          printWarning('Kimi not enabled in config');
+        }
+        return LLMFactory.create({
+          provider: 'kimi',
+          apiKey: config.kimi?.apiKey || '',
+          baseUrl: config.kimi?.baseUrl || 'https://api.moonshot.cn/v1',
+          model: config.kimi?.model || 'moonshot-v1-8k',
+          temperature: config.kimi?.temperature || 0.7,
+        });
+        
+      case 'glm':
+        return LLMFactory.create({
+          provider: 'glm',
+          apiKey: config.glm?.apiKey || '',
+          baseUrl: config.glm?.baseUrl || 'https://open.bigmodel.cn/api/paas/v4',
+          model: config.glm?.model || 'glm-4',
+          temperature: config.glm?.temperature || 0.7,
+        });
+        
+      case 'doubao':
+        return LLMFactory.create({
+          provider: 'doubao',
+          apiKey: config.doubao?.apiKey || '',
+          baseUrl: config.doubao?.baseUrl || 'https://ark.cn-beijing.volces.com/api/v3',
+          model: config.doubao?.model || 'doubao-pro',
+          temperature: config.doubao?.temperature || 0.7,
+        });
+        
+      case 'minimax':
+        return LLMFactory.create({
+          provider: 'minimax',
+          apiKey: config.minimax?.apiKey || '',
+          baseUrl: config.minimax?.baseUrl || 'https://api.minimax.chat/v1',
+          model: config.minimax?.model || 'MiniMax-Text-01',
+          temperature: config.minimax?.temperature || 0.7,
+        });
+        
+      case 'openai':
+        return LLMFactory.create({
+          provider: 'openai',
+          apiKey: config.openai?.apiKey || '',
+          baseUrl: config.openai?.baseUrl || 'https://api.openai.com/v1',
+          model: config.openai?.model || 'gpt-4',
+          temperature: config.openai?.temperature || 0.7,
+        });
+        
+      case 'claude':
+        return LLMFactory.create({
+          provider: 'claude',
+          apiKey: config.claude?.apiKey || '',
+          baseUrl: config.claude?.baseUrl || 'https://api.anthropic.com',
+          model: config.claude?.model || 'claude-sonnet-4-20250514',
+          temperature: config.claude?.temperature || 0.7,
+        });
+        
+      case 'gemini':
+        return LLMFactory.create({
+          provider: 'gemini',
+          apiKey: config.gemini?.apiKey || '',
+          baseUrl: config.gemini?.baseUrl || 'https://generativelanguage.googleapis.com/v1beta',
+          model: config.gemini?.model || 'gemini-2.0-flash',
+          temperature: config.gemini?.temperature || 0.7,
+        });
+        
+      default:
+        printWarning(`Unknown provider ${provider}, using ollama`);
+        return LLMFactory.create({
+          provider: 'ollama',
+          baseUrl: 'http://localhost:11434',
+          model: 'llama3.2',
+        });
+    }
+  }
+
   private showQuickHelp(): void {
     console.log(`
 ${chalk.bold('Quick Commands:')}
@@ -1102,11 +1216,11 @@ ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
   }
 
   private async changeModel(model: string): Promise<void> {
-    if (!this.ollama) return;
+    if (!this.llm) return;
     
     try {
-      this.ollama.setModel(model);
-      const connected = await this.ollama.checkConnection();
+      this.llm.setModel(model);
+      const connected = await this.llm.checkConnection();
       if (connected) {
         printSuccess('Model changed to: ' + model);
       } else {
@@ -1283,8 +1397,8 @@ ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
   }
 
   private async loadOrganization(configPath?: string): Promise<void> {
-    if (!this.ollama) {
-      printError('Ollama not initialized');
+    if (!this.llm) {
+      printError('LLM not initialized');
       return;
     }
 
@@ -1309,7 +1423,7 @@ ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
 
     try {
       const factory = createAgentFactory({
-        ollama: this.ollama,
+        llm: this.llm!,
         mcpManager: this.mcpManager,
         lspManager: this.lspManager,
         sandbox: this.sandbox,

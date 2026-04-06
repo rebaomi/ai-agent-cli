@@ -1,22 +1,23 @@
 import type { AgentMember, AgentRole, ROLE_DESCRIPTIONS } from './types.js';
+import type { LLMProviderInterface } from '../../llm/types.js';
 import { Agent } from '../agent.js';
 
 export interface AgentFactoryOptions {
-  ollama: any;
+  llm: LLMProviderInterface;
   mcpManager?: any;
   lspManager?: any;
   sandbox?: any;
 }
 
 export class AgentFactory {
-  private ollama: any;
+  private llm: LLMProviderInterface;
   private mcpManager: any;
   private lspManager: any;
   private sandbox: any;
   private agentInstances: Map<string, Agent> = new Map();
 
   constructor(options: AgentFactoryOptions) {
-    this.ollama = options.ollama;
+    this.llm = options.llm;
     this.mcpManager = options.mcpManager;
     this.lspManager = options.lspManager;
     this.sandbox = options.sandbox;
@@ -103,7 +104,7 @@ export class AgentFactory {
     };
 
     const agent = new Agent({
-      ollama: this.ollama,
+      llm: this.llm,
       mcpManager: this.mcpManager,
       lspManager: this.lspManager,
       sandbox: this.sandbox,

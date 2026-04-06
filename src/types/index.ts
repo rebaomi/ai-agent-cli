@@ -35,10 +35,21 @@ export interface LLMConfig {
   maxTokens?: number;
   tools?: Tool[];
   systemPrompt?: string;
+  enabled?: boolean;
+  apiKey?: string;
 }
 
 export interface AgentConfig {
+  defaultProvider?: string;
   ollama: LLMConfig;
+  deepseek?: LLMConfig;
+  kimi?: LLMConfig;
+  glm?: LLMConfig;
+  doubao?: LLMConfig;
+  minimax?: LLMConfig;
+  openai?: LLMConfig;
+  claude?: LLMConfig;
+  gemini?: LLMConfig;
   mcp?: MCPConfig[];
   lsp?: LSPServerConfig[];
   sandbox?: SandboxConfig;

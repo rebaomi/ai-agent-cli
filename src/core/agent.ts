@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import EventSource from 'eventsource';
 import type { Message, Tool, ToolCall, ToolResult } from '../types/index.js';
+import type { LLMProviderInterface } from '../llm/types.js';
 import { OllamaClient } from '../ollama/client.js';
 import { MCPManager } from '../mcp/client.js';
 import { LSPManager } from '../lsp/client.js';
@@ -11,14 +12,13 @@ import { permissionManager } from './permission-manager.js';
 import { getToolPermission, extractResource } from './tool-permissions.js';
 
 export interface AgentOptions {
-  ollama: OllamaClient;
+  llm: LLMProviderInterface;
   mcpManager?: MCPManager;
   lspManager?: LSPManager;
   sandbox?: Sandbox;
   builtInTools?: BuiltInTools;
   systemPrompt?: string;
   maxIterations?: number;
-  permissionManager?: typeof permissionManager;
 }
 
 export interface AgentEvent {
@@ -29,7 +29,7 @@ export interface AgentEvent {
 }
 
 export class Agent {
-  private ollama: OllamaClient;
+  private llm: LLMProviderInterface;
   private mcpManager: MCPManager;
   private lspManager: LSPManager;
   private sandbox: Sandbox;
@@ -40,17 +40,16 @@ export class Agent {
   private iteration = 0;
   private tools: Tool[] = [];
   private onEvent?: (event: AgentEvent) => void;
-  private planner: Planner;
+  private planner?: Planner;
 
   constructor(options: AgentOptions) {
-    this.ollama = options.ollama;
+    this.llm = options.llm;
     this.mcpManager = options.mcpManager ?? new MCPManager();
     this.lspManager = options.lspManager ?? new LSPManager();
     this.sandbox = options.sandbox ?? new Sandbox({ enabled: true });
     this.builtInTools = options.builtInTools ?? new BuiltInTools(this.sandbox, this.lspManager);
     this.systemPrompt = options.systemPrompt ?? this.getDefaultSystemPrompt();
     this.maxIterations = options.maxIterations ?? 100;
-    this.planner = createPlanner({ ollama: this.ollama });
 
     this.initializeTools();
   }
@@ -73,7 +72,7 @@ export class Agent {
       }
     }
 
-    this.ollama.setTools(this.tools);
+    this.llm.setTools(this.tools);
   }
 
   private getDefaultSystemPrompt(): string {
@@ -169,7 +168,7 @@ You: "Here's the content of package.json..."`;
     }
     
     try {
-      const response = await this.ollama.generate([
+      const response = await this.llm.generate([
         { role: 'system', content: '你是一个任务复杂度分析专家。判断用户任务是否复杂（需要多个步骤或多种工具）。简单回复 "是" 或 "否"。' },
         { role: 'user', content: `分析这个任务是否复杂：${input}` }
       ]);
@@ -185,6 +184,9 @@ You: "Here's the content of package.json..."`;
     this.onEvent?.({ type: 'thinking', content: '分析任务复杂度，准备规划步骤...' });
     
     try {
+      if (!this.planner) {
+        return 'Planner not available, falling back to direct execution';
+      }
       const plan = await this.planner.createPlan(input);
       
       let summary = `📋 **任务规划已创建**\n`;
@@ -271,7 +273,37 @@ You: "Here's the content of package.json..."`;
       ];
 
       try {
-        const stream = this.ollama.chatStream(allMessages);
+        if (!this.llm.chatStream) {
+          fullResponse = await this.llm.generate(allMessages);
+          const parsedToolCalls = this.parseToolCalls(fullResponse);
+          if (parsedToolCalls.length > 0) {
+            this.messages.push({ role: 'assistant', content: fullResponse });
+            for (const toolCall of parsedToolCalls) {
+              this.onEvent?.({
+                type: 'tool_call',
+                content: `Calling tool: ${toolCall.function.name}`,
+                toolCall,
+              });
+              const result = await this.executeToolCall(toolCall);
+              this.onEvent?.({
+                type: 'tool_result',
+                content: result.output || '',
+                toolResult: result,
+              });
+              this.messages.push({
+                role: 'tool',
+                content: result.output || '',
+                tool_call_id: toolCall.id,
+                name: toolCall.function.name,
+              });
+            }
+            continue;
+          }
+          this.messages.push({ role: 'assistant', content: fullResponse });
+          break;
+        }
+
+        const stream = this.llm.chatStream(allMessages);
         let accumulatedContent = '';
 
         for await (const chunk of stream) {
