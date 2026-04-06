@@ -1,0 +1,42 @@
+{
+  "name": "ai-agent-cli",
+  "version": "1.0.0",
+  "description": "AI Agent CLI with MCP, Ollama, and LSP support",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "ai-agent": "./bin/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/cli/index.ts",
+    "start": "node dist/cli/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["ai", "agent", "cli", "mcp", "ollama", "lsp"],
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "conf": "^12.0.0",
+    "eventsource": "^2.0.2",
+    "inquirer": "^9.2.23",
+    "ora": "^7.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-protocol": "^3.17.5",
+    "ws": "^8.18.0",
+    "yaml": "^2.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/eventsource": "^1.1.15",
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

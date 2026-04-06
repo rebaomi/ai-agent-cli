@@ -1,0 +1,78 @@
+# AI Agent CLI 配置说明
+
+## Ollama 配置
+Ollama 是必须的本地 LLM 服务。
+
+### 安装 Ollama
+1. 访问 https://ollama.ai 下载安装
+2. 启动服务：`ollama serve`
+3. 下载模型：`ollama pull llama3.2`
+
+### Ollama 配置项
+```yaml
+ollama:
+  baseUrl: http://localhost:11434  # Ollama 服务地址
+  model: llama3.2                   # 默认模型
+  temperature: 0.7                  # 温度参数 (0-1)
+  maxTokens: 4096                   # 最大生成 token 数
+```
+
+## MCP 配置 (可选)
+MCP (Model Context Protocol) 服务器，用于扩展功能。
+
+```yaml
+mcp:
+  - name: filesystem                  # MCP 服务器名称
+    command: npx                     # 启动命令
+    args:                            # 命令参数
+      - -y
+      - @modelcontextprotocol/server-filesystem
+    env:
+      ROOT_DIR: .                    # 环境变量
+```
+
+常用 MCP 服务器：
+- `@modelcontextprotocol/server-filesystem` - 文件系统访问
+- `@modelcontextprotocol/server-brave-search` - 搜索功能
+- `@modelcontextprotocol/server-github` - GitHub API
+
+## LSP 配置 (可选)
+LSP (Language Server Protocol) 用于代码智能提示。
+
+```yaml
+lsp:
+  - name: typescript
+    command: typescript-language-server
+    args:
+      - --stdio
+    languages:
+      - typescript
+      - javascript
+```
+
+## 沙箱配置
+代码执行的安全限制。
+
+```yaml
+sandbox:
+  enabled: true       # 是否启用沙箱
+  timeout: 30000     # 执行超时 (毫秒)
+  allowedPaths:       # 允许访问的目录
+    - .
+    - ./src
+  deniedPaths:       # 禁止访问的目录
+    - /etc
+    - /sys
+```
+
+## 其他配置
+
+```yaml
+workspace: .          # 工作目录
+maxIterations: 100    # Agent 最大迭代次数
+toolTimeout: 60000    # 工具调用超时 (毫秒)
+```
+
+## 配置位置
+- macOS/Linux: `~/.ai-agent-cli/config.yaml`
+- Windows: `%USERPROFILE%\.ai-agent-cli\config.yaml`

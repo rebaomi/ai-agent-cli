@@ -1,0 +1,7 @@
+{
+  "name": "hello-skill",
+  "version": "1.0.0",
+  "description": "A simple hello world skill demonstrating the skill API",
+  "author": "Example Author",
+  "main": "index.js"
+}
