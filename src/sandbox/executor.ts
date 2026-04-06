@@ -113,9 +113,8 @@ export class Sandbox {
       const child = spawn(command, args, {
         cwd,
         env: { ...process.env, ...options.env },
-        shell: true,
+        shell: process.platform === 'win32' ? 'cmd' : true,
         windowsHide: true,
-        windowsVerbatimArguments: true,
       });
 
       let stdout = '';
