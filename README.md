@@ -178,8 +178,11 @@ export default async function createSkill() {
 
 ## MCP 服务器
 
-在配置文件中添加 MCP 服务器：
+MCP (Model Context Protocol) 服务器可以扩展 AI 的能力。
 
+### 常用 MCP 服务器
+
+#### 文件系统
 ```yaml
 mcp:
   - name: filesystem
@@ -190,6 +193,51 @@ mcp:
     env:
       ROOT_DIR: .
 ```
+
+#### Obsidian 笔记
+接入你的 Obsidian 笔记库，让 AI 可以搜索和管理笔记：
+```yaml
+mcp:
+  - name: obsidian
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-obsidian
+    env:
+      OBSIDIAN_VAULT_PATH: C:\Users\你的用户名\Documents\Obsidian\我的笔记库
+```
+
+然后在 CLI 中说：
+```
+帮我搜索包含 "编程" 的笔记
+```
+AI 会自动调用 Obsidian MCP 工具搜索你的笔记库。
+
+#### GitHub
+```yaml
+mcp:
+  - name: github
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-github
+    env:
+      GITHUB_TOKEN: your-github-token
+```
+
+#### Brave 搜索
+```yaml
+mcp:
+  - name: brave-search
+    command: npx
+    args:
+      - -y
+      - @modelcontextprotocol/server-brave-search
+    env:
+      BRAVE_API_KEY: your-api-key
+```
+
+更多 MCP 服务器：https://modelcontextprotocol.io/servers
 
 ## 内置工具
 
