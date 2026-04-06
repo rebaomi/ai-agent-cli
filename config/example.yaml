@@ -2,71 +2,81 @@
 # 复制到 ~/.ai-agent-cli/config.yaml
 
 # ===========================================
-# LLM 配置（至少配置一个）
+# 默认模型（必须配置一个）
 # ===========================================
+defaultProvider: ollama
 
-# Ollama（本地模型，默认）
+# Ollama（本地模型）
 ollama:
+  enabled: true
   baseUrl: http://localhost:11434
   model: qwen3.5:9b
   temperature: 0.7
   maxTokens: 4096
 
-# DeepSeek
-# deepseek:
-#   apiKey: your-deepseek-api-key
-#   model: deepseek-chat
-#   baseUrl: https://api.deepseek.com
-#   temperature: 0.7
+# DeepSeek（云端模型）
+deepseek:
+  enabled: false
+  apiKey: sk-your-deepseek-api-key
+  model: deepseek-chat
+  baseUrl: https://api.deepseek.com
+  temperature: 0.7
 
 # Kimi（月之暗面）
-# kimi:
-#   apiKey: your-kimi-api-key
-#   model: moonshot-v1-8k
-#   baseUrl: https://api.moonshot.cn/v1
-#   temperature: 0.7
+kimi:
+  enabled: false
+  apiKey: your-kimi-api-key
+  model: moonshot-v1-8k
+  baseUrl: https://api.moonshot.cn/v1
+  temperature: 0.7
 
 # 智谱 GLM
-# glm:
-#   apiKey: your-glm-api-key
-#   model: glm-4
-#   baseUrl: https://open.bigmodel.cn/api/paas/v4
-#   temperature: 0.7
+glm:
+  enabled: false
+  apiKey: your-glm-api-key
+  model: glm-4
+  baseUrl: https://open.bigmodel.cn/api/paas/v4
+  temperature: 0.7
 
 # 字节豆包
-# doubao:
-#   apiKey: your-doubao-api-key
-#   model: doubao-pro
-#   baseUrl: https://ark.cn-beijing.volces.com/api/v3
-#   temperature: 0.7
+doubao:
+  enabled: false
+  apiKey: your-doubao-api-key
+  model: doubao-pro
+  baseUrl: https://ark.cn-beijing.volces.com/api/v3
+  temperature: 0.7
 
 # MiniMax
-# minimax:
-#   apiKey: your-minimax-api-key
-#   model: MiniMax-Text-01
-#   baseUrl: https://api.minimax.chat/v1
-#   temperature: 0.7
+minimax:
+  enabled: false
+  apiKey: your-minimax-api-key
+  model: MiniMax-Text-01
+  baseUrl: https://api.minimax.chat/v1
+  temperature: 0.7
 
 # OpenAI
-# openai:
-#   apiKey: your-openai-api-key
-#   model: gpt-4
-#   baseUrl: https://api.openai.com/v1
-#   temperature: 0.7
+openai:
+  enabled: false
+  apiKey: your-openai-api-key
+  model: gpt-4
+  baseUrl: https://api.openai.com/v1
+  temperature: 0.7
 
 # Anthropic Claude
-# claude:
-#   apiKey: your-claude-api-key
-#   model: claude-sonnet-4-20250514
-#   baseUrl: https://api.anthropic.com
-#   temperature: 0.7
+claude:
+  enabled: false
+  apiKey: your-claude-api-key
+  model: claude-sonnet-4-20250514
+  baseUrl: https://api.anthropic.com
+  temperature: 0.7
 
 # Google Gemini
-# gemini:
-#   apiKey: your-gemini-api-key
-#   model: gemini-2.0-flash
-#   baseUrl: https://generativelanguage.googleapis.com/v1beta
-#   temperature: 0.7
+gemini:
+  enabled: false
+  apiKey: your-gemini-api-key
+  model: gemini-2.0-flash
+  baseUrl: https://generativelanguage.googleapis.com/v1beta
+  temperature: 0.7
 
 # ===========================================
 # 基础配置
@@ -99,7 +109,7 @@ sandbox:
 # ===========================================
 
 mcp:
-  # 文件系统服务器
+  # 文件系统
   # - name: filesystem
   #   command: npx
   #   args:
@@ -108,7 +118,7 @@ mcp:
   #   env:
   #     ALLOWED_DIRECTORY: /tmp
 
-  # 飞书服务器
+  # 飞书
   # - name: feishu
   #   command: npx
   #   args:
@@ -118,7 +128,7 @@ mcp:
   #     FEISHU_APP_ID: your-app-id
   #     FEISHU_APP_SECRET: your-app-secret
 
-  # 钉钉服务器
+  # 钉钉
   # - name: dingtalk
   #   command: npx
   #   args:
@@ -128,7 +138,7 @@ mcp:
   #     DINGTALK_APP_KEY: your-app-key
   #     DINGTALK_APP_SECRET: your-app-secret
 
-  # Telegram 服务器
+  # Telegram
   # - name: telegram
   #   command: npx
   #   args:
@@ -137,7 +147,7 @@ mcp:
   #   env:
   #     TELEGRAM_BOT_TOKEN: your-bot-token
 
-  # GitHub 服务器
+  # GitHub
   # - name: github
   #   command: npx
   #   args:
@@ -146,7 +156,7 @@ mcp:
   #   env:
   #     GITHUB_TOKEN: your-github-token
 
-  # Slack 服务器
+  # Slack
   # - name: slack
   #   command: npx
   #   args:
@@ -156,7 +166,7 @@ mcp:
   #     SLACK_BOT_TOKEN: xoxb-your-token
   #     SLACK_TEAM_ID: your-team-id
 
-  # Brave 搜索服务器
+  # Brave 搜索
   # - name: brave-search
   #   command: npx
   #   args:
@@ -165,14 +175,14 @@ mcp:
   #   env:
   #     BRAVE_API_KEY: your-brave-api-key
 
-  # Fetch 网页获取服务器
+  # Fetch 网页获取
   # - name: fetch
   #   command: npx
   #   args:
   #     - -y
   #     - @modelcontextprotocol/server-fetch
 
-  # Google Maps 服务器
+  # Google Maps
   # - name: google-maps
   #   command: npx
   #   args:
@@ -181,7 +191,7 @@ mcp:
   #   env:
   #     GOOGLE_MAPS_API_KEY: your-api-key
 
-  # SQLite 数据库服务器
+  # SQLite 数据库
   # - name: sqlite
   #   command: npx
   #   args:
@@ -190,21 +200,12 @@ mcp:
   #   env:
   #     DATABASE_PATH: ./data.db
 
-  # 时间服务器
+  # 时间
   # - name: time
   #   command: npx
   #   args:
   #     - -y
   #     - @modelcontextprotocol/server-time
-
-  # EverArt 图像生成服务器
-  # - name: everart
-  #   command: npx
-  #   args:
-  #     - -y
-  #     - @modelcontextprotocol/server-everart
-  #   env:
-  #     EVERART_API_TOKEN: your-token
 
 # ===========================================
 # LSP 服务器配置
@@ -233,19 +234,3 @@ lsp:
   #   rootPatterns:
   #     - pyproject.toml
   #     - setup.py
-
-  # Rust
-  # - name: rust
-  #   command: rust-analyzer
-  #   languages:
-  #     - rust
-  #   rootPatterns:
-  #     - Cargo.toml
-
-  # Go
-  # - name: go
-  #   command: gopls
-  #   languages:
-  #     - go
-  #   rootPatterns:
-  #     - go.mod

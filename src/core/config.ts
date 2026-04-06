@@ -27,14 +27,27 @@ const sandboxSchema = z.object({
   maxMemory: z.number().optional(),
 });
 
+const providerSchema = z.object({
+  enabled: z.boolean().default(true),
+  baseUrl: z.string().optional(),
+  apiKey: z.string().optional(),
+  model: z.string(),
+  temperature: z.number().default(0.7),
+  maxTokens: z.number().default(4096),
+  systemPrompt: z.string().optional(),
+});
+
 const configSchema = z.object({
-  ollama: z.object({
-    baseUrl: z.string().default('http://localhost:11434'),
-    model: z.string().default('llama3.2'),
-    temperature: z.number().default(0.7),
-    maxTokens: z.number().default(4096),
-    systemPrompt: z.string().optional(),
-  }),
+  defaultProvider: z.string().default('ollama'),
+  ollama: providerSchema.merge(z.object({ baseUrl: z.string().default('http://localhost:11434') })),
+  deepseek: providerSchema.optional(),
+  kimi: providerSchema.optional(),
+  glm: providerSchema.optional(),
+  doubao: providerSchema.optional(),
+  minimax: providerSchema.optional(),
+  openai: providerSchema.optional(),
+  claude: providerSchema.optional(),
+  gemini: providerSchema.optional(),
   mcp: z.array(mcpServerSchema).optional(),
   lsp: z.array(lspServerSchema).optional(),
   sandbox: sandboxSchema.optional(),
@@ -46,7 +59,9 @@ const configSchema = z.object({
 export type ConfigSchema = z.infer<typeof configSchema>;
 
 const defaultConfig: ConfigSchema = {
+  defaultProvider: 'ollama',
   ollama: {
+    enabled: true,
     baseUrl: 'http://localhost:11434',
     model: 'llama3.2',
     temperature: 0.7,
