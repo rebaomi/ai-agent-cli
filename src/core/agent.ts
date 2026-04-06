@@ -6,6 +6,7 @@ import { MCPManager } from '../mcp/client.js';
 import { LSPManager } from '../lsp/client.js';
 import { Sandbox } from '../sandbox/executor.js';
 import { BuiltInTools } from '../tools/builtin.js';
+import { Planner, Plan, PlanStep, createPlanner } from './planner.js';
 
 export interface AgentOptions {
   ollama: OllamaClient;
@@ -36,6 +37,7 @@ export class Agent {
   private iteration = 0;
   private tools: Tool[] = [];
   private onEvent?: (event: AgentEvent) => void;
+  private planner: Planner;
 
   constructor(options: AgentOptions) {
     this.ollama = options.ollama;
@@ -45,6 +47,7 @@ export class Agent {
     this.builtInTools = options.builtInTools ?? new BuiltInTools(this.sandbox, this.lspManager);
     this.systemPrompt = options.systemPrompt ?? this.getDefaultSystemPrompt();
     this.maxIterations = options.maxIterations ?? 100;
+    this.planner = createPlanner({ ollama: this.ollama });
 
     this.initializeTools();
   }
@@ -128,8 +131,126 @@ You: "Here's the content of package.json..."`;
   async chat(input: string): Promise<string> {
     this.messages.push({ role: 'user', content: input });
 
+    const isComplex = await this.detectComplexTask(input);
+    
+    if (isComplex) {
+      return this.chatWithPlanning(input);
+    }
+    
     const response = await this.generateResponse();
     return response;
+  }
+
+  private async detectComplexTask(input: string): Promise<boolean> {
+    const complexityIndicators = [
+      '多个', 'several', 'multiple', 'various',
+      '先', '然后', 'first', 'then', 'after that',
+      '分', '步骤', 'steps', 'phases',
+      '并且', '同时', 'and also', 'also',
+      '以及', 'plus', 'as well as',
+      '需要完成', 'need to', 'should',
+      '帮我', 'help me',
+    ];
+    
+    const inputLower = input.toLowerCase();
+    let matchCount = 0;
+    
+    for (const indicator of complexityIndicators) {
+      if (inputLower.includes(indicator)) {
+        matchCount++;
+      }
+    }
+    
+    if (input.length > 200 || matchCount >= 2) {
+      return true;
+    }
+    
+    try {
+      const response = await this.ollama.generate([
+        { role: 'system', content: '你是一个任务复杂度分析专家。判断用户任务是否复杂（需要多个步骤或多种工具）。简单回复 "是" 或 "否"。' },
+        { role: 'user', content: `分析这个任务是否复杂：${input}` }
+      ]);
+      
+      const result = response.toLowerCase().trim();
+      return result.includes('是') || result.includes('yes') || result.includes('complex');
+    } catch {
+      return matchCount >= 2;
+    }
+  }
+
+  private async chatWithPlanning(input: string): Promise<string> {
+    this.onEvent?.({ type: 'thinking', content: '分析任务复杂度，准备规划步骤...' });
+    
+    try {
+      const plan = await this.planner.createPlan(input);
+      
+      let summary = `📋 **任务规划已创建**\n`;
+      summary += `**原任务**: ${plan.originalTask}\n\n`;
+      summary += `**执行步骤** (${plan.steps.length} 步):\n`;
+      
+      for (let idx = 0; idx < plan.steps.length; idx++) {
+        const step = plan.steps[idx];
+        if (step) {
+          summary += `${idx + 1}. ${step.description}\n`;
+        }
+      }
+      
+      this.onEvent?.({ type: 'response', content: summary });
+      console.log(chalk.cyan(summary));
+      
+      const results: string[] = [];
+      
+      for (let i = 0; i < plan.steps.length; i++) {
+        const step = plan.steps[i];
+        if (!step) continue;
+        
+        const stepNum = i + 1;
+        
+        console.log(chalk.yellow(`\n🔄 执行步骤 ${stepNum}/${plan.steps.length}: ${step.description}`));
+        this.onEvent?.({ type: 'thinking', content: `执行步骤 ${stepNum}: ${step.description}` });
+        
+        try {
+          const stepContext = `步骤 ${stepNum}/${plan.steps.length}: ${step.description}\n原任务: ${input}\n已完成步骤结果: ${results.join('\n---\n')}`;
+          
+          this.messages.push({ role: 'user', content: stepContext });
+          
+          const stepResult = await this.generateResponse();
+          
+          results.push(`[步骤 ${stepNum}] ${step.description}\n${stepResult}`);
+          
+          console.log(chalk.green(`✅ 步骤 ${stepNum} 完成`));
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          results.push(`[步骤 ${stepNum}] 失败: ${errorMsg}`);
+          console.log(chalk.red(`❌ 步骤 ${stepNum} 失败: ${errorMsg}`));
+        }
+      }
+      
+      return this.synthesizeResults(input, results);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.log(chalk.red(`规划失败，回退到直接执行: ${errorMessage}`));
+      return this.generateResponse();
+    }
+  }
+
+  private synthesizeResults(originalTask: string, stepResults: string[]): string {
+    let finalResponse = `## ✅ 任务完成\n\n`;
+    finalResponse += `**原始任务**: ${originalTask}\n\n`;
+    finalResponse += `**执行摘要**:\n\n`;
+    
+    for (let i = 0; i < stepResults.length; i++) {
+      finalResponse += `### 步骤 ${i + 1}\n${stepResults[i]}\n\n`;
+    }
+    
+    const completedSteps = stepResults.filter(r => !r.includes('失败')).length;
+    const totalSteps = stepResults.length;
+    
+    finalResponse += `---\n**完成进度**: ${completedSteps}/${totalSteps} 步骤成功完成`;
+    
+    this.onEvent?.({ type: 'response', content: finalResponse });
+    
+    return finalResponse;
   }
 
   private async generateResponse(): Promise<string> {

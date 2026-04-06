@@ -19,6 +19,7 @@
 - 💾 **记忆管理** - 对话历史持久化，支持会话切换
 - 🌊 **流式输出** - AI 回复逐字显示，打字机效果
 - ⚡ **智能工具调用** - AI 自动调用合适工具完成任务
+- 📊 **任务规划器** - 复杂任务自动拆分成步骤执行，逐步完成
 
 ### 安装
 
@@ -102,6 +103,38 @@ AI：自动调用 list_directory 工具
 用户：在 src 目录下搜索包含 "hello" 的文件
 AI：自动调用 search_files 或 glob 工具
 ```
+
+### 任务规划器 (Planner)
+
+复杂任务会被自动检测并拆分成步骤执行：
+
+```
+用户：帮我完成这几个任务：1) 读取配置文件 2) 修改代码 3) 运行测试
+
+AI：📋 任务规划已创建
+    执行步骤 (3 步):
+    1. 读取配置文件
+    2. 修改代码
+    3. 运行测试
+
+    🔄 执行步骤 1/3: 读取配置文件
+    ✅ 步骤 1 完成
+
+    🔄 执行步骤 2/3: 修改代码
+    ✅ 步骤 2 完成
+
+    🔄 执行步骤 3/3: 运行测试
+    ✅ 步骤 3 完成
+
+    ## ✅ 任务完成
+    完成进度: 3/3 步骤成功完成
+```
+
+规划器会自动：
+- 分析任务复杂度
+- 拆分可执行的步骤
+- 逐步执行每个步骤
+- 汇总最终结果
 
 #### 配合 MCP 扩展
 如果配置了 Obsidian MCP：
@@ -394,6 +427,7 @@ An intelligent coding assistant CLI tool powered by Ollama, with support for MCP
 - 💾 **Memory Management** - Persistent conversation history with session switching
 - 🌊 **Streaming Output** - Typewriter effect for AI responses
 - ⚡ **Smart Tool Calling** - AI automatically calls appropriate tools to complete tasks
+- 📊 **Task Planner** - Complex tasks automatically split into steps for sequential execution
 
 ### Installation
 
@@ -463,6 +497,38 @@ AI: Automatically calls write_file tool
 User: Run npm install
 AI: Automatically calls execute_command
 ```
+
+### Task Planner
+
+Complex tasks are automatically detected and split into steps:
+
+```
+User: Help me with these tasks: 1) Read config file 2) Modify code 3) Run tests
+
+AI: 📋 Task Plan Created
+    Steps (3 total):
+    1. Read config file
+    2. Modify code
+    3. Run tests
+
+    🔄 Step 1/3: Read config file
+    ✅ Step 1 complete
+
+    🔄 Step 2/3: Modify code
+    ✅ Step 2 complete
+
+    🔄 Step 3/3: Run tests
+    ✅ Step 3 complete
+
+    ## ✅ Task Complete
+    Progress: 3/3 steps completed successfully
+```
+
+The Planner automatically:
+- Analyzes task complexity
+- Splits into executable steps
+- Executes each step sequentially
+- Synthesizes final results
 
 #### MCP Extensions
 With Obsidian MCP configured:
