@@ -17,6 +17,9 @@ import type { AgentEvent } from '../core/agent.js';
 import { createAgentFactory, createOrganization, loadOrganization, createReceptionAgent, ReceptionAgent } from '../core/organization/index.js';
 import type { Organization } from '../core/organization/index.js';
 import { createAgentCat, AgentCat } from '../core/companion/index.js';
+import { UserProfileManager, userProfileManager } from '../core/user-profile.js';
+import { ContentModerator, contentModerator } from '../core/content-moderator.js';
+import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import * as readline from 'readline';
 
@@ -46,6 +49,9 @@ export class CLI {
   private organizationMode = false;
   private receptionAgent?: ReceptionAgent;
   private agentCat?: AgentCat;
+  private userProfile?: UserProfileManager;
+  private moderator?: ContentModerator;
+  private isFirstInteraction = true;
 
   constructor() {
     this.mcpManager = new MCPManager();
@@ -64,6 +70,17 @@ export class CLI {
     await this.memoryManager.initialize();
     printSuccess('Memory manager ready');
 
+    this.userProfile = userProfileManager;
+    await this.userProfile.initialize();
+    const profile = this.userProfile.getProfile();
+    if (profile) {
+      printSuccess('User profile loaded');
+    } else {
+      this.isFirstInteraction = true;
+    }
+
+    this.moderator = contentModerator;
+
     this.ollama = new OllamaClient(config.ollama);
     
     let connected = false;
@@ -77,8 +94,18 @@ export class CLI {
     }
     
     if (!connected) {
-      printWarning('Ollama server not reachable at ' + config.ollama.baseUrl);
-      console.log(chalk.gray('  Run "ollama serve" to start Ollama, then restart this CLI\n'));
+      console.log(chalk.yellow('\n⚠️  Ollama 未连接'));
+      console.log(chalk.cyan('  ┌─────────────────────────────────────────────┐'));
+      console.log(chalk.cyan('  │  请在另一个终端运行以下命令启动 Ollama:       │'));
+      console.log(chalk.cyan('  │                                             │'));
+      console.log(chalk.cyan('  │  ') + chalk.bold('ollama serve') + chalk.cyan('                              │'));
+      console.log(chalk.cyan('  │                                             │'));
+      console.log(chalk.cyan('  │  如未安装 Ollama，请访问:                  │'));
+      console.log(chalk.cyan('  │  https://ollama.ai                         │'));
+      console.log(chalk.cyan('  │                                             │'));
+      console.log(chalk.cyan('  │  下载模型: ollama pull qwen3.5:9b         │'));
+      console.log(chalk.cyan('  └─────────────────────────────────────────────┘\n'));
+      console.log(chalk.gray('  或者配置其他模型提供商 (DeepSeek/Kimi/GLM 等)\n'));
     } else {
       printSuccess('Connected to Ollama (' + config.ollama.model + ')');
     }
@@ -260,6 +287,9 @@ export class CLI {
       case 'templates':
         await this.showTemplates();
         break;
+      case 'profile':
+        this.handleProfileCommand(args);
+        break;
       default:
         console.log(chalk.yellow(`Unknown command: ${command}. Type /? for help.`));
     }
@@ -268,6 +298,27 @@ export class CLI {
   private async handleMessage(input: string): Promise<void> {
     this.cmdHistory.push(input);
     this.historyIndex = this.cmdHistory.length;
+
+    const moderationResult = this.moderator?.moderateUserInput(input);
+    if (moderationResult) {
+      if (!moderationResult.allowed) {
+        console.log(chalk.red('\n⚠️ 消息已被拦截\n'));
+        return;
+      }
+      
+      if (moderationResult.message) {
+        console.log(chalk.yellow('\n' + moderationResult.message + '\n'));
+      }
+      
+      this.moderator?.recordWarning(input);
+    }
+
+    if (this.isFirstInteraction && this.userProfile) {
+      this.showWelcomeQuestions();
+      this.isFirstInteraction = false;
+    }
+
+    this.userProfile?.recordInteraction();
 
     if (this.organizationMode && this.organization) {
       await this.handleOrganizationMessage(input);
@@ -330,6 +381,20 @@ export class CLI {
   private async streamResponse(text: string): Promise<void> {
     const output = createStreamingOutput({ color: 'cyan', speed: 5 });
     await output.stream(text);
+  }
+
+  private async showWelcomeQuestions(): Promise<void> {
+    console.log(chalk.bold('\n👋 欢迎使用 coolAI！\n'));
+    console.log(chalk.gray('为了更好地为您服务，请告诉我一些关于您的信息：\n'));
+    
+    console.log(chalk.cyan('1. 您的工作是？') + chalk.gray(' (如：学生、程序员、产品经理、设计师...)'));
+    console.log(chalk.cyan('2. 您主要用 coolAI 来做什么？') + chalk.gray(' (如：编程、写文章、数据处理、聊天...)'));
+    console.log(chalk.cyan('3. 您喜欢什么样的交流风格？') + chalk.gray(' (专业/友好/幽默/温柔/活力)\n'));
+    
+    console.log(chalk.gray('可以直接输入您的回答，例如：'));
+    console.log(chalk.gray('  "我是程序员，主要用来写代码和调试bug，喜欢幽默风格"\n'));
+    
+    console.log(chalk.gray('或者输入 ') + chalk.cyan('/profile') + chalk.gray(' 稍后设置\n'));
   }
 
   private async handleOrganizationMessage(input: string): Promise<void> {
@@ -521,6 +586,94 @@ export class CLI {
         console.log(chalk.gray(`  时间: ${new Date(m.timestamp).toLocaleString()}\n`));
       });
     }
+  }
+
+  private handleProfileCommand(args: string[]): void {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.userProfile) {
+      printError('User profile not initialized');
+      return;
+    }
+
+    switch (subcommand) {
+      case 'view':
+      case undefined:
+        this.userProfile.printProfile();
+        break;
+      case 'set':
+        this.setUserPreference(args);
+        break;
+      case 'personality':
+        this.setPersonality(args[1]);
+        break;
+      case 'style':
+        this.setCommunicationStyle(args[1]);
+        break;
+      default:
+        console.log(`
+${chalk.bold('用户档案命令:')}
+${chalk.cyan('/profile')}            查看用户档案
+${chalk.cyan('/profile set job')}   设置职业
+${chalk.cyan('/profile set purpose')} 设置使用目的
+${chalk.cyan('/profile personality [type]')} 设置性格 (professional/friendly/humorous/gentle/energetic)
+${chalk.cyan('/profile style [type]')}  设置沟通风格 (concise/normal/detailed)
+`);
+    }
+  }
+
+  private setUserPreference(args: string[]): void {
+    const key = args[1]?.toLowerCase();
+    const value = args.slice(2).join(' ');
+
+    if (!key || !value) {
+      printError('Usage: /profile set <key> <value>');
+      return;
+    }
+
+    if (key === 'job') {
+      this.userProfile?.updateFromOnboarding({ job: value });
+      printSuccess('职业已设置: ' + value);
+    } else if (key === 'purpose') {
+      this.userProfile?.updateFromOnboarding({ purpose: value });
+      printSuccess('使用目的已设置: ' + value);
+    } else if (key === 'interests') {
+      const interests = value.split(',').map(s => s.trim()).filter(s => s);
+      this.userProfile?.updateFromOnboarding({ interests });
+      printSuccess('兴趣领域已设置: ' + interests.join(', '));
+    }
+  }
+
+  private setPersonality(type?: string): void {
+    if (!type) {
+      console.log(chalk.gray('当前性格: ' + this.userProfile?.getProfile()?.preferences.personality));
+      return;
+    }
+
+    const validTypes = ['professional', 'friendly', 'humorous', 'gentle', 'energetic'];
+    if (!validTypes.includes(type)) {
+      printError('Invalid type. Choose from: ' + validTypes.join(', '));
+      return;
+    }
+
+    this.userProfile?.updatePreferences({ personality: type as any });
+    printSuccess('性格已设置为: ' + type);
+  }
+
+  private setCommunicationStyle(style?: string): void {
+    if (!style) {
+      console.log(chalk.gray('当前风格: ' + this.userProfile?.getProfile()?.preferences.communicationStyle));
+      return;
+    }
+
+    const validStyles = ['concise', 'normal', 'detailed'];
+    if (!validStyles.includes(style)) {
+      printError('Invalid style. Choose from: ' + validStyles.join(', '));
+      return;
+    }
+
+    this.userProfile?.updatePreferences({ communicationStyle: style as any });
+    printSuccess('沟通风格已设置为: ' + style);
   }
 
   private async showTemplates(): Promise<void> {
