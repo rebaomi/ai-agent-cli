@@ -279,7 +279,7 @@ export class CLI {
         if (args[0]) {
           await this.changeModel(args[0]);
         } else {
-          console.log(chalk.gray('Current model: ' + this.ollama?.getModel()));
+          this.showModels();
         }
         break;
       case 'workspace':
@@ -1063,6 +1063,41 @@ ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
     console.log(chalk.gray('\nMemory:'));
     console.log(`  Session: ${this.memoryManager.getCurrentSessionId()}`);
     console.log(`  Messages: ${this.memoryManager.getMessages().length}`);
+    console.log();
+  }
+
+  private showModels(): void {
+    const config = configManager.getAll();
+    console.log(chalk.bold('\nAvailable Models:\n'));
+    
+    const providers = [
+      { name: 'Ollama', config: config.ollama, enabled: config.ollama.enabled },
+      { name: 'DeepSeek', config: config.deepseek, enabled: config.deepseek?.enabled },
+      { name: 'Kimi', config: config.kimi, enabled: config.kimi?.enabled },
+      { name: 'GLM', config: config.glm, enabled: config.glm?.enabled },
+      { name: 'Doubao', config: config.doubao, enabled: config.doubao?.enabled },
+      { name: 'MiniMax', config: config.minimax, enabled: config.minimax?.enabled },
+      { name: 'OpenAI', config: config.openai, enabled: config.openai?.enabled },
+      { name: 'Claude', config: config.claude, enabled: config.claude?.enabled },
+      { name: 'Gemini', config: config.gemini, enabled: config.gemini?.enabled },
+    ];
+
+    const defaultProvider = config.defaultProvider;
+    
+    for (const provider of providers) {
+      if (provider.config?.enabled) {
+        const isDefault = provider.name.toLowerCase() === defaultProvider;
+        const marker = isDefault ? chalk.green(' (默认)') : '';
+        console.log(`${chalk.cyan(provider.name)}${marker}`);
+        console.log(`  Model: ${provider.config.model}`);
+        if (provider.config.baseUrl) {
+          console.log(`  URL: ${provider.config.baseUrl}`);
+        }
+        console.log();
+      }
+    }
+
+    console.log(chalk.gray('Use /model <provider> <model> to switch'));
     console.log();
   }
 
