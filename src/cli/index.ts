@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import { Command } from 'commander';
 import { configManager } from '../core/config.js';
+import { createMemoryManager, MemoryManager } from '../core/memory.js';
 import { createSkillManager } from '../core/skills.js';
 import { OllamaClient } from '../ollama/client.js';
 import { MCPManager } from '../mcp/client.js';
@@ -9,11 +10,12 @@ import { Sandbox } from '../sandbox/executor.js';
 import { BuiltInTools } from '../tools/builtin.js';
 import { Agent, createAgent } from '../core/agent.js';
 import type { AgentEvent } from '../core/agent.js';
+import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import * as readline from 'readline';
 
 const logo = `
 ╔═══════════════════════════════════════════════════╗
-║           AI Agent CLI v1.0.0                     ║
+║           AI Agent CLI v1.2.0                     ║
 ║   Your intelligent coding assistant                 ║
 ╚═══════════════════════════════════════════════════╝
 `;
@@ -25,11 +27,13 @@ export class CLI {
   private lspManager: LSPManager;
   private sandbox!: Sandbox;
   private skillManager: ReturnType<typeof createSkillManager>;
+  private memoryManager!: MemoryManager;
   private builtInTools?: BuiltInTools;
   private workspace: string;
   private running = true;
-  private history: string[] = [];
+  private cmdHistory: string[] = [];
   private historyIndex = -1;
+  private streamingOutput?: StreamingOutput;
 
   constructor() {
     this.mcpManager = new MCPManager();
@@ -43,7 +47,10 @@ export class CLI {
     console.log(chalk.gray('Initializing...\n'));
     
     const config = configManager.getAgentConfig();
-    console.log(chalk.gray('Config model: ' + config.ollama.model));
+
+    this.memoryManager = createMemoryManager();
+    await this.memoryManager.initialize();
+    printSuccess('Memory manager ready');
 
     this.ollama = new OllamaClient(config.ollama);
     
@@ -53,38 +60,38 @@ export class CLI {
         this.ollama.checkConnection(),
         new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000))
       ]);
-    } catch {
-      connected = false;
+    } catch (error) {
+      printWarning('Failed to connect to Ollama: ' + (error instanceof Error ? error.message : String(error)));
     }
     
     if (!connected) {
-      console.log(chalk.yellow('Warning: Ollama server not reachable at ') + config.ollama.baseUrl);
+      printWarning('Ollama server not reachable at ' + config.ollama.baseUrl);
       console.log(chalk.gray('  Run "ollama serve" to start Ollama, then restart this CLI\n'));
     } else {
-      console.log(chalk.green('✓') + ' Connected to Ollama');
+      printSuccess('Connected to Ollama (' + config.ollama.model + ')');
     }
 
     this.sandbox = new Sandbox(config.sandbox);
     await this.sandbox.initialize();
-    console.log(chalk.green('✓') + ' Sandbox ready');
+    printSuccess('Sandbox ready');
 
     await this.skillManager.initialize();
     const skills = await this.skillManager.listSkills();
     if (skills.length > 0) {
-      console.log(chalk.green('✓') + ` ${skills.length} skills loaded`);
+      printSuccess(skills.length + ' skills loaded');
     }
 
     this.builtInTools = new BuiltInTools(this.sandbox, this.lspManager);
-    console.log(chalk.green('✓') + ` ${this.builtInTools.getTools().length} built-in tools`);
+    printSuccess(this.builtInTools.getTools().length + ' built-in tools');
 
     if (config.mcp && config.mcp.length > 0) {
       console.log(chalk.gray('Connecting to MCP servers...'));
       for (const mcpConfig of config.mcp) {
         try {
           await this.mcpManager.addServer(mcpConfig);
-          console.log(chalk.green('✓') + ` MCP server: ${mcpConfig.name}`);
+          printSuccess('MCP server: ' + mcpConfig.name);
         } catch (error) {
-          console.log(chalk.red('✗') + ` MCP server ${mcpConfig.name}: ${error instanceof Error ? error.message : String(error)}`);
+          printError('MCP server ' + mcpConfig.name + ': ' + (error instanceof Error ? error.message : String(error)));
         }
       }
     }
@@ -94,9 +101,9 @@ export class CLI {
       for (const lspConfig of config.lsp) {
         try {
           await this.lspManager.addServer(lspConfig, `file://${this.workspace}`);
-          console.log(chalk.green('✓') + ` LSP server: ${lspConfig.name}`);
+          printSuccess('LSP server: ' + lspConfig.name);
         } catch (error) {
-          console.log(chalk.red('✗') + ` LSP server ${lspConfig.name}: ${error instanceof Error ? error.message : String(error)}`);
+          printError('LSP server ' + lspConfig.name + ': ' + (error instanceof Error ? error.message : String(error)));
         }
       }
     }
@@ -111,7 +118,7 @@ export class CLI {
       maxIterations: config.maxIterations,
     });
 
-    console.log(chalk.gray('\nType /help for commands, or ask me anything!\n'));
+    console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
   }
 
   async run(): Promise<void> {
@@ -129,7 +136,7 @@ export class CLI {
         if (error instanceof Error && error.message === 'Exit') {
           break;
         }
-        console.log(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
+        printError('Error: ' + (error instanceof Error ? error.message : String(error)));
       }
     }
   }
@@ -171,6 +178,7 @@ export class CLI {
       case 'clear':
       case 'cls':
         console.clear();
+        console.log(chalk.cyan(logo));
         break;
       case 'history':
       case 'hi':
@@ -196,7 +204,7 @@ export class CLI {
       case 'w':
         if (args[0]) {
           this.workspace = args[0];
-          console.log(chalk.green('Workspace set to: ' + this.workspace));
+          printSuccess('Workspace set to: ' + this.workspace);
         } else {
           console.log(chalk.gray('Current workspace: ' + this.workspace));
         }
@@ -204,7 +212,14 @@ export class CLI {
       case 'reset':
       case 'r':
         this.agent?.clearMessages();
-        console.log(chalk.green('Conversation reset.'));
+        this.memoryManager.clearHistory();
+        printSuccess('Conversation reset.');
+        break;
+      case 'sessions':
+        await this.showSessions();
+        break;
+      case 'load':
+        await this.loadSession(args[0]);
         break;
       case 'mcp':
         await this.handleMCPCommand(args);
@@ -222,37 +237,38 @@ export class CLI {
   }
 
   private async handleMessage(input: string): Promise<void> {
-    this.history.push(input);
-    this.historyIndex = this.history.length;
+    this.cmdHistory.push(input);
+    this.historyIndex = this.cmdHistory.length;
 
     if (!this.ollama) {
-      console.log(chalk.red('Ollama not connected. Please check your configuration.'));
+      printError('Ollama not connected. Please check your configuration.');
       return;
     }
 
     if (!this.agent) {
-      console.log(chalk.red('Agent not initialized.'));
+      printError('Agent not initialized.');
       return;
     }
 
-    console.log(chalk.gray('\nThinking...\n'));
-
+    console.log();
+    this.streamingOutput = createStreamingOutput({ color: 'cyan', speed: 0 });
+    
     this.agent.setEventHandler((event: AgentEvent) => {
       switch (event.type) {
         case 'thinking':
-          process.stdout.write(chalk.gray('.'));
+          process.stdout.write(chalk.gray('Thinking... '));
           break;
         case 'tool_call':
           console.log(chalk.cyan('\n🔧 ' + event.content));
           break;
         case 'tool_result':
           if (event.toolResult?.is_error) {
-            console.log(chalk.red('Error: ' + event.toolResult.output));
+            printError(event.toolResult.output || 'Tool execution failed');
           } else {
-            const output = event.toolResult?.output ?? '';
-            if (output.length > 500) {
-              console.log(chalk.gray(output.slice(0, 500) + '...'));
-            } else {
+            const output = event.toolResult?.output || '';
+            if (output.length > 200) {
+              console.log(chalk.gray(output.slice(0, 200) + '...'));
+            } else if (output) {
               console.log(chalk.gray(output));
             }
           }
@@ -260,27 +276,70 @@ export class CLI {
         case 'response':
           break;
         case 'error':
-          console.log(chalk.red('Error: ' + event.content));
+          printError(event.content);
           break;
       }
     });
 
-    process.stdout.write('\n');
-    const response = await this.agent.chat(input);
-    console.log(chalk.green('\nAssistant:') + ' ' + response + '\n');
+    try {
+      const response = await this.agent.chat(input);
+      this.streamingOutput.clear();
+      console.log(chalk.green('\nAssistant: '));
+      await this.streamResponse(response);
+    } catch (error) {
+      printError('Failed to get response: ' + (error instanceof Error ? error.message : String(error)));
+    }
+    
+    console.log();
+  }
+
+  private async streamResponse(text: string): Promise<void> {
+    const output = createStreamingOutput({ color: 'cyan', speed: 5 });
+    await output.stream(text);
+  }
+
+  private async showSessions(): Promise<void> {
+    const sessions = await this.memoryManager.listSessions();
+    console.log(chalk.bold('\nRecent Sessions:\n'));
+    
+    if (sessions.length === 0) {
+      console.log(chalk.gray('No sessions found.'));
+    } else {
+      for (const session of sessions.slice(0, 10)) {
+        const date = new Date(session.lastUpdated);
+        const timeStr = date.toLocaleString();
+        const current = session.id === this.memoryManager.getCurrentSessionId() ? chalk.green('(current)') : '';
+        console.log(chalk.cyan(`  ${session.id}`) + ' ' + chalk.gray(`${session.messageCount} messages`) + ' ' + current);
+        console.log(chalk.gray(`    Last: ${timeStr}`));
+      }
+    }
+    console.log();
+  }
+
+  private async loadSession(sessionId?: string): Promise<void> {
+    if (!sessionId) {
+      console.log(chalk.yellow('Usage: /load <session-id>'));
+      console.log(chalk.gray('Use /sessions to see available sessions.'));
+      return;
+    }
+    
+    const success = await this.memoryManager.loadSession(sessionId);
+    if (success) {
+      this.agent?.setMessages(this.memoryManager.getMessages());
+      printSuccess('Loaded session: ' + sessionId);
+    } else {
+      printError('Session not found: ' + sessionId);
+    }
   }
 
   private showQuickHelp(): void {
     console.log(`
 ${chalk.bold('Quick Commands:')}
   ${chalk.cyan('/?')}        ${chalk.gray('Show this help')}
-  ${chalk.cyan('/quit, /bye')}  ${chalk.gray('Exit')}
+  ${chalk.cyan('/quit')}     ${chalk.gray('Exit')}
   ${chalk.cyan('/tools')}    ${chalk.gray('List tools')}
   ${chalk.cyan('/model')}    ${chalk.gray('Show/change model')}
-  ${chalk.cyan('/config')}   ${chalk.gray('Show config')}
-  ${chalk.cyan('/skill')}    ${chalk.gray('Manage skills')}
-  ${chalk.cyan('/mcp')}      ${chalk.gray('MCP servers')}
-  ${chalk.cyan('/lsp')}      ${chalk.gray('LSP servers')}
+  ${chalk.cyan('/sessions')} ${chalk.gray('Show sessions')}
   ${chalk.cyan('/reset')}    ${chalk.gray('Clear chat')}
 `);
   }
@@ -299,22 +358,17 @@ ${chalk.cyan('/config, /c')}       Show current configuration
 ${chalk.cyan('/model, /m')} [name] Show or change the model
 ${chalk.cyan('/workspace, /w')}    Show or change workspace
 ${chalk.cyan('/reset, /r')}        Reset conversation
+${chalk.cyan('/sessions')}         List conversation sessions
+${chalk.cyan('/load')} <id>        Load a previous session
 ${chalk.cyan('/mcp')}              Manage MCP servers
 ${chalk.cyan('/lsp')}              Manage LSP servers
 ${chalk.cyan('/skill')}            Manage skills
-
-${chalk.bold('Skill Commands:')}
-  ${chalk.cyan('/skill list')}       List installed skills
-  ${chalk.cyan('/skill install')}    Install a skill
-  ${chalk.cyan('/skill uninstall')}  Uninstall a skill
-  ${chalk.cyan('/skill enable')}     Enable a skill
-  ${chalk.cyan('/skill disable')}    Disable a skill
 `);
   }
 
   private showHistory(): void {
     console.log(chalk.bold('\nCommand History:\n'));
-    this.history.forEach((cmd, i) => {
+    this.cmdHistory.forEach((cmd, i) => {
       console.log(chalk.gray(`${i + 1}. ${cmd}`));
     });
     console.log();
@@ -343,6 +397,9 @@ ${chalk.bold('Skill Commands:')}
     console.log(chalk.gray('\nSandbox:'));
     console.log(`  Enabled: ${config.sandbox?.enabled ?? true}`);
     console.log(`  Timeout: ${config.sandbox?.timeout ?? 30000}ms`);
+    console.log(chalk.gray('\nMemory:'));
+    console.log(`  Session: ${this.memoryManager.getCurrentSessionId()}`);
+    console.log(`  Messages: ${this.memoryManager.getMessages().length}`);
     console.log();
   }
 
@@ -353,12 +410,12 @@ ${chalk.bold('Skill Commands:')}
       this.ollama.setModel(model);
       const connected = await this.ollama.checkConnection();
       if (connected) {
-        console.log(chalk.green(`Model changed to: ${model}`));
+        printSuccess('Model changed to: ' + model);
       } else {
-        console.log(chalk.red('Failed to verify model.'));
+        printError('Failed to verify model. Please ensure the model is available.');
       }
     } catch (error) {
-      console.log(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
+      printError('Error: ' + (error instanceof Error ? error.message : String(error)));
     }
   }
 
@@ -448,11 +505,11 @@ ${chalk.bold('Skill Commands:')}
           return;
         }
         try {
-          console.log(chalk.gray(`Installing skill from: ${skillName}...`));
+          printInfo(`Installing skill from: ${skillName}...`);
           await this.skillManager.installSkill(skillName);
-          console.log(chalk.green(`✓ Skill installed: ${skillName}`));
+          printSuccess('Skill installed: ' + skillName);
         } catch (error) {
-          console.log(chalk.red(`Failed to install: ${error instanceof Error ? error.message : String(error)}`));
+          printError('Failed to install: ' + (error instanceof Error ? error.message : String(error)));
         }
         break;
 
@@ -464,9 +521,9 @@ ${chalk.bold('Skill Commands:')}
         }
         try {
           await this.skillManager.uninstallSkill(skillName);
-          console.log(chalk.green(`✓ Skill uninstalled: ${skillName}`));
+          printSuccess('Skill uninstalled: ' + skillName);
         } catch (error) {
-          console.log(chalk.red(`Failed to uninstall: ${error instanceof Error ? error.message : String(error)}`));
+          printError('Failed to uninstall: ' + (error instanceof Error ? error.message : String(error)));
         }
         break;
 
@@ -476,7 +533,7 @@ ${chalk.bold('Skill Commands:')}
           return;
         }
         this.skillManager.enableSkill(skillName);
-        console.log(chalk.green(`✓ Skill enabled: ${skillName}`));
+        printSuccess('Skill enabled: ' + skillName);
         break;
 
       case 'disable':
@@ -485,7 +542,7 @@ ${chalk.bold('Skill Commands:')}
           return;
         }
         this.skillManager.disableSkill(skillName);
-        console.log(chalk.green(`✓ Skill disabled: ${skillName}`));
+        printSuccess('Skill disabled: ' + skillName);
         break;
 
       default:
@@ -506,7 +563,7 @@ export async function runCLI(): Promise<void> {
   program
     .name('ai-agent')
     .description('AI Agent CLI with MCP, Ollama, LSP and Skills support')
-    .version('1.0.0')
+    .version('1.2.0')
     .option('-c, --config <path>', 'Path to configuration file')
     .option('-m, --model <name>', 'Model to use')
     .option('-w, --workspace <path>', 'Workspace directory')
@@ -535,11 +592,10 @@ export async function runCLI(): Promise<void> {
   });
 
   await cli.initialize();
-  console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
   await cli.run();
 }
 
 runCLI().catch(err => {
-  console.error('Fatal error:', err);
+  printError('Fatal error: ' + (err instanceof Error ? err.message : String(err)));
   process.exit(1);
 });
