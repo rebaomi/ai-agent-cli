@@ -650,11 +650,12 @@ export class BuiltInTools {
   }
 
   private async glob(pattern: string, cwd?: string): Promise<string> {
-    const { join, resolve } = await import('path');
+    const { join, resolve, sep } = await import('path');
     const baseDir = cwd ?? process.cwd();
     const results: string[] = [];
     
-    const parts = pattern.split('/');
+    const normalizedPattern = pattern.replace(/\\/g, '/');
+    const parts = normalizedPattern.split('/');
     const regex = new RegExp(
       '^' + parts.map(p => p === '**' ? '.*' : p.replace(/\*/g, '[^/]*')).join('/') + '$'
     );
@@ -668,7 +669,8 @@ export class BuiltInTools {
             await search(fullPath);
           } else {
             const relativePath = resolve(fullPath).replace(resolve(baseDir), baseDir);
-            if (regex.test(relativePath.replace(/\\/g, '/'))) {
+            const normalizedPath = relativePath.replace(/\\/g, '/');
+            if (regex.test(normalizedPath)) {
               results.push(fullPath);
             }
           }
