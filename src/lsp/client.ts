@@ -47,7 +47,6 @@ export class LSPClient extends EventEmitter {
       this.process = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: process.env,
-        shell: process.platform === 'win32',
         windowsHide: true,
       });
 

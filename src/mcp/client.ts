@@ -70,7 +70,6 @@ export class MCPClient extends EventEmitter {
       this.process = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, ...env },
-        shell: process.platform === 'win32',
         windowsHide: true,
       });
 
