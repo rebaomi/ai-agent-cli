@@ -1,5 +1,7 @@
 # AI Agent CLI
 
+> ⚠️ **目前测试中，欢迎提 [Issue](https://github.com/rebaomi/ai-agent-cli/issues)**
+
 **[简体中文](#简体中文) | [English](#english)**
 
 ---
@@ -96,7 +98,9 @@ ollama:
 | `/perm` | 权限管理 |
 | `/sessions` | 查看历史会话 |
 | `/load <id>` | 加载历史会话 |
+| `/new` | 创建新会话（存档旧会话） |
 | `/reset` | 清空对话 |
+| `/wipe` | 重置用户数据（重新接待） |
 
 ### 智能工具调用示例
 
@@ -880,7 +884,9 @@ ollama:
 | `/perm` | Permission management |
 | `/sessions` | List conversation sessions |
 | `/load <id>` | Load a previous session |
+| `/new` | Create new session (archive old) |
 | `/reset` | Clear conversation |
+| `/wipe` | Reset user data (restart onboarding) |
 
 ### Intelligent Tool Calling Examples
 

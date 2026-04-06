@@ -289,6 +289,9 @@ export class CLI {
         this.memoryManager.clearHistory();
         printSuccess('Conversation reset.');
         break;
+      case 'new':
+        this.createNewSession();
+        break;
       case 'sessions':
         await this.showSessions();
         break;
@@ -325,6 +328,9 @@ export class CLI {
       case 'profile':
         this.handleProfileCommand(args);
         break;
+      case 'wipe':
+        await this.wipeUserData();
+        break;
       case 'perm':
       case 'permission':
         this.handlePermissionCommand(args);
@@ -355,6 +361,7 @@ export class CLI {
     if (this.isFirstInteraction && this.userProfile) {
       this.showWelcomeQuestions();
       this.isFirstInteraction = false;
+      return;
     }
 
     this.userProfile?.recordInteraction();
@@ -813,6 +820,49 @@ ${chalk.gray('权限类型:')}
     printSuccess(`Revoked: ${type}${resource ? ` (${resource})` : ''}`);
   }
 
+  private createNewSession(): void {
+    const oldSessionId = this.memoryManager.getCurrentSessionId();
+    this.memoryManager.newSession();
+    this.agent?.clearMessages();
+    
+    console.log(chalk.bold('\n📝 新会话已创建\n'));
+    console.log(`旧会话: ${chalk.gray(oldSessionId)}`);
+    console.log(`新会话: ${chalk.cyan(this.memoryManager.getCurrentSessionId())}`);
+    console.log(chalk.gray('\n旧会话已存档，可以随时通过 /load <id> 加载回\n'));
+    
+    this.isFirstInteraction = true;
+  }
+
+  private async wipeUserData(): Promise<void> {
+    console.log(chalk.yellow('\n⚠️ 将清除所有用户数据:\n'));
+    console.log('  - 用户画像');
+    console.log('  - 当前对话历史');
+    console.log('  - Agent 记忆\n');
+    console.log('输入 ' + chalk.cyan('yes') + ' 确认清除: ');
+    
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    
+    const answer = await new Promise<string>((resolve) => {
+      rl.question('', (a) => {
+        rl.close();
+        resolve(a.trim());
+      });
+    });
+    
+    if (answer.toLowerCase() === 'yes') {
+      await this.userProfile?.reset();
+      this.memoryManager.clearHistory();
+      this.agent?.clearMessages();
+      this.isFirstInteraction = true;
+      printSuccess('所有用户数据已清除');
+    } else {
+      printInfo('取消操作');
+    }
+  }
+
   private async showTemplates(): Promise<void> {
     const templateDir = path.join(process.cwd(), 'config', 'templates');
     
@@ -894,6 +944,8 @@ ${chalk.cyan('/config, /c')}       Show current configuration
 ${chalk.cyan('/model, /m')} [name] Show or change the model
 ${chalk.cyan('/workspace, /w')}    Show or change workspace
 ${chalk.cyan('/reset, /r')}        Reset conversation
+${chalk.cyan('/new')}              Create new session (archive old)
+${chalk.cyan('/wipe')}             Reset user data (restart onboarding)
 ${chalk.cyan('/sessions')}         List conversation sessions
 ${chalk.cyan('/load')} <id>        Load a previous session
 ${chalk.cyan('/mcp')}              Manage MCP servers

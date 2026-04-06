@@ -232,6 +232,32 @@ export class UserProfileManager {
     return Math.round(satisfaction * 10) / 10;
   }
 
+  async reset(): Promise<void> {
+    this.currentProfile = this.createDefaultProfile();
+    await this.saveProfile();
+  }
+
+  private createDefaultProfile(): UserProfile {
+    return {
+      id: `user_${Date.now()}`,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      preferences: {
+        language: 'zh-CN',
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        personality: 'friendly',
+        communicationStyle: 'normal',
+        responseFormat: 'markdown',
+      },
+      interests: [],
+      interactionCount: 0,
+      lastSeen: Date.now(),
+      conversationTopics: [],
+      complaintsCount: 0,
+      suggestionsCount: 0,
+    };
+  }
+
   async exportProfile(): Promise<string> {
     if (!this.currentProfile) return '';
     
