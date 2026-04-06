@@ -7,3 +7,4 @@ import { AgentFactory, createAgentFactory } from './factory.js';
 
 export { Organization, createOrganization, loadOrganization };
 export { AgentFactory, createAgentFactory };
+export { ReceptionAgent, createReceptionAgent } from './reception.js';

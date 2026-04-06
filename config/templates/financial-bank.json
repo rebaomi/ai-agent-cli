@@ -1,0 +1,74 @@
+{
+  "name": "银行网点",
+  "description": "银行网点的服务架构，适合金融业务咨询和办理",
+  "type": "financial",
+  "agents": [
+    {
+      "id": "branch_manager",
+      "name": "网点行长",
+      "role": "supervisor",
+      "description": "网点负责人，负责整体运营和风险管理",
+      "status": "idle",
+      "capabilities": ["运营管理", "风险控制", "客户服务"]
+    },
+    {
+      "id": "lobby_manager",
+      "name": "大堂经理",
+      "role": "orchestrator",
+      "description": "大堂负责人，负责客户接待和服务协调",
+      "status": "idle",
+      "capabilities": ["客户接待", "业务分流", "服务协调", "投诉处理"]
+    },
+    {
+      "id": "customer_service",
+      "name": "柜员",
+      "role": "executor",
+      "description": "柜面业务办理人员",
+      "status": "idle",
+      "capabilities": ["账户业务", "转账汇款", "现金业务", "挂失补办"]
+    },
+    {
+      "id": "financial_advisor",
+      "name": "理财顾问",
+      "role": "executor",
+      "description": "理财产品和投资咨询",
+      "status": "idle",
+      "capabilities": ["理财产品", "基金销售", "保险咨询", "资产配置"]
+    },
+    {
+      "id": "loan_officer",
+      "name": "信贷专员",
+      "role": "executor",
+      "description": "贷款业务办理",
+      "status": "idle",
+      "capabilities": ["贷款咨询", "信用评估", "审批跟进", "贷后管理"]
+    },
+    {
+      "id": "compliance_officer",
+      "name": "合规专员",
+      "role": "tester",
+      "description": "合规检查和质量监督",
+      "status": "idle",
+      "capabilities": ["合规检查", "反洗钱", "风险提示", "质量监督"]
+    },
+    {
+      "id": "it_support",
+      "name": "技术支持",
+      "role": "fallback",
+      "description": "系统和技术问题支持",
+      "status": "idle",
+      "capabilities": ["系统问题", "设备维护", "网络支持"]
+    }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true,
+    "reception": {
+      "enabled": true,
+      "agentId": "lobby_manager",
+      "welcomeMessage": "您好！欢迎来到银行网点，我是大堂经理。请问您需要办理什么业务？我将为您提供专业的服务。"
+    }
+  }
+}

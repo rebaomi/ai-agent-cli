@@ -1,0 +1,106 @@
+{
+  "name": "IT互联网公司",
+  "description": "互联网/IT 公司的标准组织架构，适合技术项目开发",
+  "type": "enterprise",
+  "agents": [
+    {
+      "id": "ceo_1",
+      "name": "CEO",
+      "role": "supervisor",
+      "description": "首席执行官，负责战略决策和技术方向把控",
+      "status": "idle",
+      "capabilities": ["战略规划", "技术决策", "风险评估"]
+    },
+    {
+      "id": "pm_1",
+      "name": "产品经理",
+      "role": "orchestrator",
+      "description": "需求分析专家，负责收集用户需求并转化为产品特性",
+      "status": "idle",
+      "capabilities": ["需求分析", "产品设计", "用户研究", "PRD编写"]
+    },
+    {
+      "id": "arch_1",
+      "name": "架构师",
+      "role": "supervisor",
+      "description": "技术架构专家，负责系统设计和架构评审",
+      "status": "idle",
+      "capabilities": ["系统设计", "技术选型", "代码审查", "性能优化"]
+    },
+    {
+      "id": "tl_backend",
+      "name": "后端组长",
+      "role": "dispatcher",
+      "description": "后端团队负责人，协调后端开发任务分配",
+      "status": "idle",
+      "capabilities": ["任务分配", "代码审查", "技术指导"]
+    },
+    {
+      "id": "dev_backend_1",
+      "name": "Java开发",
+      "role": "executor",
+      "description": "后端开发工程师，负责 API 和服务开发",
+      "status": "idle",
+      "capabilities": ["Java", "Spring Boot", "数据库设计", "微服务"]
+    },
+    {
+      "id": "dev_backend_2",
+      "name": "Python开发",
+      "role": "executor",
+      "description": "Python 后端开发，负责数据处理和脚本开发",
+      "status": "idle",
+      "capabilities": ["Python", "Django", "数据分析", "自动化"]
+    },
+    {
+      "id": "tl_frontend",
+      "name": "前端组长",
+      "role": "dispatcher",
+      "description": "前端团队负责人，协调前端开发任务分配",
+      "status": "idle",
+      "capabilities": ["任务分配", "UI评审", "技术指导"]
+    },
+    {
+      "id": "dev_frontend",
+      "name": "前端开发",
+      "role": "executor",
+      "description": "前端开发工程师，负责界面和交互开发",
+      "status": "idle",
+      "capabilities": ["React", "Vue", "TypeScript", "CSS"]
+    },
+    {
+      "id": "devops_1",
+      "name": "DevOps工程师",
+      "role": "executor",
+      "description": "运维开发，负责部署和自动化",
+      "status": "idle",
+      "capabilities": ["Docker", "K8s", "CI/CD", "监控"]
+    },
+    {
+      "id": "qa_1",
+      "name": "测试工程师",
+      "role": "tester",
+      "description": "质量保证，负责功能测试和自动化测试",
+      "status": "idle",
+      "capabilities": ["功能测试", "自动化测试", "性能测试", "Bug追踪"]
+    },
+    {
+      "id": "consultant_1",
+      "name": "技术顾问",
+      "role": "fallback",
+      "description": "疑难问题解决专家，提供技术咨询",
+      "status": "idle",
+      "capabilities": ["问题诊断", "方案设计", "技术培训"]
+    }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "dispatcher", "executor", "tester", "supervisor"],
+    "autoSupervise": true,
+    "allowFallback": true,
+    "reception": {
+      "enabled": true,
+      "agentId": "pm_1",
+      "welcomeMessage": "您好！我是产品经理，很高兴为您服务。请描述您的需求，我将为您分析并协调团队完成。"
+    }
+  }
+}

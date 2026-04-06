@@ -16,11 +16,13 @@
 - 🎯 **Skills 系统** - 安装和管理第三方技能扩展
 - 🛡️ **安全沙箱** - 代码执行在受控环境中运行
 - 💬 **交互式对话** - 类 Claude Code 的命令行界面
-- 💾 **记忆管理** - 对话历史持久化，支持会话切换
+- 💾 **长期+短期记忆** - 模拟人脑记忆机制，Agent 专属记忆区域
 - 🌊 **流式输出** - AI 回复逐字显示，打字机效果
 - ⚡ **智能工具调用** - AI 自动调用合适工具完成任务
 - 📊 **任务规划器** - 复杂任务自动拆分成步骤执行，逐步完成
 - 🏢 **多 Agent 组织架构** - 模拟企业团队协作，多角色 Agent 协同工作
+- 🐱 **AgentCat 电子宠物** - 健康提醒助手，提醒喝水、休息、运动
+- 📋 **任务进度追踪** - 实时查看任务执行进度和状态
 
 ### 安装
 
@@ -70,6 +72,10 @@ ollama:
 | `/config` | 显示配置 |
 | `/skill` | 管理 Skills |
 | `/org` | 管理组织架构/团队 |
+| `/cat` | 电子宠物 AgentCat |
+| `/progress` | 查看任务进度 |
+| `/memory` | 记忆管理 |
+| `/templates` | 查看组织架构模板 |
 | `/mcp` | 管理 MCP 服务器 |
 | `/sessions` | 查看历史会话 |
 | `/load <id>` | 加载历史会话 |
@@ -233,6 +239,101 @@ coolAI 支持多 Agent 协作系统，模拟企业团队的工作方式。用户
 🔄 测试工程师 验收中...
 
 ✅ 任务完成！
+```
+
+#### 组织架构模板
+
+coolAI 提供了多种预设的组织架构模板，位于 `config/templates/` 目录：
+
+| 模板 | 说明 |
+|------|------|
+| `enterprise-it.json` | IT 互联网公司 |
+| `administrative-government.json` | 政府行政中心 |
+| `team-agile.json` | 敏捷开发团队 |
+| `financial-bank.json` | 银行网点 |
+| `ecommerce-customer-service.json` | 电商客服团队 |
+
+```bash
+# 查看所有模板
+/templates
+
+# 使用模板创建组织
+/org load config/templates/enterprise-it.json
+```
+
+### 接待 Agent（Reception Agent）
+
+接待 Agent 类似企业前台或银行大堂经理，负责：
+- 友好地迎接用户
+- 收集和理解用户需求
+- 必要时询问更多细节
+- 将需求传递给团队处理
+
+配置示例：
+```json
+{
+  "workflow": {
+    "reception": {
+      "enabled": true,
+      "agentId": "pm_1",
+      "welcomeMessage": "您好！我是产品经理，很高兴为您服务。"
+    }
+  }
+}
+```
+
+### 长期记忆与短期记忆
+
+coolAI 模拟人类大脑的记忆机制：
+
+- **长期记忆**：持久化存储，包括用户偏好、知识库、组织记忆
+- **短期记忆**：任务相关的临时信息，每个 Agent 有独立区域
+- **记忆共享**：不同 Agent 可以互相查看和串联记忆
+
+```bash
+/memory long    # 查看长期记忆
+/memory short   # 查看所有 Agent 的短期记忆
+/memory short <agentId>  # 查看特定 Agent 的短期记忆
+/memory clear   # 清空所有短期记忆
+```
+
+### AgentCat 电子宠物
+
+AgentCat 是一个健康提醒助手，类似 Claude Code 的电子宠物：
+
+```bash
+/cat start      # 启动 AgentCat
+/cat status     # 查看状态
+/cat water      # 确认喝水
+/cat rest       # 确认休息
+/cat walk       # 确认运动
+/cat interact   # 与猫猫互动
+/cat stop       # 暂停提醒
+```
+
+AgentCat 会按时提醒：
+- 💧 每 30 分钟提醒喝水
+- 👀 每 20 分钟提醒让眼睛休息
+- 🚶 每 60 分钟提醒起身运动
+- 🍽️ 按时提醒吃饭
+
+### 任务进度追踪
+
+实时查看任务执行进度：
+
+```bash
+/progress       # 或 /p
+```
+
+输出示例：
+```
+📊 任务进度:
+
+  用户登录功能开发
+  进度: 65%
+  状态: in_progress
+  当前: 编写后端 API
+  已完成: 需求分析, 数据库设计, 创建用户表
 ```
 
 ### 安装 Ollama 模型
@@ -528,11 +629,13 @@ An intelligent coding assistant CLI tool powered by Ollama, with support for MCP
 - 🎯 **Skills System** - Install and manage third-party skill extensions
 - 🛡️ **Secure Sandbox** - Code execution in controlled environment
 - 💬 **Interactive Chat** - Claude Code-like command line interface
-- 💾 **Memory Management** - Persistent conversation history with session switching
+- 💾 **Long-term + Short-term Memory** - Human brain-like memory with agent-specific areas
 - 🌊 **Streaming Output** - Typewriter effect for AI responses
 - ⚡ **Smart Tool Calling** - AI automatically calls appropriate tools to complete tasks
 - 📊 **Task Planner** - Complex tasks automatically split into steps for sequential execution
 - 🏢 **Multi-Agent Organization** - Simulate enterprise team collaboration with multiple agent roles
+- 🐱 **AgentCat Companion** - Health reminder assistant for water, rest, and exercise
+- 📋 **Task Progress Tracking** - Real-time task execution progress and status
 
 ### Installation
 
@@ -580,6 +683,10 @@ ollama:
 | `/config` | Show configuration |
 | `/skill` | Manage Skills |
 | `/org` | Manage organization/team |
+| `/cat` | AgentCat companion pet |
+| `/progress` | Show task progress |
+| `/memory` | Memory management |
+| `/templates` | List organization templates |
 | `/mcp` | Manage MCP servers |
 | `/sessions` | List conversation sessions |
 | `/load <id>` | Load a previous session |

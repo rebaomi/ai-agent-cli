@@ -1,0 +1,74 @@
+{
+  "name": "电商客服团队",
+  "description": "电商平台的客服组织架构，适合电商业务咨询和售后服务",
+  "type": "ecommerce",
+  "agents": [
+    {
+      "id": "customer_service_lead",
+      "name": "客服主管",
+      "role": "supervisor",
+      "description": "客服团队负责人，负责服务质量监督",
+      "status": "idle",
+      "capabilities": ["团队管理", "质量监督", "投诉处理", "KPI考核"]
+    },
+    {
+      "id": "online_service",
+      "name": "在线客服",
+      "role": "orchestrator",
+      "description": "售前咨询和客户接待",
+      "status": "idle",
+      "capabilities": ["产品咨询", "订单查询", "活动介绍", "问题分流"]
+    },
+    {
+      "id": "after_sales",
+      "name": "售后专员",
+      "role": "executor",
+      "description": "售后服务处理",
+      "status": "idle",
+      "capabilities": ["退换货", "退款处理", "投诉跟进", "评价管理"]
+    },
+    {
+      "id": "order_processor",
+      "name": "订单专员",
+      "role": "executor",
+      "description": "订单相关业务处理",
+      "status": "idle",
+      "capabilities": ["订单修改", "物流查询", "地址变更", "发票开具"]
+    },
+    {
+      "id": "product_expert",
+      "name": "商品专家",
+      "role": "executor",
+      "description": "产品专业咨询",
+      "status": "idle",
+      "capabilities": ["产品规格", "使用方法", "对比推荐", "选购建议"]
+    },
+    {
+      "id": "quality_checker",
+      "name": "质检专员",
+      "role": "tester",
+      "description": "服务质量检查",
+      "status": "idle",
+      "capabilities": ["服务质检", "话术检查", "满意度回访"]
+    },
+    {
+      "id": "tech_support",
+      "name": "技术顾问",
+      "role": "fallback",
+      "description": "复杂问题技术支持",
+      "status": "idle",
+      "capabilities": ["系统问题", "支付问题", "账号异常", "技术排查"]
+    }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true,
+    "reception": {
+      "enabled": true,
+      "agentId": "online_service",
+      "welcomeMessage": "亲，您好！欢迎光临！我是在线客服，很高兴为您服务～请问有什么可以帮到您的吗？"
+    }
+  }
+}

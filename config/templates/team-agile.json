@@ -1,0 +1,82 @@
+{
+  "name": "软件开发团队",
+  "description": "敏捷开发团队的组织架构，适合软件项目开发",
+  "type": "team",
+  "agents": [
+    {
+      "id": "scrum_master",
+      "name": "Scrum Master",
+      "role": "orchestrator",
+      "description": "敏捷教练，负责任务分解和流程协调",
+      "status": "idle",
+      "capabilities": ["任务拆分", "敏捷管理", "团队协调", "Sprint规划"]
+    },
+    {
+      "id": "tech_lead",
+      "name": "Tech Lead",
+      "role": "dispatcher",
+      "description": "技术负责人，负责任务分配和技术指导",
+      "status": "idle",
+      "capabilities": ["任务分配", "代码审查", "技术决策"]
+    },
+    {
+      "id": "dev_fullstack",
+      "name": "全栈开发",
+      "role": "executor",
+      "description": "全栈工程师，负责功能开发",
+      "status": "idle",
+      "capabilities": ["前端开发", "后端开发", "API设计", "数据库"]
+    },
+    {
+      "id": "dev_backend",
+      "name": "后端开发",
+      "role": "executor",
+      "description": "后端开发工程师",
+      "status": "idle",
+      "capabilities": ["Java/Python", "微服务", "数据库", "缓存"]
+    },
+    {
+      "id": "dev_frontend",
+      "name": "前端开发",
+      "role": "executor",
+      "description": "前端开发工程师",
+      "status": "idle",
+      "capabilities": ["React/Vue", "CSS", "用户体验", "响应式"]
+    },
+    {
+      "id": "qa_engineer",
+      "name": "QA工程师",
+      "role": "tester",
+      "description": "测试和质量保证",
+      "status": "idle",
+      "capabilities": ["功能测试", "自动化测试", "性能测试", "Bug追踪"]
+    },
+    {
+      "id": "senior_dev",
+      "name": "高级开发",
+      "role": "supervisor",
+      "description": "技术专家，负责代码审查和技术攻关",
+      "status": "idle",
+      "capabilities": ["代码审查", "架构设计", "性能优化", "技术培训"]
+    },
+    {
+      "id": "junior_dev",
+      "name": "初级开发",
+      "role": "fallback",
+      "description": "成长中的开发者，处理辅助任务",
+      "status": "idle",
+      "capabilities": ["功能开发", "文档编写", "测试辅助", "学习成长"]
+    }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "dispatcher", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true,
+    "reception": {
+      "enabled": true,
+      "agentId": "scrum_master",
+      "welcomeMessage": "你好！我是 Scrum Master。告诉我你想要的功能或需要解决的问题，我会帮你拆解成可执行的任务。准备好开始了吗？"
+    }
+  }
+}

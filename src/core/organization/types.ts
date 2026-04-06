@@ -24,11 +24,19 @@ export interface OrganizationConfig {
   workflow?: WorkflowConfig;
 }
 
+export interface ReceptionConfig {
+  enabled: boolean;
+  agentId: string;
+  welcomeMessage: string;
+  followUpQuestions?: string[];
+}
+
 export interface WorkflowConfig {
   enabled: boolean;
   defaultFlow: AgentRole[];
   autoSupervise: boolean;
   allowFallback: boolean;
+  reception?: ReceptionConfig;
 }
 
 export interface Task {

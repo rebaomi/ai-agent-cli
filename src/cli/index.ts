@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { configManager } from '../core/config.js';
 import { createMemoryManager, MemoryManager } from '../core/memory.js';
+import { createEnhancedMemoryManager, EnhancedMemoryManager } from '../core/memory-enhanced.js';
 import { createSkillManager } from '../core/skills.js';
 import { OllamaClient } from '../ollama/client.js';
 import { MCPManager } from '../mcp/client.js';
@@ -13,14 +14,15 @@ import { Sandbox } from '../sandbox/executor.js';
 import { BuiltInTools } from '../tools/builtin.js';
 import { Agent, createAgent } from '../core/agent.js';
 import type { AgentEvent } from '../core/agent.js';
-import { createAgentFactory, createOrganization, loadOrganization } from '../core/organization/index.js';
+import { createAgentFactory, createOrganization, loadOrganization, createReceptionAgent, ReceptionAgent } from '../core/organization/index.js';
 import type { Organization } from '../core/organization/index.js';
+import { createAgentCat, AgentCat } from '../core/companion/index.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import * as readline from 'readline';
 
 const logo = `
 ╔═══════════════════════════════════════════════════╗
-║           AI Agent CLI v1.2.0                     ║
+║           AI Agent CLI v1.3.0                     ║
 ║   Your intelligent coding assistant                 ║
 ╚═══════════════════════════════════════════════════╝
 `;
@@ -33,6 +35,7 @@ export class CLI {
   private sandbox!: Sandbox;
   private skillManager: ReturnType<typeof createSkillManager>;
   private memoryManager!: MemoryManager;
+  private enhancedMemory?: EnhancedMemoryManager;
   private builtInTools?: BuiltInTools;
   private workspace: string;
   private running = true;
@@ -41,6 +44,8 @@ export class CLI {
   private streamingOutput?: StreamingOutput;
   private organization?: Organization;
   private organizationMode = false;
+  private receptionAgent?: ReceptionAgent;
+  private agentCat?: AgentCat;
 
   constructor() {
     this.mcpManager = new MCPManager();
@@ -242,6 +247,19 @@ export class CLI {
       case 'team':
         await this.handleOrgCommand(args);
         break;
+      case 'cat':
+        this.handleCatCommand(args);
+        break;
+      case 'progress':
+      case 'p':
+        this.showProgress();
+        break;
+      case 'memory':
+        this.handleMemoryCommand(args);
+        break;
+      case 'templates':
+        await this.showTemplates();
+        break;
       default:
         console.log(chalk.yellow(`Unknown command: ${command}. Type /? for help.`));
     }
@@ -333,6 +351,197 @@ export class CLI {
     }
 
     console.log();
+  }
+
+  private handleCatCommand(args: string[]): void {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.agentCat) {
+      this.agentCat = createAgentCat();
+      this.agentCat.start();
+    }
+
+    switch (subcommand) {
+      case 'status':
+        this.showCatStatus();
+        break;
+      case 'water':
+        this.agentCat.acknowledge('water');
+        break;
+      case 'rest':
+        this.agentCat.acknowledge('eye_rest');
+        break;
+      case 'walk':
+        this.agentCat.acknowledge('walk');
+        break;
+      case 'meal':
+        this.agentCat.acknowledge('meal');
+        break;
+      case 'interact':
+        console.log(chalk.cyan(this.agentCat.interact()));
+        break;
+      case 'stop':
+        this.agentCat.stop();
+        printSuccess('AgentCat stopped');
+        break;
+      case 'start':
+        this.agentCat.start();
+        printSuccess('AgentCat started');
+        break;
+      default:
+        this.agentCat.showHelp();
+    }
+  }
+
+  private showCatStatus(): void {
+    if (!this.agentCat) {
+      printInfo('AgentCat not started. Use /cat start to activate.');
+      return;
+    }
+
+    const status = this.agentCat.getStatus();
+    console.log(chalk.bold('\n🐱 AgentCat 状态:\n'));
+    console.log(`  名字: ${status.name}`);
+    console.log(`  心情: ${status.mood}`);
+    console.log(`  状态: ${status.isActive ? chalk.green('活跃') : chalk.gray('休眠')}`);
+    console.log(`  上次喝水: ${status.lastWater}`);
+    console.log(`  上次休息: ${status.lastEyeRest}`);
+    console.log(`  上次运动: ${status.lastWalk}`);
+    console.log(`  互动次数: ${status.interactionCount}`);
+    console.log();
+  }
+
+  private showProgress(): void {
+    if (!this.enhancedMemory) {
+      printInfo('Enhanced memory not initialized');
+      return;
+    }
+
+    const activeTasks = this.enhancedMemory.getActiveTasks();
+    console.log(chalk.bold('\n📊 任务进度:\n'));
+
+    if (activeTasks.length === 0) {
+      console.log(chalk.gray('暂无进行中的任务'));
+    } else {
+      for (const task of activeTasks) {
+        const statusColor = task.status === 'in_progress' ? chalk.yellow : 
+                          task.status === 'completed' ? chalk.green : chalk.gray;
+        console.log(chalk.cyan(`  ${task.description}`));
+        console.log(`  进度: ${statusColor(task.progress + '%')}`);
+        console.log(`  状态: ${statusColor(task.status)}`);
+        if (task.currentStep) {
+          console.log(`  当前: ${task.currentStep}`);
+        }
+        if (task.completedSteps.length > 0) {
+          console.log(chalk.gray(`  已完成: ${task.completedSteps.join(', ')}`));
+        }
+        console.log();
+      }
+    }
+  }
+
+  private handleMemoryCommand(args: string[]): void {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.enhancedMemory) {
+      this.enhancedMemory = createEnhancedMemoryManager();
+    }
+
+    switch (subcommand) {
+      case 'long':
+        this.showLongTermMemory();
+        break;
+      case 'short':
+        this.showShortTermMemory(args[1]);
+        break;
+      case 'clear':
+        this.enhancedMemory.clearAllAgentShortTermMemory();
+        printSuccess('Short-term memory cleared');
+        break;
+      default:
+        console.log(chalk.bold('\n💾 记忆管理:\n'));
+        console.log(chalk.cyan('/memory long') + '   ' + chalk.gray('查看长期记忆'));
+        console.log(chalk.cyan('/memory short [agentId]') + '   ' + chalk.gray('查看短期记忆'));
+        console.log(chalk.cyan('/memory clear') + '   ' + chalk.gray('清空短期记忆'));
+        console.log();
+    }
+  }
+
+  private showLongTermMemory(): void {
+    if (!this.enhancedMemory) return;
+
+    const memory = this.enhancedMemory.getLongTermMemory();
+    console.log(chalk.bold('\n💾 长期记忆:\n'));
+    
+    if (Object.keys(memory.userPreferences).length > 0) {
+      console.log(chalk.cyan('用户偏好:'));
+      for (const [key, value] of Object.entries(memory.userPreferences)) {
+        console.log(`  ${key}: ${JSON.stringify(value)}`);
+      }
+    }
+    
+    if (memory.knowledgeBase.length > 0) {
+      console.log(chalk.cyan('\n知识库:'));
+      memory.knowledgeBase.forEach(k => console.log(`  • ${k}`));
+    }
+    
+    if (Object.keys(memory.organizationMemory).length > 0) {
+      console.log(chalk.cyan('\n组织记忆:'));
+      for (const [id, agent] of Object.entries(memory.organizationMemory)) {
+        console.log(`  ${agent.agentName} (${agent.role}): ${agent.shortTerm.length} 条短期记忆`);
+      }
+    }
+    
+    console.log();
+  }
+
+  private showShortTermMemory(agentId?: string): void {
+    if (!this.enhancedMemory) return;
+
+    if (!agentId) {
+      const memory = this.enhancedMemory.getLongTermMemory();
+      console.log(chalk.bold('\n📝 Agent 短期记忆:\n'));
+      for (const [id, agent] of Object.entries(memory.organizationMemory)) {
+        console.log(chalk.cyan(`${agent.agentName} (${id}):`));
+        agent.shortTerm.slice(-5).forEach(m => {
+          console.log(`  [${m.type}] ${m.content.slice(0, 50)}${m.content.length > 50 ? '...' : ''}`);
+        });
+        console.log();
+      }
+      return;
+    }
+
+    const memories = this.enhancedMemory.getAgentShortTermMemory(agentId);
+    console.log(chalk.bold(`\n📝 ${agentId} 短期记忆:\n`));
+    if (memories.length === 0) {
+      console.log(chalk.gray('暂无记忆'));
+    } else {
+      memories.forEach(m => {
+        console.log(`[${m.type}] ${m.content}`);
+        console.log(chalk.gray(`  时间: ${new Date(m.timestamp).toLocaleString()}\n`));
+      });
+    }
+  }
+
+  private async showTemplates(): Promise<void> {
+    const templateDir = path.join(process.cwd(), 'config', 'templates');
+    
+    try {
+      const files = await fs.readdir(templateDir);
+      const templates = files.filter(f => f.endsWith('.json'));
+      
+      console.log(chalk.bold('\n📁 组织架构模板:\n'));
+      for (const template of templates) {
+        const content = await fs.readFile(path.join(templateDir, template), 'utf-8');
+        const config = JSON.parse(content);
+        console.log(chalk.cyan(`  ${config.name}`) + chalk.gray(` - ${config.type}`));
+        console.log(chalk.gray(`    ${config.description}`));
+        console.log(chalk.gray(`    角色数: ${config.agents.length}`));
+        console.log();
+      }
+    } catch (error) {
+      printError('Failed to load templates: ' + (error instanceof Error ? error.message : String(error)));
+    }
   }
 
   private async showSessions(): Promise<void> {

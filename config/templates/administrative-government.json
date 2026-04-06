@@ -1,0 +1,82 @@
+{
+  "name": "政府行政中心",
+  "description": "政府行政服务中心的组织架构，适合政务处理和公共服务",
+  "type": "administrative",
+  "agents": [
+    {
+      "id": "director_1",
+      "name": "中心主任",
+      "role": "supervisor",
+      "description": "中心主任，负责整体工作协调和重大事项决策",
+      "status": "idle",
+      "capabilities": ["行政决策", "政策解读", "统筹协调"]
+    },
+    {
+      "id": "reception_1",
+      "name": "导办员",
+      "role": "orchestrator",
+      "description": "前台接待和引导，负责初步接待和需求分类",
+      "status": "idle",
+      "capabilities": ["咨询服务", "材料预审", "业务分流"]
+    },
+    {
+      "id": "section_chief_1",
+      "name": "综合科科长",
+      "role": "dispatcher",
+      "description": "综合科负责人，协调部门间协作",
+      "status": "idle",
+      "capabilities": ["部门协调", "文件审核", "会议组织"]
+    },
+    {
+      "id": "clerk_license",
+      "name": "证照办理员",
+      "role": "executor",
+      "description": "负责各类证照的受理和办理",
+      "status": "idle",
+      "capabilities": ["证照办理", "材料审核", "流程办理"]
+    },
+    {
+      "id": "clerk_tax",
+      "name": "税务办理员",
+      "role": "executor",
+      "description": "负责税务相关业务办理",
+      "status": "idle",
+      "capabilities": ["税务登记", "申报指导", "政策解答"]
+    },
+    {
+      "id": "clerk_civil",
+      "name": "民政办事员",
+      "role": "executor",
+      "description": "负责民政类业务办理",
+      "status": "idle",
+      "capabilities": ["婚姻登记", "社保办理", "救助申请"]
+    },
+    {
+      "id": "auditor_1",
+      "name": "审核员",
+      "role": "tester",
+      "description": "业务审核和质量检查",
+      "status": "idle",
+      "capabilities": ["材料审核", "合规检查", "质量监督"]
+    },
+    {
+      "id": "consultant_legal",
+      "name": "法律顾问",
+      "role": "fallback",
+      "description": "提供法律咨询和合规建议",
+      "status": "idle",
+      "capabilities": ["法律咨询", "政策解读", "风险提示"]
+    }
+  ],
+  "workflow": {
+    "enabled": true,
+    "defaultFlow": ["orchestrator", "dispatcher", "executor", "tester"],
+    "autoSupervise": true,
+    "allowFallback": true,
+    "reception": {
+      "enabled": true,
+      "agentId": "reception_1",
+      "welcomeMessage": "您好！欢迎来到行政服务中心，我是导办员。请问您要办理什么业务？我来帮您引导和解答。"
+    }
+  }
+}
