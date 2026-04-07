@@ -36,7 +36,7 @@ export interface AgentOptions {
 }
 
 export interface AgentEvent {
-  type: 'thinking' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'plan_summary' | 'plan_progress' | 'write_confirmation';
+  type: 'thinking' | 'tool_call' | 'tool_result' | 'response' | 'error' | 'plan_summary' | 'plan_progress' | 'write_confirmation' | 'memory_sync';
   content: string;
   toolCall?: ToolCall;
   toolResult?: ToolResult;
@@ -52,6 +52,11 @@ export interface AgentEvent {
   writeData?: {
     content: string;
     suggestedPath?: string;
+  };
+  memorySync?: {
+    backend: 'mempalace';
+    status: 'archived' | 'failed' | 'skipped';
+    detail?: string;
   };
 }
 
@@ -86,6 +91,7 @@ export class Agent {
   private skillManager?: any;
   private assignedSkills?: Set<string>;
   private agentRole?: string;
+  private readonly usingDefaultSystemPrompt: boolean;
 
   constructor(options: AgentOptions) {
     this.llm = options.llm;
@@ -116,6 +122,7 @@ export class Agent {
         skillsDir: this.skillManager.getSkillsDir(),
       }) : undefined,
     });
+    this.usingDefaultSystemPrompt = !options.systemPrompt;
     this.systemPrompt = options.systemPrompt ?? this.getDefaultSystemPrompt();
     this.contextManager = createContextManager(options.contextConfig);
     this.maxIterations = options.maxIterations ?? 100;
@@ -213,6 +220,10 @@ export class Agent {
     await this.toolRegistry.refresh();
     this.tools = this.toolRegistry.listTools();
 
+    if (this.usingDefaultSystemPrompt) {
+      this.systemPrompt = this.getDefaultSystemPrompt();
+    }
+
     this.llm.setTools(this.tools);
   }
 
@@ -235,6 +246,22 @@ ${availableSkills.map(s => `  <skill>
 `;
     }
 
+  const hasMemPalace = this.tools.some(tool => tool.name.includes('mempalace_'));
+  const memPalaceSection = hasMemPalace ? `
+## Memory Protocol
+When MemPalace tools are available, use them as the long-term memory backend.
+
+Rules:
+1. Before answering questions about a person, project, prior decision, or past event, first verify with mempalace_search or mempalace_kg_query when relevant.
+2. Prefer mempalace_kg_query for structured facts and relationships, and mempalace_search for verbatim recall or broad retrieval.
+3. If the answer depends on uncertain historical memory, say you are checking and use the memory tools instead of guessing.
+4. After finishing an important task or conversation, write a concise memory using mempalace_diary_write.
+5. When you learn a durable new fact that should persist, store it with mempalace_add_drawer or update facts with mempalace_kg_add / mempalace_kg_invalidate.
+
+Do not use MemPalace for every turn. Use it when durable memory or historical verification matters.
+
+` : '';
+
     return `You are an expert AI coding assistant, like Claude Code or OpenCode.
 
 ## Your Capabilities
@@ -244,7 +271,7 @@ You can help with:
 - Searching and analyzing codebases
 - Explaining complex concepts
 - Debugging issues
-- Writing tests and documentation${skillSection}
+- Writing tests and documentation${skillSection}${memPalaceSection}
 ## Tool Usage (CRITICAL - Read Carefully)
 
 When you need to read, write, edit, list, search, or execute ANY file/command operation, you MUST actually call the tool. DO NOT just describe what you would do - you MUST use the tool.
@@ -491,10 +518,10 @@ You: "Here's the content of package.json:
       }
     }
     
-    return this.synthesizeResults(originalTask, results);
+    return await this.synthesizeResults(originalTask, results);
   }
 
-  private synthesizeResults(originalTask: string, stepResults: string[]): string {
+  private async synthesizeResults(originalTask: string, stepResults: string[]): Promise<string> {
     let finalResponse = `## ✅ 任务完成\n\n`;
     finalResponse += `**原始任务**: ${originalTask}\n\n`;
     finalResponse += `**执行摘要**:\n\n`;
@@ -507,10 +534,75 @@ You: "Here's the content of package.json:
     const totalSteps = stepResults.length;
     
     finalResponse += `---\n**完成进度**: ${completedSteps}/${totalSteps} 步骤成功完成`;
+
+    await this.archiveTaskToMemPalace(originalTask, stepResults, completedSteps, totalSteps);
     
     this.onEvent?.({ type: 'response', content: finalResponse });
     
     return finalResponse;
+  }
+
+  private async archiveTaskToMemPalace(
+    originalTask: string,
+    stepResults: string[],
+    completedSteps: number,
+    totalSteps: number,
+  ): Promise<void> {
+    const mempalaceClient = this.mcpManager.getClient('mempalace');
+    if (!mempalaceClient) {
+      this.onEvent?.({
+        type: 'memory_sync',
+        content: 'MemPalace 未连接，跳过长期归档。',
+        memorySync: { backend: 'mempalace', status: 'skipped', detail: 'not_connected' },
+      });
+      return;
+    }
+
+    const hasDiaryTool = mempalaceClient.getTools().some(tool => tool.name === 'mempalace_diary_write');
+    if (!hasDiaryTool) {
+      this.onEvent?.({
+        type: 'memory_sync',
+        content: 'MemPalace 未提供 diary 工具，跳过长期归档。',
+        memorySync: { backend: 'mempalace', status: 'skipped', detail: 'tool_missing' },
+      });
+      return;
+    }
+
+    const summaryLines = stepResults
+      .map(result => result.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    const entry = [
+      `DATE:${new Date().toISOString().slice(0, 10)}`,
+      `TASK:${originalTask}`,
+      `STATUS:completed`,
+      `PROGRESS:${completedSteps}/${totalSteps}`,
+      summaryLines.length > 0 ? `SUMMARY:${summaryLines.join(' | ')}` : undefined,
+      'IMPORTANCE:★★★',
+    ].filter(Boolean).join('\n');
+
+    try {
+      await this.mcpManager.callTool('mempalace', 'mempalace_diary_write', {
+        agent_name: this.agentRole || 'ai-agent-cli',
+        topic: 'completed_task',
+        entry,
+      });
+      this.onEvent?.({
+        type: 'memory_sync',
+        content: 'MemPalace 已归档本次任务摘要。',
+        memorySync: { backend: 'mempalace', status: 'archived', detail: 'diary_write' },
+      });
+    } catch (error) {
+      this.onEvent?.({
+        type: 'memory_sync',
+        content: `MemPalace 归档失败: ${error instanceof Error ? error.message : String(error)}`,
+        memorySync: {
+          backend: 'mempalace',
+          status: 'failed',
+          detail: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
   }
 
   private async generateResponse(): Promise<string> {

@@ -34,12 +34,60 @@ export interface TaskProgress {
   updatedAt: number;
 }
 
+export type MemoryPalaceZone =
+  | 'entrance'
+  | 'identity'
+  | 'project'
+  | 'knowledge'
+  | 'tasks'
+  | 'agents'
+  | 'archive';
+
+export interface MemoryPalaceItem {
+  id: string;
+  anchor: string;
+  title: string;
+  content: string;
+  zone: MemoryPalaceZone;
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+  metadata?: Record<string, any>;
+}
+
+export interface MemoryPalaceRoom {
+  id: string;
+  name: string;
+  zone: MemoryPalaceZone;
+  description: string;
+  landmarks: string[];
+  memories: MemoryPalaceItem[];
+  exits: string[];
+  lastVisited: number;
+}
+
+export interface MemoryPalaceRoute {
+  from: string;
+  to: string;
+  label: string;
+}
+
+export interface MemoryPalace {
+  name: string;
+  entranceRoomId: string;
+  currentRoomId: string;
+  rooms: Record<string, MemoryPalaceRoom>;
+  routes: MemoryPalaceRoute[];
+  updatedAt: number;
+}
+
 export interface LongTermMemory {
   userPreferences: Record<string, any>;
   projectContext: Record<string, any>;
   knowledgeBase: string[];
   organizationMemory: Record<string, AgentMemory>;
   taskHistory: TaskProgress[];
+  memoryPalace: MemoryPalace;
 }
 
 export class EnhancedMemoryManager {
@@ -61,13 +109,7 @@ export class EnhancedMemoryManager {
     this.progressFile = join(this.baseDir, 'progress.json');
     this.currentSessionId = this.generateSessionId();
     
-    this.longTermMemory = {
-      userPreferences: {},
-      projectContext: {},
-      knowledgeBase: [],
-      organizationMemory: {},
-      taskHistory: [],
-    };
+    this.longTermMemory = this.createDefaultLongTermMemory();
   }
 
   private generateSessionId(): string {
@@ -81,19 +123,110 @@ export class EnhancedMemoryManager {
     await this.loadCurrentSession();
   }
 
+  private createDefaultLongTermMemory(): LongTermMemory {
+    return {
+      userPreferences: {},
+      projectContext: {},
+      knowledgeBase: [],
+      organizationMemory: {},
+      taskHistory: [],
+      memoryPalace: this.createDefaultMemoryPalace(),
+    };
+  }
+
+  private createDefaultMemoryPalace(): MemoryPalace {
+    const now = Date.now();
+    const room = (
+      id: string,
+      name: string,
+      zone: MemoryPalaceZone,
+      description: string,
+      landmarks: string[],
+      exits: string[],
+    ): MemoryPalaceRoom => ({
+      id,
+      name,
+      zone,
+      description,
+      landmarks,
+      memories: [],
+      exits,
+      lastVisited: now,
+    });
+
+    const rooms: Record<string, MemoryPalaceRoom> = {
+      propylaea: room('propylaea', '前厅 Propylaea', 'entrance', '进入记忆宫殿的总入口，用于导航各个记忆区域。', ['石柱', '火炬', '总览地图'], ['oikos', 'agora', 'bibliotheke']),
+      oikos: room('oikos', '居所 Oikos', 'identity', '记录用户身份、偏好与沟通习惯。', ['铜镜', '衣柜', '姓名卷轴'], ['propylaea', 'agora', 'mnemosyne_archive']),
+      agora: room('agora', '广场 Agora', 'project', '记录项目背景、工作区状态和当前关注主题。', ['市场石碑', '项目看板', '路线图'], ['propylaea', 'ergasterion', 'bibliotheke']),
+      bibliotheke: room('bibliotheke', '图书馆 Bibliotheke', 'knowledge', '存放稳定知识、经验规则与可复用结论。', ['卷轴架', '油灯', '索引台'], ['propylaea', 'agora', 'stoa']),
+      ergasterion: room('ergasterion', '工坊 Ergasterion', 'tasks', '记录任务进度、步骤、失败点与产出。', ['工作台', '工具墙', '任务板'], ['agora', 'stoa', 'mnemosyne_archive']),
+      stoa: room('stoa', '柱廊 Stoa', 'agents', '记录 Agent 角色、协作上下文和观察。', ['长廊', '角色徽章', '协作公告板'], ['bibliotheke', 'ergasterion', 'mnemosyne_archive']),
+      mnemosyne_archive: room('mnemosyne_archive', '记忆档案馆 Mnemosyne', 'archive', '归档重要结论、旧任务和会话痕迹。', ['石柜', '封蜡箱', '年代索引'], ['oikos', 'ergasterion', 'stoa']),
+    };
+
+    return {
+      name: 'Temple of Mnemosyne',
+      entranceRoomId: 'propylaea',
+      currentRoomId: 'propylaea',
+      rooms,
+      routes: [
+        { from: 'propylaea', to: 'oikos', label: '左侧回廊' },
+        { from: 'propylaea', to: 'agora', label: '中央大道' },
+        { from: 'propylaea', to: 'bibliotheke', label: '右侧阶梯' },
+        { from: 'agora', to: 'ergasterion', label: '工匠小径' },
+        { from: 'bibliotheke', to: 'stoa', label: '知识柱廊' },
+        { from: 'ergasterion', to: 'mnemosyne_archive', label: '归档门' },
+        { from: 'stoa', to: 'mnemosyne_archive', label: '回声长廊' },
+        { from: 'oikos', to: 'mnemosyne_archive', label: '私室暗门' },
+      ],
+      updatedAt: now,
+    };
+  }
+
   private async loadLongTermMemory(): Promise<void> {
     try {
       const content = await fs.readFile(this.longTermFile, 'utf-8');
-      this.longTermMemory = JSON.parse(content);
-    } catch {
+      const parsed = JSON.parse(content) as Partial<LongTermMemory>;
       this.longTermMemory = {
-        userPreferences: {},
-        projectContext: {},
-        knowledgeBase: [],
-        organizationMemory: {},
-        taskHistory: [],
+        ...this.createDefaultLongTermMemory(),
+        ...parsed,
+        userPreferences: parsed.userPreferences || {},
+        projectContext: parsed.projectContext || {},
+        knowledgeBase: Array.isArray(parsed.knowledgeBase) ? parsed.knowledgeBase : [],
+        organizationMemory: parsed.organizationMemory || {},
+        taskHistory: Array.isArray(parsed.taskHistory) ? parsed.taskHistory : [],
+        memoryPalace: parsed.memoryPalace ? this.normalizeMemoryPalace(parsed.memoryPalace) : this.createDefaultMemoryPalace(),
+      };
+    } catch {
+      this.longTermMemory = this.createDefaultLongTermMemory();
+    }
+  }
+
+  private normalizeMemoryPalace(memoryPalace: Partial<MemoryPalace>): MemoryPalace {
+    const defaults = this.createDefaultMemoryPalace();
+    const mergedRooms: Record<string, MemoryPalaceRoom> = { ...defaults.rooms };
+    const entranceRoom = defaults.rooms.propylaea as MemoryPalaceRoom;
+
+    for (const [roomId, room] of Object.entries(memoryPalace.rooms || {})) {
+      const fallbackRoom = defaults.rooms[roomId] ?? entranceRoom;
+      mergedRooms[roomId] = {
+        ...fallbackRoom,
+        ...room,
+        memories: Array.isArray(room.memories) ? room.memories : fallbackRoom.memories,
+        exits: Array.isArray(room.exits) ? room.exits : fallbackRoom.exits,
+        landmarks: Array.isArray(room.landmarks) ? room.landmarks : fallbackRoom.landmarks,
       };
     }
+
+    return {
+      ...defaults,
+      ...memoryPalace,
+      rooms: mergedRooms,
+      routes: Array.isArray(memoryPalace.routes) ? memoryPalace.routes : defaults.routes,
+      entranceRoomId: memoryPalace.entranceRoomId || defaults.entranceRoomId,
+      currentRoomId: memoryPalace.currentRoomId || defaults.currentRoomId,
+      updatedAt: memoryPalace.updatedAt || defaults.updatedAt,
+    };
   }
 
   private async saveLongTermMemory(): Promise<void> {
@@ -203,6 +336,18 @@ export class EnhancedMemoryManager {
       ...agent,
       lastUpdated: Date.now(),
     };
+    this.upsertPalaceMemory('stoa', `agent:${agent.agentId}`, {
+      title: `${agent.agentName} (${agent.role})`,
+      content: agent.context || `${agent.agentName} has ${agent.shortTerm.length} short-term memories.`,
+      zone: 'agents',
+      tags: ['agent', agent.role, agent.agentId],
+      metadata: {
+        agentId: agent.agentId,
+        agentName: agent.agentName,
+        role: agent.role,
+        shortTermCount: agent.shortTerm.length,
+      },
+    });
     this.saveLongTermMemory();
   }
 
@@ -217,6 +362,19 @@ export class EnhancedMemoryManager {
         ...update,
         lastUpdated: Date.now(),
       };
+      const agent = this.longTermMemory.organizationMemory[agentId];
+      this.upsertPalaceMemory('stoa', `agent:${agentId}`, {
+        title: `${agent.agentName} (${agent.role})`,
+        content: agent.context || `${agent.agentName} has ${agent.shortTerm.length} short-term memories.`,
+        zone: 'agents',
+        tags: ['agent', agent.role, agentId],
+        metadata: {
+          agentId,
+          agentName: agent.agentName,
+          role: agent.role,
+          shortTermCount: agent.shortTerm.length,
+        },
+      });
       this.saveLongTermMemory();
     }
   }
@@ -234,6 +392,14 @@ export class EnhancedMemoryManager {
       if (agentMemory.shortTerm.length > 50) {
         agentMemory.shortTerm = agentMemory.shortTerm.slice(-50);
       }
+
+      this.upsertPalaceMemory('stoa', `agent-entry:${agentId}:${newEntry.id}`, {
+        title: `${agentId} · ${newEntry.type}`,
+        content: newEntry.content,
+        zone: 'agents',
+        tags: ['agent-entry', agentId, newEntry.type],
+        metadata: newEntry.metadata,
+      });
       
       this.updateAgentMemory(agentId, { shortTerm: agentMemory.shortTerm });
     }
@@ -255,6 +421,13 @@ export class EnhancedMemoryManager {
 
   setUserPreference(key: string, value: any): void {
     this.longTermMemory.userPreferences[key] = value;
+    this.upsertPalaceMemory('oikos', `preference:${key}`, {
+      title: `Preference · ${key}`,
+      content: typeof value === 'string' ? value : JSON.stringify(value),
+      zone: 'identity',
+      tags: ['preference', key],
+      metadata: { key, value },
+    });
     this.saveLongTermMemory();
   }
 
@@ -265,8 +438,30 @@ export class EnhancedMemoryManager {
   addToKnowledgeBase(knowledge: string): void {
     if (!this.longTermMemory.knowledgeBase.includes(knowledge)) {
       this.longTermMemory.knowledgeBase.push(knowledge);
+      this.upsertPalaceMemory('bibliotheke', `knowledge:${knowledge}`, {
+        title: `Knowledge`,
+        content: knowledge,
+        zone: 'knowledge',
+        tags: ['knowledge'],
+      });
       this.saveLongTermMemory();
     }
+  }
+
+  setProjectContext(key: string, value: any): void {
+    this.longTermMemory.projectContext[key] = value;
+    this.upsertPalaceMemory('agora', `project:${key}`, {
+      title: `Project · ${key}`,
+      content: typeof value === 'string' ? value : JSON.stringify(value),
+      zone: 'project',
+      tags: ['project', key],
+      metadata: { key, value },
+    });
+    this.saveLongTermMemory();
+  }
+
+  getProjectContext(key: string): any {
+    return this.longTermMemory.projectContext[key];
   }
 
   getKnowledgeBase(): string[] {
@@ -285,6 +480,17 @@ export class EnhancedMemoryManager {
       updatedAt: Date.now(),
     };
     this.longTermMemory.taskHistory.push(progress);
+    this.upsertPalaceMemory('ergasterion', `task:${progress.taskId}`, {
+      title: description,
+      content: `Task created with ${steps.length} planned steps.`,
+      zone: 'tasks',
+      tags: ['task', progress.status],
+      metadata: {
+        taskId: progress.taskId,
+        steps,
+        progress: progress.progress,
+      },
+    });
     this.saveLongTermMemory();
     return progress;
   }
@@ -294,6 +500,24 @@ export class EnhancedMemoryManager {
     if (task) {
       Object.assign(task, update, { updatedAt: Date.now() });
       task.progress = this.calculateProgress(task);
+      this.upsertPalaceMemory('ergasterion', `task:${taskId}`, {
+        title: task.description,
+        content: [
+          `Status: ${task.status}`,
+          task.currentStep ? `Current step: ${task.currentStep}` : undefined,
+          task.result ? `Result: ${task.result}` : undefined,
+          task.error ? `Error: ${task.error}` : undefined,
+        ].filter(Boolean).join('\n'),
+        zone: 'tasks',
+        tags: ['task', task.status],
+        metadata: {
+          taskId,
+          progress: task.progress,
+          completedSteps: task.completedSteps,
+          pendingSteps: task.pendingSteps,
+          status: task.status,
+        },
+      });
       this.saveLongTermMemory();
     }
   }
@@ -330,7 +554,7 @@ export class EnhancedMemoryManager {
   }
 
   getLongTermMemory(): LongTermMemory {
-    return { ...this.longTermMemory };
+    return JSON.parse(JSON.stringify(this.longTermMemory)) as LongTermMemory;
   }
 
   getSharedContext(): string {
@@ -348,8 +572,147 @@ export class EnhancedMemoryManager {
     if (activeTasks.length > 0) {
       contextParts.push(`进行中任务: ${activeTasks.map(t => `${t.description}(${t.progress}%)`).join(', ')}`);
     }
+
+    const palaceContext = this.getNavigablePalaceContext();
+    if (palaceContext) {
+      contextParts.push(`记忆宫殿: ${palaceContext}`);
+    }
     
     return contextParts.join('\n');
+  }
+
+  getMemoryPalace(): MemoryPalace {
+    return JSON.parse(JSON.stringify(this.longTermMemory.memoryPalace)) as MemoryPalace;
+  }
+
+  getMemoryPalaceOverview(): {
+    name: string;
+    currentRoomId: string;
+    roomCount: number;
+    totalMemoryCount: number;
+    rooms: Array<{ id: string; name: string; zone: MemoryPalaceZone; memoryCount: number; exits: string[] }>;
+  } {
+    const palace = this.longTermMemory.memoryPalace;
+    const rooms = Object.values(palace.rooms).map(room => ({
+      id: room.id,
+      name: room.name,
+      zone: room.zone,
+      memoryCount: room.memories.length,
+      exits: room.exits,
+    }));
+
+    return {
+      name: palace.name,
+      currentRoomId: palace.currentRoomId,
+      roomCount: rooms.length,
+      totalMemoryCount: rooms.reduce((sum, room) => sum + room.memoryCount, 0),
+      rooms,
+    };
+  }
+
+  getMemoryPalaceRoom(roomId?: string): MemoryPalaceRoom | undefined {
+    const palace = this.longTermMemory.memoryPalace;
+    const id = roomId || palace.currentRoomId;
+    const room = palace.rooms[id];
+    if (!room) {
+      return undefined;
+    }
+
+    room.lastVisited = Date.now();
+    palace.updatedAt = Date.now();
+    return JSON.parse(JSON.stringify(room)) as MemoryPalaceRoom;
+  }
+
+  setCurrentPalaceRoom(roomId: string): boolean {
+    const palace = this.longTermMemory.memoryPalace;
+    if (!palace.rooms[roomId]) {
+      return false;
+    }
+
+    palace.currentRoomId = roomId;
+    palace.rooms[roomId].lastVisited = Date.now();
+    palace.updatedAt = Date.now();
+    this.saveLongTermMemory();
+    return true;
+  }
+
+  searchMemoryPalace(query: string): MemoryPalaceItem[] {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) {
+      return [];
+    }
+
+    const results: MemoryPalaceItem[] = [];
+    for (const room of Object.values(this.longTermMemory.memoryPalace.rooms)) {
+      for (const item of room.memories) {
+        const haystack = `${item.title}\n${item.content}\n${item.tags.join(' ')}`.toLowerCase();
+        if (haystack.includes(normalized)) {
+          results.push(JSON.parse(JSON.stringify(item)) as MemoryPalaceItem);
+        }
+      }
+    }
+
+    return results.sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  getNavigablePalaceContext(maxItemsPerRoom = 2): string {
+    const palace = this.longTermMemory.memoryPalace;
+    const room = palace.rooms[palace.currentRoomId];
+    if (!room) {
+      return '';
+    }
+
+    const items = room.memories.slice(-maxItemsPerRoom).map(item => item.title).join(', ');
+    const exits = room.exits.map(exitId => palace.rooms[exitId]?.name || exitId).join(', ');
+    return `${room.name}，陈列: ${items || '暂无'}，可前往: ${exits || '无'}`;
+  }
+
+  private upsertPalaceMemory(
+    roomId: string,
+    anchor: string,
+    input: {
+      title: string;
+      content: string;
+      zone: MemoryPalaceZone;
+      tags: string[];
+      metadata?: Record<string, any>;
+    },
+  ): void {
+    const palace = this.longTermMemory.memoryPalace;
+    const room = palace.rooms[roomId];
+    if (!room) {
+      return;
+    }
+
+    const now = Date.now();
+    const existing = room.memories.find(item => item.anchor === anchor);
+    if (existing) {
+      existing.title = input.title;
+      existing.content = input.content;
+      existing.tags = input.tags;
+      existing.zone = input.zone;
+      existing.metadata = input.metadata;
+      existing.updatedAt = now;
+    } else {
+      room.memories.push({
+        id: `palace_${now}_${Math.random().toString(36).slice(2, 8)}`,
+        anchor,
+        title: input.title,
+        content: input.content,
+        zone: input.zone,
+        tags: input.tags,
+        createdAt: now,
+        updatedAt: now,
+        metadata: input.metadata,
+      });
+    }
+
+    room.lastVisited = now;
+    palace.updatedAt = now;
+
+    if (room.memories.length > 120) {
+      room.memories = room.memories.slice(-120);
+    }
   }
 }
 

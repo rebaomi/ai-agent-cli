@@ -66,6 +66,7 @@ export class MCPClient extends EventEmitter {
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       const { command, args = [], env = {} } = this.config;
+      let settled = false;
       
       this.process = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -83,35 +84,56 @@ export class MCPClient extends EventEmitter {
 
       this.process.stderr?.on('data', (data: Buffer) => {
         stderrBuffer += data.toString();
-        if (stderrBuffer.includes('\n')) {
-          this.emit('error', new Error(stderrBuffer));
-          stderrBuffer = '';
+        const lines = stderrBuffer.split(/\r?\n/);
+        stderrBuffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.length > 0) {
+            this.emit('stderr', trimmed);
+          }
         }
       });
 
       this.process.on('error', (error) => {
-        this.emit('error', error);
-        reject(error);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      });
+
+      this.process.on('spawn', () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
       });
 
       this.process.on('exit', (code) => {
+        if (stderrBuffer.trim().length > 0) {
+          this.emit('stderr', stderrBuffer.trim());
+          stderrBuffer = '';
+        }
         this.emit('close', code);
         this.isInitialized = false;
+
+        if (!settled) {
+          settled = true;
+          reject(new Error(`MCP process exited${code !== null ? ` (code ${code})` : ''}`));
+        }
       });
 
       const timeout = setTimeout(() => {
-        reject(new Error('MCP connection timeout'));
+        if (!settled) {
+          settled = true;
+          reject(new Error('MCP process spawn timeout'));
+        }
       }, 30000);
 
-      this.once('initialized', () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-
-      this.once('error', (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
+      const clearOnSettle = (): void => clearTimeout(timeout);
+      this.process.once('spawn', clearOnSettle);
+      this.process.once('error', clearOnSettle);
+      this.process.once('exit', clearOnSettle);
     });
   }
 

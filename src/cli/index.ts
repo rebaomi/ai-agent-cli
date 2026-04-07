@@ -79,6 +79,7 @@ export class CLI {
   private awaitingOnboardingInput = false;
   private permissionHandlerSetup = false;
   private activePlannedTaskId?: string;
+  private activeProgressDisplayTaskId?: string;
   private inputHistoryPath: string;
 
   constructor() {
@@ -391,7 +392,7 @@ export class CLI {
     const staticCandidates: Record<string, string[]> = {
       '/model': ['/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
       '/m': ['/m', '/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
-      '/mcp': ['/mcp list', '/mcp tools'],
+      '/mcp': ['/mcp list', '/mcp tools', '/mcp check', '/mcp check mempalace'],
       '/lsp': ['/lsp list', '/lsp status'],
       '/skill': ['/skill list', '/skill ls', '/skill install', '/skill add', '/skill uninstall', '/skill remove', '/skill enable', '/skill disable'],
       '/skills': ['/skills list', '/skills install', '/skills uninstall', '/skills enable', '/skills disable'],
@@ -662,6 +663,13 @@ export class CLI {
         case 'response':
           this.completeTrackedTaskIfNeeded(event.content);
           break;
+        case 'memory_sync':
+          if (event.memorySync?.status === 'archived') {
+            console.log(chalk.gray(`\n[MemPalace] ${event.content}`));
+          } else if (event.memorySync?.status === 'failed') {
+            printWarning(`[MemPalace] ${event.content}`);
+          }
+          break;
         case 'error':
           this.failTrackedTask(event.content);
           printError(event.content);
@@ -763,6 +771,11 @@ export class CLI {
       status: 'in_progress',
       currentStep: stepDescriptions[0],
     });
+
+    const displayTask = progressTracker.createTask(event.plan.originalTask, stepDescriptions);
+    this.activeProgressDisplayTaskId = displayTask.taskId;
+    progressTracker.startTask(displayTask.taskId);
+    progressTracker.printProgress(displayTask);
   }
 
   private completeTrackedTaskIfNeeded(content: string): void {
@@ -778,12 +791,26 @@ export class CLI {
       pendingSteps: [],
       currentStep: undefined,
     });
+
+    if (this.activeProgressDisplayTaskId) {
+      progressTracker.completeTask(content);
+      this.activeProgressDisplayTaskId = undefined;
+    }
+
     this.activePlannedTaskId = undefined;
   }
 
   private failTrackedTask(error: string): void {
     if (!this.enhancedMemory || !this.activePlannedTaskId) return;
     this.enhancedMemory.failTask(this.activePlannedTaskId, error);
+    if (this.activeProgressDisplayTaskId) {
+      const displayTask = progressTracker.getTask(this.activeProgressDisplayTaskId);
+      const runningStep = displayTask?.steps[displayTask.currentStepIndex];
+      if (runningStep) {
+        progressTracker.failStep(runningStep.id, error);
+      }
+      this.activeProgressDisplayTaskId = undefined;
+    }
     this.activePlannedTaskId = undefined;
   }
 
@@ -797,6 +824,10 @@ export class CLI {
     const stepIndex = event.planProgress.stepIndex;
     const completedSteps = allSteps.filter((_, index) => index < stepIndex);
     const pendingSteps = allSteps.filter((_, index) => index >= stepIndex);
+    const displayTask = this.activeProgressDisplayTaskId
+      ? progressTracker.getTask(this.activeProgressDisplayTaskId)
+      : undefined;
+    const displayStep = displayTask?.steps[stepIndex];
 
     if (event.planProgress.status === 'started') {
       this.enhancedMemory.updateTaskProgress(this.activePlannedTaskId, {
@@ -805,6 +836,9 @@ export class CLI {
         completedSteps,
         pendingSteps,
       });
+      if (displayStep) {
+        progressTracker.startStep(displayStep.id);
+      }
       return;
     }
 
@@ -815,6 +849,9 @@ export class CLI {
         completedSteps: allSteps.filter((_, index) => index <= stepIndex),
         pendingSteps: allSteps.filter((_, index) => index > stepIndex),
       });
+      if (displayStep) {
+        progressTracker.completeStep(displayStep.id, event.planProgress.result);
+      }
       return;
     }
 
@@ -826,6 +863,10 @@ export class CLI {
         pendingSteps,
         error: event.planProgress.result,
       });
+      if (displayStep) {
+        progressTracker.failStep(displayStep.id, event.planProgress.result || '步骤失败');
+      }
+      this.activeProgressDisplayTaskId = undefined;
     }
   }
 
@@ -958,6 +999,9 @@ export class CLI {
       case 'short':
         this.showShortTermMemory(args[1]);
         break;
+      case 'palace':
+        this.handleMemoryPalaceCommand(args.slice(1));
+        break;
       case 'clear':
         this.enhancedMemory.clearAllAgentShortTermMemory();
         printSuccess('Short-term memory cleared');
@@ -966,6 +1010,10 @@ export class CLI {
         console.log(chalk.bold('\n💾 记忆管理:\n'));
         console.log(chalk.cyan('/memory long') + '   ' + chalk.gray('查看长期记忆'));
         console.log(chalk.cyan('/memory short [agentId]') + '   ' + chalk.gray('查看短期记忆'));
+        console.log(chalk.cyan('/memory palace') + '   ' + chalk.gray('查看记忆宫殿总览'));
+        console.log(chalk.cyan('/memory palace room [roomId]') + '   ' + chalk.gray('查看房间陈列'));
+        console.log(chalk.cyan('/memory palace go <roomId>') + '   ' + chalk.gray('切换当前房间'));
+        console.log(chalk.cyan('/memory palace find <query>') + '   ' + chalk.gray('搜索记忆宫殿'));
         console.log(chalk.cyan('/memory clear') + '   ' + chalk.gray('清空短期记忆'));
         console.log();
     }
@@ -995,8 +1043,107 @@ export class CLI {
         console.log(`  ${agent.agentName} (${agent.role}): ${agent.shortTerm.length} 条短期记忆`);
       }
     }
+
+    const palace = this.enhancedMemory.getMemoryPalaceOverview();
+    console.log(chalk.cyan('\n记忆宫殿:'));
+    console.log(`  名称: ${palace.name}`);
+    console.log(`  当前房间: ${palace.currentRoomId}`);
+    console.log(`  房间数: ${palace.roomCount}`);
+    console.log(`  记忆条目: ${palace.totalMemoryCount}`);
     
     console.log();
+  }
+
+  private handleMemoryPalaceCommand(args: string[]): void {
+    if (!this.enhancedMemory) return;
+
+    const subcommand = args[0]?.toLowerCase();
+
+    switch (subcommand) {
+      case undefined:
+      case 'view':
+      case 'overview': {
+        const overview = this.enhancedMemory.getMemoryPalaceOverview();
+        console.log(chalk.bold(`\n🏛️ ${overview.name}\n`));
+        console.log(chalk.gray(`当前房间: ${overview.currentRoomId}`));
+        console.log(chalk.gray(`总房间数: ${overview.roomCount}，总记忆条目: ${overview.totalMemoryCount}\n`));
+        for (const room of overview.rooms) {
+          console.log(chalk.cyan(`${room.id} · ${room.name}`));
+          console.log(chalk.gray(`  区域: ${room.zone} | 记忆数: ${room.memoryCount}`));
+          console.log(chalk.gray(`  出口: ${room.exits.join(', ') || '无'}`));
+        }
+        console.log();
+        break;
+      }
+      case 'room': {
+        const room = this.enhancedMemory.getMemoryPalaceRoom(args[1]);
+        if (!room) {
+          printError(`Unknown memory palace room: ${args[1] || '(current)'}`);
+          return;
+        }
+
+        console.log(chalk.bold(`\n🏛️ ${room.name}\n`));
+        console.log(chalk.gray(room.description));
+        console.log(chalk.gray(`地标: ${room.landmarks.join(', ')}`));
+        console.log(chalk.gray(`出口: ${room.exits.join(', ') || '无'}\n`));
+
+        if (room.memories.length === 0) {
+          console.log(chalk.gray('该房间暂无记忆条目。\n'));
+          return;
+        }
+
+        for (const item of room.memories.slice(-10)) {
+          console.log(chalk.cyan(`  • ${item.title}`));
+          console.log(chalk.gray(`    ${item.content.replace(/\n/g, ' ')}`));
+          if (item.tags.length > 0) {
+            console.log(chalk.gray(`    tags: ${item.tags.join(', ')}`));
+          }
+        }
+        console.log();
+        break;
+      }
+      case 'go': {
+        const roomId = args[1];
+        if (!roomId) {
+          printError('Usage: /memory palace go <roomId>');
+          return;
+        }
+
+        const moved = this.enhancedMemory.setCurrentPalaceRoom(roomId);
+        if (!moved) {
+          printError(`Unknown memory palace room: ${roomId}`);
+          return;
+        }
+
+        printSuccess(`已进入记忆宫殿房间: ${roomId}`);
+        this.handleMemoryPalaceCommand(['room', roomId]);
+        break;
+      }
+      case 'find': {
+        const query = args.slice(1).join(' ').trim();
+        if (!query) {
+          printError('Usage: /memory palace find <query>');
+          return;
+        }
+
+        const results = this.enhancedMemory.searchMemoryPalace(query);
+        console.log(chalk.bold(`\n🔎 搜索记忆宫殿: ${query}\n`));
+        if (results.length === 0) {
+          console.log(chalk.gray('未找到相关记忆。\n'));
+          return;
+        }
+
+        for (const item of results.slice(0, 12)) {
+          console.log(chalk.cyan(`  • ${item.title}`));
+          console.log(chalk.gray(`    ${item.content.replace(/\n/g, ' ')}`));
+          console.log(chalk.gray(`    tags: ${item.tags.join(', ') || '无'}`));
+        }
+        console.log();
+        break;
+      }
+      default:
+        printInfo('Usage: /memory palace [overview|room [roomId]|go <roomId>|find <query>]');
+    }
   }
 
   private showShortTermMemory(agentId?: string): void {
@@ -1899,12 +2046,12 @@ ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
     switch (subcommand) {
       case 'list':
         console.log(chalk.bold('\nMCP Servers:\n'));
-        const clients = this.mcpManager.getAllClients();
-        if (clients.length === 0) {
+        const serverNames = this.mcpManager.getServerNames();
+        if (serverNames.length === 0) {
           console.log(chalk.gray('No MCP servers connected.'));
         } else {
-          for (const client of clients) {
-            console.log(chalk.cyan(`  • ${client}`));
+          for (const serverName of serverNames) {
+            console.log(chalk.cyan(`  • ${serverName}`));
           }
         }
         console.log();
@@ -1921,9 +2068,52 @@ ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
         }
         console.log();
         break;
+      case 'check':
+      case 'status':
+        await this.checkMCPServer(args[1]?.toLowerCase() || 'mempalace');
+        break;
       default:
-        console.log(chalk.yellow('Usage: /mcp [list|tools]'));
+        console.log(chalk.yellow('Usage: /mcp [list|tools|check|status]'));
     }
+  }
+
+  private async checkMCPServer(serverName: string): Promise<void> {
+    const client = this.mcpManager.getClient(serverName);
+
+    console.log(chalk.bold(`\nMCP Check: ${serverName}\n`));
+
+    if (!client) {
+      console.log(chalk.red(`Server not connected: ${serverName}`));
+      console.log();
+      return;
+    }
+
+    const tools = client.getTools();
+    console.log(chalk.green(`Connected: ${serverName}`));
+    console.log(`Tools: ${tools.length}`);
+
+    if (serverName === 'mempalace') {
+      try {
+        const result = await this.mcpManager.callTool('mempalace', 'mempalace_status', {});
+        const output = this.getToolResultDisplayText(result);
+        if (output.length > 0) {
+          console.log();
+          console.log(output);
+        }
+      } catch (error) {
+        printWarning(`MemPalace status failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else if (tools.length > 0) {
+      console.log();
+      for (const tool of tools.slice(0, 10)) {
+        console.log(chalk.cyan(`  • ${tool.name}`) + chalk.gray(` - ${tool.description}`));
+      }
+      if (tools.length > 10) {
+        console.log(chalk.gray(`  ... and ${tools.length - 10} more tools`));
+      }
+    }
+
+    console.log();
   }
 
   private async handleLSPCommand(args: string[]): Promise<void> {

@@ -142,6 +142,27 @@ mcp:
 - `@modelcontextprotocol/server-brave-search` - 搜索功能
 - `@modelcontextprotocol/server-github` - GitHub API
 
+### MemPalace MCP 配置
+
+```yaml
+mcp:
+  - name: mempalace
+    command: python
+    args:
+      - -m
+      - mempalace.mcp_server
+    env:
+      MEMPALACE_PALACE_PATH: C:/Users/your-name/.mempalace/palace
+```
+
+准备步骤：
+- 安装：`pip install mempalace`
+- 初始化：`mempalace init`
+- 导入当前项目资料（可选）：`mempalace mine .`
+- Windows 如 `python` 不可用，可改成 `py`，并把 args 改为 `-3`, `-m`, `mempalace.mcp_server`
+
+接入后，MemPalace 工具会自动并入统一 Tool Registry，Agent 会在涉及历史事实、长期项目记忆、人物关系和会话归档时优先使用它。
+
 ## LSP 配置 (可选)
 LSP (Language Server Protocol) 用于代码智能提示。
 

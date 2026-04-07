@@ -207,6 +207,22 @@ mcp:
   #     - -y
   #     - @modelcontextprotocol/server-time
 
+  # MemPalace 长期记忆
+  # 先安装 Python 版 MemPalace:
+  #   pip install mempalace
+  # 初始化一次记忆库:
+  #   mempalace init
+  # 如需导入现有项目资料:
+  #   mempalace mine .
+  # Windows 如有多个 Python，可把 command 改成 py，args 改为 [-3, -m, mempalace.mcp_server]
+  # - name: mempalace
+  #   command: python
+  #   args:
+  #     - -m
+  #     - mempalace.mcp_server
+  #   env:
+  #     MEMPALACE_PALACE_PATH: C:\Users\your-name\.mempalace\palace
+
 # ===========================================
 # LSP 服务器配置
 # ===========================================

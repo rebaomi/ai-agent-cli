@@ -23,6 +23,7 @@
 - 🌊 **流式输出** - AI 回复逐字显示，打字机效果
 - ⚡ **智能工具调用** - AI 自动调用合适工具完成任务
 - 🧰 **统一 Tool Registry** - 内置工具、Skills 工具、MCP 工具统一注册与分发
+- 🏛️ **分层记忆架构** - 保留本地 Memory Palace，并可通过 MCP 接入 MemPalace 作为长期记忆后端
 - 📊 **任务规划器** - 复杂任务自动拆分成步骤执行，逐步完成
 - 📨 **任务与轻量协作工具** - 本地 Task、Team、Peer 消息、Cron 调度统一接入
 - 🏢 **多 Agent 组织架构** - 模拟企业团队协作，多角色 Agent 协同工作
@@ -165,6 +166,61 @@ coolAI --cron-once
 - `--cron-once` 会立即检查一次当前到期任务并退出
 - cron 任务保存在 `~/.ai-agent-cli/cron/jobs.json`
 - 已内置腾讯新闻 CLI 对接，可直接调用 `tencent_hot_news`、`tencent_search_news`、`tencent_morning_news`、`tencent_evening_news`
+
+### MemPalace 长期记忆接入
+
+当前推荐的记忆方案是分层使用：
+
+- CLI 内置的 Memory Palace 继续负责本地可导航记忆、用户偏好、任务进度和会话侧展示
+- MemPalace 通过 MCP 接入，负责长期语义检索、知识图谱、历史事实校验和 Agent Diary
+
+安装 MemPalace：
+
+```bash
+pip install mempalace
+mempalace init
+```
+
+如果你想先把当前项目资料导入 MemPalace：
+
+```bash
+mempalace mine .
+```
+
+在 `~/.ai-agent-cli/config.yaml` 里加入 MCP 配置：
+
+```yaml
+mcp:
+  - name: mempalace
+    command: python
+    args:
+      - -m
+      - mempalace.mcp_server
+    env:
+      MEMPALACE_PALACE_PATH: C:/Users/your-name/.mempalace/palace
+```
+
+Windows 如果 `python` 命令不可用，可以改成：
+
+```yaml
+mcp:
+  - name: mempalace
+    command: py
+    args:
+      - -3
+      - -m
+      - mempalace.mcp_server
+    env:
+      MEMPALACE_PALACE_PATH: C:/Users/your-name/.mempalace/palace
+```
+
+接入后，MemPalace 的 MCP 工具会自动进入统一 Tool Registry。默认 Agent 提示词也会启用最小记忆协议：
+
+- 涉及人物、项目、历史决策、过去事件时，优先用 `mempalace_search` 或 `mempalace_kg_query` 校验，再回答
+- 学到稳定的新事实时，可写入 `mempalace_add_drawer` 或 `mempalace_kg_add`
+- 重要任务或会话结束后，可调用 `mempalace_diary_write` 做长期归档
+
+这意味着现有的本地记忆宫殿不会被替换，而是多了一层更强的长期记忆后端。
 
 ### 工具体系
 
