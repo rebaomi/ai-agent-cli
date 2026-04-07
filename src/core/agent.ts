@@ -370,6 +370,18 @@ You: "Here's the content of package.json:
   }
 
   private async detectComplexTask(input: string): Promise<boolean> {
+    const trimmedInput = input.trim();
+    const inputLower = trimmedInput.toLowerCase();
+
+    const simpleGreetings = [
+      '你好', '您好', '嗨', 'hi', 'hello', 'hey',
+      '早上好', '下午好', '晚上好', '在吗', '在不在',
+    ];
+
+    if (trimmedInput.length <= 12 && simpleGreetings.some(greeting => inputLower === greeting || inputLower.startsWith(`${greeting}呀`) || inputLower.startsWith(`${greeting}啊`))) {
+      return false;
+    }
+
     const complexityIndicators = [
       '多个', 'several', 'multiple', 'various',
       '先', '然后', 'first', 'then', 'after that',
@@ -380,7 +392,6 @@ You: "Here's the content of package.json:
       '帮我', 'help me',
     ];
 
-    const inputLower = input.toLowerCase();
     let matchCount = 0;
 
     for (const indicator of complexityIndicators) {
@@ -389,8 +400,12 @@ You: "Here's the content of package.json:
       }
     }
 
-    if (input.length > 200 || matchCount >= 2) {
+    if (trimmedInput.length > 200 || matchCount >= 2) {
       return true;
+    }
+
+    if (trimmedInput.length <= 20 && matchCount === 0) {
+      return false;
     }
 
     try {
@@ -400,10 +415,50 @@ You: "Here's the content of package.json:
       ]);
 
       const result = response.toLowerCase().trim();
-      return result.includes('是') || result.includes('yes') || result.includes('complex');
+
+      const negativePatterns = [/^否[。！!]?$/, /^不是[。！!]?$/, /^不复杂[。！!]?$/, /^简单[。！!]?$/, /^no[.!]?$/, /^not complex[.!]?$/];
+      if (negativePatterns.some(pattern => pattern.test(result))) {
+        return false;
+      }
+
+      const positivePatterns = [/^是[。！!]?$/, /^复杂[。！!]?$/, /^需要规划[。！!]?$/, /^yes[.!]?$/, /^complex[.!]?$/];
+      if (positivePatterns.some(pattern => pattern.test(result))) {
+        return true;
+      }
+
+      return false;
     } catch {
       return matchCount >= 2;
     }
+  }
+
+  private isGenericPlan(plan: Plan, input: string): boolean {
+    const normalizedInput = input.trim().toLowerCase();
+    const genericMarkers = [
+      '分析任务需求',
+      '将任务拆分成清晰的步骤',
+      '确定每个步骤需要的工具或操作',
+      '开发一个网站应用',
+      '分析数据并生成报告',
+      '整理文件系统',
+      '创建自动化工作流程',
+      '或者其他任何复杂任务',
+    ];
+
+    if (plan.steps.length === 0) {
+      return true;
+    }
+
+    const genericStepCount = plan.steps.filter(step => genericMarkers.includes(step.description.trim())).length;
+    if (genericStepCount >= Math.max(2, Math.ceil(plan.steps.length / 2))) {
+      return true;
+    }
+
+    if (normalizedInput.length <= 20 && plan.steps.length >= 3) {
+      return true;
+    }
+
+    return false;
   }
 
   private async chatWithPlanning(input: string): Promise<string> {
@@ -414,6 +469,11 @@ You: "Here's the content of package.json:
         return 'Planner not available, falling back to direct execution';
       }
       const plan = await this.planner.createPlan(input);
+
+      if (this.isGenericPlan(plan, input)) {
+        this.onEvent?.({ type: 'thinking', content: '规划结果过于通用，回退到直接对话响应。' });
+        return this.generateResponse();
+      }
       
       if (plan.neededSkills && plan.neededSkills.length > 0 && this.onSkillInstallNeeded) {
         console.log(chalk.yellow(`\n📦 检测到任务需要安装以下 Skills: ${plan.neededSkills.join(', ')}`));

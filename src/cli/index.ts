@@ -46,7 +46,7 @@ export class CLI {
     '/config', '/c', '/model', '/m', '/workspace', '/w',
     '/reset', '/r', '/new', '/sessions', '/load', '/mcp',
     '/lsp', '/skill', '/skills', '/org', '/team', '/cat',
-    '/progress', '/p', '/memory', '/templates', '/profile',
+    '/progress', '/p', '/memory', '/templates', '/profile', '/news',
     '/wipe', '/perm', '/permission', '/cron',
   ];
 
@@ -411,6 +411,7 @@ export class CLI {
         '/permission audit', '/permission trust', '/permission allow', '/permission deny', '/permission auto', '/permission ask',
       ],
       '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron delete', '/cron run-due'],
+      '/news': ['/news hot', '/news search', '/news morning', '/news evening', '/news help'],
       '/load': ['/load'],
       '/workspace': ['/workspace'],
     };
@@ -566,6 +567,9 @@ export class CLI {
         break;
       case 'cron':
         await this.handleCronCommand(args);
+        break;
+      case 'news':
+        await this.handleNewsCommand(args);
         break;
       default:
         console.log(chalk.yellow(`Unknown command: ${command}. Type /? for help.`));
@@ -1650,6 +1654,7 @@ ${chalk.bold('Quick Commands:')}
   ${chalk.cyan('/?')}        ${chalk.gray('Show this help')}
   ${chalk.cyan('/quit')}     ${chalk.gray('Exit')}
   ${chalk.cyan('/tools')}    ${chalk.gray('List tools')}
+  ${chalk.cyan('/news')}     ${chalk.gray('Tencent news shortcuts')}
   ${chalk.cyan('/model')}    ${chalk.gray('Show/change model')}
   ${chalk.cyan('/sessions')} ${chalk.gray('Show sessions')}
   ${chalk.cyan('/cron')}     ${chalk.gray('Manage cron jobs')}
@@ -1679,9 +1684,93 @@ ${chalk.cyan('/load')} <id>        Load a previous session
 ${chalk.cyan('/mcp')}              Manage MCP servers
 ${chalk.cyan('/lsp')}              Manage LSP servers
 ${chalk.cyan('/skill')}            Manage skills
+${chalk.cyan('/news')}             Tencent news shortcuts (hot/search/morning/evening)
 ${chalk.cyan('/cron')}             Manage cron jobs
 ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
 `);
+  }
+
+  private async handleNewsCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.builtInTools) {
+      printError('Built-in tools not initialized');
+      return;
+    }
+
+    switch (subcommand) {
+      case undefined:
+      case 'help':
+        console.log(`
+${chalk.bold('Tencent News Commands:')}
+${chalk.cyan('/news hot')} [limit]             查看热榜新闻
+${chalk.cyan('/news search')} <keyword> [limit] 搜索相关新闻
+${chalk.cyan('/news morning')}                  查看早报
+${chalk.cyan('/news evening')}                  查看晚报
+
+${chalk.gray('示例:')}
+${chalk.gray('/news hot 5')}
+${chalk.gray('/news search AI 5')}
+${chalk.gray('/news morning')}
+`);
+        return;
+      case 'hot': {
+        const limit = Number.parseInt(args[1] || '10', 10);
+        const result = await this.builtInTools.executeTool('tencent_hot_news', {
+          limit: Number.isFinite(limit) && limit > 0 ? limit : 10,
+        });
+        this.displayDirectToolResult(result, '腾讯热榜');
+        return;
+      }
+      case 'search': {
+        const limitCandidate = args[args.length - 1];
+        const parsedLimit = limitCandidate ? Number.parseInt(limitCandidate, 10) : Number.NaN;
+        const hasNumericLimit = Number.isFinite(parsedLimit);
+        const keyword = args.slice(1, hasNumericLimit ? -1 : undefined).join(' ').trim();
+
+        if (!keyword) {
+          printError('Usage: /news search <keyword> [limit]');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('tencent_search_news', {
+          keyword,
+          limit: hasNumericLimit && parsedLimit > 0 ? parsedLimit : 10,
+        });
+        this.displayDirectToolResult(result, `腾讯新闻搜索: ${keyword}`);
+        return;
+      }
+      case 'morning': {
+        const result = await this.builtInTools.executeTool('tencent_morning_news', {});
+        this.displayDirectToolResult(result, '腾讯早报');
+        return;
+      }
+      case 'evening': {
+        const result = await this.builtInTools.executeTool('tencent_evening_news', {});
+        this.displayDirectToolResult(result, '腾讯晚报');
+        return;
+      }
+      default:
+        printError('Usage: /news [hot [limit]|search <keyword> [limit]|morning|evening|help]');
+    }
+  }
+
+  private displayDirectToolResult(result: { is_error?: boolean; output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }, title: string): void {
+    console.log();
+    console.log(chalk.cyan(title));
+    const output = this.getToolResultDisplayText(result);
+    if (result.is_error) {
+      printError(output || `${title} 调用失败`);
+      console.log();
+      return;
+    }
+
+    if (output.length > 0) {
+      console.log(output);
+    } else {
+      console.log(chalk.gray('(无输出)'));
+    }
+    console.log();
   }
 
   private async handleCronCommand(args: string[]): Promise<void> {

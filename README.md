@@ -167,6 +167,24 @@ coolAI --cron-once
 - cron 任务保存在 `~/.ai-agent-cli/cron/jobs.json`
 - 已内置腾讯新闻 CLI 对接，可直接调用 `tencent_hot_news`、`tencent_search_news`、`tencent_morning_news`、`tencent_evening_news`
 
+也支持直接用 slash 命令查看腾讯新闻：
+
+```bash
+/news hot
+/news hot 5
+/news search AI
+/news search AI 5
+/news morning
+/news evening
+```
+
+说明：
+- `/news hot [limit]` 查看腾讯热榜
+- `/news search <keyword> [limit]` 搜索腾讯新闻
+- `/news morning` 查看腾讯早报
+- `/news evening` 查看腾讯晚报
+- `/news help` 查看帮助
+
 ### MemPalace 长期记忆接入
 
 当前推荐的记忆方案是分层使用：
@@ -1122,6 +1140,24 @@ Notes:
 - `--cron-once` checks due jobs once and exits
 - Cron jobs are stored in `~/.ai-agent-cli/cron/jobs.json`
 - Tencent News CLI tools are already wired in: `tencent_hot_news`, `tencent_search_news`, `tencent_morning_news`, `tencent_evening_news`
+
+You can also use slash commands for Tencent News directly:
+
+```bash
+/news hot
+/news hot 5
+/news search AI
+/news search AI 5
+/news morning
+/news evening
+```
+
+Notes:
+- `/news hot [limit]` shows Tencent hot news
+- `/news search <keyword> [limit]` searches Tencent News
+- `/news morning` shows the morning briefing
+- `/news evening` shows the evening briefing
+- `/news help` shows usage help
 
 ### Tool System
 

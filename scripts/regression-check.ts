@@ -358,6 +358,7 @@ function testCliSlashCommandCompletion(): void {
   const [modelMatches] = (cli as any).completeInput('/model s') as [string[], string];
   const [cronMatches] = (cli as any).completeInput('/cron c') as [string[], string];
   const [mcpMatches] = (cli as any).completeInput('/mcp c') as [string[], string];
+  const [newsMatches] = (cli as any).completeInput('/news ') as [string[], string];
 
   assert.equal(matches.includes('/m'), true);
   assert.equal(matches.includes('/model'), true);
@@ -368,6 +369,10 @@ function testCliSlashCommandCompletion(): void {
   assert.equal(cronMatches.includes('/cron create-news'), true);
   assert.equal(mcpMatches.includes('/mcp check'), true);
   assert.equal(mcpMatches.includes('/mcp check mempalace'), true);
+  assert.equal(newsMatches.includes('/news hot'), true);
+  assert.equal(newsMatches.includes('/news search'), true);
+  assert.equal(newsMatches.includes('/news morning'), true);
+  assert.equal(newsMatches.includes('/news evening'), true);
 }
 
 function testMemPalaceSystemPromptProtocol(): void {
@@ -394,6 +399,38 @@ function testMemPalaceSystemPromptProtocol(): void {
   assert.match(prompt, /Memory Protocol/);
   assert.match(prompt, /mempalace_search/);
   assert.match(prompt, /mempalace_diary_write/);
+}
+
+async function testGreetingDoesNotTriggerPlanning(): Promise<void> {
+  const agent = createAgent({
+    llm: new StubLLM(),
+  }) as any;
+
+  const simpleGreeting = await agent.detectComplexTask('你好');
+  const negativeResponse = await agent.detectComplexTask('hello');
+
+  assert.equal(simpleGreeting, false);
+  assert.equal(negativeResponse, false);
+}
+
+function testGenericPlanDetection(): void {
+  const agent = createAgent({
+    llm: new StubLLM(),
+  }) as any;
+
+  const genericPlan = {
+    id: 'plan_generic',
+    originalTask: '你好',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [
+      { id: 'step_1', description: '分析任务需求', status: 'pending' },
+      { id: 'step_2', description: '将任务拆分成清晰的步骤', status: 'pending' },
+      { id: 'step_3', description: '开发一个网站应用', status: 'pending' },
+    ],
+  };
+
+  assert.equal(agent.isGenericPlan(genericPlan, '你好'), true);
 }
 
 async function testMemPalaceTaskAutoArchive(): Promise<void> {
@@ -592,6 +629,8 @@ async function main(): Promise<void> {
     testContextManagerCompressionKeepsToolMessagesValid();
     testCliSlashCommandCompletion();
     testMemPalaceSystemPromptProtocol();
+    await testGreetingDoesNotTriggerPlanning();
+    testGenericPlanDetection();
     await testMemPalaceTaskAutoArchive();
     await testCliHistoryPersistence(tempDir);
     await testMemoryPalace(tempDir);
