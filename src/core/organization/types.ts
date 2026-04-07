@@ -6,22 +6,77 @@ export type AgentRole =
   | 'tester'          // 验收测试
   | 'fallback';       // 备用/容错
 
+export type AgentStatus = 'idle' | 'busy' | 'waiting' | 'completed' | 'failed' | 'offline';
+
+export type TaskStatus = 'pending' | 'assigned' | 'in_progress' | 'completed' | 'failed' | 'blocked';
+
+export type Priority = 'low' | 'medium' | 'high' | 'critical';
+
 export interface AgentMember {
   id: string;
   name: string;
   role: AgentRole;
   description: string;
   model?: string;
-  status: 'idle' | 'busy' | 'offline';
+  status: AgentStatus;
   capabilities: string[];
   currentTask?: string;
+  skills?: string[];
+  maxIterations?: number;
+  permissions?: AgentPermissionConfig;
 }
+
+export interface AgentPermissionConfig {
+  allowedTools?: string[];
+  deniedTools?: string[];
+  maxToolCalls?: number;
+  maxDuration?: number;
+  confirmationRequired?: string[];
+}
+
+export interface LaneContext {
+  laneId: string;
+  agentId: string;
+  status: AgentStatus;
+  createdAt: number;
+  startedAt?: number;
+  completedAt?: number;
+  input: string;
+  output?: string;
+  error?: string;
+  currentBlocker?: string;
+  context: Record<string, any>;
+}
+
+export interface PolicyRule {
+  name: string;
+  condition: PolicyCondition;
+  action: PolicyAction;
+  priority: number;
+}
+
+export type PolicyCondition = 
+  | { type: 'lane_completed' }
+  | { type: 'lane_failed' }
+  | { type: 'has_blocker' }
+  | { type: 'timeout' }
+  | { type: 'all', conditions: PolicyCondition[] }
+  | { type: 'any', conditions: PolicyCondition[] };
+
+export type PolicyAction = 
+  | { type: 'continue' }
+  | { type: 'rollback' }
+  | { type: 'retry' }
+  | { type: 'escalate' }
+  | { type: 'fallback' }
+  | { type: 'complete' };
 
 export interface OrganizationConfig {
   name: string;
   description?: string;
   agents: AgentMember[];
   workflow?: WorkflowConfig;
+  policies?: PolicyRule[];
 }
 
 export interface ReceptionConfig {
@@ -36,20 +91,23 @@ export interface WorkflowConfig {
   defaultFlow: AgentRole[];
   autoSupervise: boolean;
   allowFallback: boolean;
+  maxRetries?: number;
+  timeout?: number;
   reception?: ReceptionConfig;
 }
 
 export interface Task {
   id: string;
   description: string;
-  priority: 'low' | 'medium' | 'high' | 'critical';
-  status: 'pending' | 'assigned' | 'in_progress' | 'completed' | 'failed';
+  priority: Priority;
+  status: TaskStatus;
   assignedTo?: string;
   result?: string;
   createdAt: Date;
   completedAt?: Date;
   subtasks?: Task[];
   parentTaskId?: string;
+  context?: Record<string, any>;
 }
 
 export interface TaskResult {
@@ -59,6 +117,13 @@ export interface TaskResult {
   output: string;
   error?: string;
   duration: number;
+}
+
+export interface AgentEvent {
+  type: 'started' | 'completed' | 'failed' | 'blocked' | 'escalated';
+  agentId: string;
+  timestamp: number;
+  data?: Record<string, any>;
 }
 
 export const ROLE_DESCRIPTIONS: Record<AgentRole, string> = {

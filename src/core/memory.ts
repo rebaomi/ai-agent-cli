@@ -47,6 +47,10 @@ export class MemoryManager {
   async initialize(): Promise<void> {
     await fs.mkdir(this.historyDir, { recursive: true });
     await this.loadCurrentSession();
+
+    if (this.currentMessages.length === 0) {
+      await this.loadLatestSession();
+    }
   }
 
   private getHistoryFilePath(): string {
@@ -66,6 +70,18 @@ export class MemoryManager {
           ...m,
           timestamp: m.timestamp,
         }));
+      }
+    } catch {
+      this.currentMessages = [];
+    }
+  }
+
+  private async loadLatestSession(): Promise<void> {
+    try {
+      const sessions = await this.listSessions();
+      const latest = sessions[0];
+      if (latest) {
+        await this.loadSession(latest.id);
       }
     } catch {
       this.currentMessages = [];

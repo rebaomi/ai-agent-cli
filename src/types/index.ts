@@ -15,10 +15,21 @@ export interface ToolCall {
   };
 }
 
+export type ToolCategory = 
+  | 'file_operations'   // File read, write, edit, delete, glob, grep
+  | 'execution'         // Bash, PowerShell, REPL
+  | 'search_fetch'      // Web search, web fetch, browser
+  | 'agents_tasks'      // Agent message, task queue, teams
+  | 'planning'          // Enter/exit plan mode, worktree
+  | 'mcp'               // MCP tools
+  | 'system'            // Config, skills, cron, todo
+  | 'experimental';     // LSP, sleep, etc
+
 export interface Tool {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
+  category?: ToolCategory;
 }
 
 export interface ToolResult {

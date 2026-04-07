@@ -338,6 +338,19 @@ export class PermissionManager {
     }
 
     if (this.isDangerous(type, resource) && !this.config.autoGrantDangerous) {
+      if (!this.config.askForPermissions) {
+        await this.logAudit({
+          id: `deny_${Date.now()}`,
+          timestamp: Date.now(),
+          action: 'deny',
+          type,
+          resource,
+          granted: false,
+          reason: 'ask_disabled',
+        });
+        return false;
+      }
+
       const request: PermissionRequest = {
         id: `req_${Date.now()}`,
         type,

@@ -1,6 +1,8 @@
 import { promises as fs } from 'fs';
 import { join, resolve } from 'path';
+import { pathToFileURL } from 'url';
 import { z } from 'zod';
+import chalk from 'chalk';
 
 export interface Skill {
   name: string;
@@ -8,6 +10,10 @@ export interface Skill {
   description: string;
   author?: string;
   main: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: Record<string, string>;
+  skillContent?: string;
   commands?: SkillCommand[];
   tools?: SkillTool[];
   hooks?: SkillHooks;
@@ -72,6 +78,82 @@ export class SkillManager {
 
   async initialize(): Promise<void> {
     await fs.mkdir(this.skillsDir, { recursive: true });
+    await this.discoverSkills();
+  }
+
+  private async discoverSkills(): Promise<void> {
+    const searchPaths: string[] = [];
+
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    if (homeDir) {
+      searchPaths.push(
+        join(homeDir, '.config', 'ai-agent-cli', 'skills'),
+        join(homeDir, '.opencode', 'skills'),
+        join(homeDir, '.claude', 'skills'),
+        join(homeDir, '.agents', 'skills')
+      );
+    }
+
+    try {
+      let currentDir = process.cwd();
+      const rootDir = await this.findGitRoot(currentDir);
+      
+      while (currentDir && currentDir !== rootDir) {
+        searchPaths.push(
+          join(currentDir, '.ai-agent-cli', 'skills'),
+          join(currentDir, '.opencode', 'skills'),
+          join(currentDir, '.claude', 'skills'),
+          join(currentDir, '.agents', 'skills')
+        );
+        const parent = join(currentDir, '..');
+        if (parent === currentDir) break;
+        currentDir = parent;
+      }
+    } catch {}
+
+    const discovered = new Set<string>();
+    
+    for (const path of searchPaths) {
+      try {
+        const entries = await fs.readdir(path, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !discovered.has(entry.name)) {
+            if (!this.isValidSkillName(entry.name)) {
+              console.log(chalk.gray(`[Skill] Invalid name skipped: ${entry.name}`));
+              continue;
+            }
+            discovered.add(entry.name);
+            try {
+              await this.loadSkill(entry.name, join(path, entry.name));
+              console.log(chalk.cyan(`[Skill] Loaded: ${entry.name}`));
+            } catch (e) {
+              console.log(chalk.gray(`[Skill] Skipped: ${entry.name}`));
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
+  private isValidSkillName(name: string): boolean {
+    if (name.length < 1 || name.length > 64) return false;
+    if (name.startsWith('-') || name.endsWith('-')) return false;
+    if (name.includes('--')) return false;
+    return /^[a-z0-9]+(-[a-z0-9]+)*$/.test(name);
+  }
+
+  private async findGitRoot(dir: string): Promise<string> {
+    try {
+      const { execSync } = await import('child_process');
+      const root = execSync('git rev-parse --show-toplevel', { 
+        cwd: dir, 
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'ignore']
+      });
+      return root.trim();
+    } catch {
+      return dir;
+    }
   }
 
   async installSkill(source: string): Promise<void> {
@@ -82,7 +164,11 @@ export class SkillManager {
 
     if (source.startsWith('npm:')) {
       await this.installFromNpm(source.slice(4), skillPath);
-    } else if (source.startsWith('github:') || source.startsWith('https://')) {
+    } else if (source.startsWith('github:')) {
+      await this.installFromGitHub(source.slice(7), skillPath);
+    } else if (source.startsWith('https://github.com/')) {
+      await this.installFromGitHub(source.replace('https://github.com/', ''), skillPath);
+    } else if (source.startsWith('https://')) {
       await this.installFromGit(source, skillPath);
     } else if (source.startsWith('./') || source.startsWith('/') || /^[a-zA-Z]:/.test(source)) {
       await this.installFromLocal(source, skillPath);
@@ -91,6 +177,41 @@ export class SkillManager {
     }
 
     await this.loadSkill(skillName);
+  }
+
+  private async installFromGitHub(repoPath: string, targetPath: string): Promise<void> {
+    const { execSync } = await import('child_process');
+    
+    let owner: string, repo: string, subPath: string;
+    
+    if (repoPath.includes('/tree/')) {
+      const parts = repoPath.split('/');
+      const treeIndex = parts.indexOf('tree');
+      owner = parts[0] || '';
+      repo = parts[1] || '';
+      subPath = parts.slice(treeIndex + 2).join('/') || '';
+    } else {
+      const [o, r, ...rest] = repoPath.split('/');
+      owner = o || '';
+      repo = r || '';
+      subPath = rest.join('/') || '';
+    }
+    
+    const repoUrl = `https://github.com/${owner}/${repo}.git`;
+    const tempPath = join(this.skillsDir, '_temp_install');
+    
+    try {
+      execSync(`git clone --depth 1 ${repoUrl} "${tempPath}"`, { stdio: 'pipe' });
+      
+      if (subPath) {
+        const srcPath = join(tempPath, subPath);
+        await this.copyDirectory(srcPath, targetPath);
+      } else {
+        await this.copyDirectory(tempPath, targetPath);
+      }
+    } finally {
+      await fs.rm(tempPath, { recursive: true, force: true });
+    }
   }
 
   private async installFromNpm(packageName: string, targetPath: string): Promise<void> {
@@ -142,6 +263,14 @@ export class SkillManager {
       const parts = name.split('/');
       return parts.pop() || 'unknown';
     }
+    
+    if (source.includes('github.com')) {
+      const match = source.match(/github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?$/);
+      if (match && match[2]) {
+        return match[2];
+      }
+    }
+    
     const match = source.match(/([^/]+?)(?:\.git)?$/);
     return match?.[1] || 'unknown';
   }
@@ -153,39 +282,138 @@ export class SkillManager {
     this.enabledSkills.delete(name);
   }
 
-  async loadSkill(name: string): Promise<void> {
-    const skillPath = join(this.skillsDir, name);
-    const manifestPath = join(skillPath, 'skill.json');
-
-    let manifest: z.infer<typeof skillManifestSchema>;
-    try {
-      const content = await fs.readFile(manifestPath, 'utf-8');
-      manifest = skillManifestSchema.parse(JSON.parse(content));
-    } catch (error) {
-      throw new Error(`Invalid skill manifest: ${error}`);
+  async loadSkill(name: string, customPath?: string): Promise<void> {
+    const skillPath = customPath || join(this.skillsDir, name);
+    
+    let manifest: any = null;
+    let mainPath: string | undefined;
+    
+    const manifestFiles = ['skill.json', 'SKILL.md', 'package.json'];
+    
+    for (const mf of manifestFiles) {
+      const manifestPath = join(skillPath, mf);
+      try {
+        const content = await fs.readFile(manifestPath, 'utf-8');
+        
+        if (mf === 'skill.json') {
+          manifest = JSON.parse(content);
+          mainPath = manifest.main || 'index.js';
+          break;
+        } else if (mf === 'SKILL.md') {
+          const frontmatter = this.parseFrontmatter(content);
+          manifest = {
+            name: frontmatter.name || name,
+            version: frontmatter.version || '1.0.0',
+            description: frontmatter.description || '',
+            ...frontmatter,
+          };
+          mainPath = 'index.js';
+          break;
+        } else if (mf === 'package.json') {
+          manifest = JSON.parse(content);
+          mainPath = manifest.main || 'index.js';
+          break;
+        }
+      } catch {
+        continue;
+      }
     }
-
+    
+    if (!manifest) {
+      manifest = { name, version: '1.0.0', description: `Skill: ${name}` };
+      mainPath = 'index.js';
+    }
+    
+    if (!manifest.name) manifest.name = name;
+    if (!manifest.version) manifest.version = '1.0.0';
+    if (!manifest.description) manifest.description = '';
+    
+    if (manifest.description.length < 1 || manifest.description.length > 1024) {
+      throw new Error(`Invalid description length: ${manifest.description.length}`);
+    }
+    
+    let skillContent = '';
+    try {
+      const skillMdPath = join(skillPath, 'SKILL.md');
+      await fs.access(skillMdPath);
+      skillContent = await fs.readFile(skillMdPath, 'utf-8');
+      skillContent = skillContent.replace(/^---[\s\S]*?---\n/, '');
+    } catch {}
+    
     const skill: Skill = {
-      ...manifest,
-      main: manifest.main,
+      name: manifest.name || name,
+      version: manifest.version || '1.0.0',
+      description: manifest.description || '',
+      main: mainPath || 'index.js',
+      license: manifest.license || undefined,
+      compatibility: manifest.compatibility || undefined,
+      metadata: manifest.metadata || undefined,
+      skillContent: skillContent || undefined,
       hooks: {},
     };
-
-    try {
-      const mainPath = join(skillPath, manifest.main);
-      const module = await import(mainPath);
-      if (typeof module.default === 'function') {
-        const instance = await module.default();
-        skill.commands = instance.commands;
-        skill.tools = instance.tools;
-        skill.hooks = instance.hooks;
+    
+    const entryFiles = ['index.js', 'index.ts', 'main.js', 'main.ts', 'skill.js', 'skill.ts'];
+    let loadedEntry = false;
+    
+    for (const ef of entryFiles) {
+      const entryPath = join(skillPath, ef);
+      try {
+        await fs.access(entryPath);
+        const module = await import(pathToFileURL(entryPath).href);
+        if (typeof module.default === 'function') {
+          const instance = await module.default();
+          skill.commands = instance.commands || [];
+          skill.tools = instance.tools || [];
+          skill.hooks = instance.hooks || {};
+        }
+        loadedEntry = true;
+        break;
+      } catch {
+        continue;
       }
-    } catch (error) {
-      console.warn(`Failed to load skill ${name}: ${error}`);
     }
-
+    
+    if (!loadedEntry) {
+      console.log(chalk.gray(`[Skill] ${name}: no entry file, using SKILL.md content`));
+    }
+    
     this.skills.set(name, skill);
     this.enabledSkills.add(name);
+  }
+  
+  private parseFrontmatter(content: string): Record<string, any> {
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch || !fmMatch[1]) return {};
+    
+    const fm: Record<string, any> = {};
+    const lines = fmMatch[1].split('\n');
+    let currentKey = '';
+    let currentValue: string[] = [];
+    
+    for (const line of lines) {
+      if (line.match(/^\s+/) && currentKey) {
+        currentValue.push(line.trim());
+      } else {
+        if (currentKey) {
+          fm[currentKey] = currentValue.join(' ').replace(/^["']|["']$/g, '');
+        }
+        const keyMatch = line.match(/^(\w+):\s*(.*)$/);
+        if (keyMatch && keyMatch[1]) {
+          currentKey = keyMatch[1];
+          const val = keyMatch[2]?.trim() || '';
+          if (val) {
+            currentValue = [val];
+          } else {
+            currentValue = [];
+          }
+        }
+      }
+    }
+    if (currentKey) {
+      fm[currentKey] = currentValue.join(' ').replace(/^["']|["']$/g, '');
+    }
+    
+    return fm;
   }
 
   async listSkills(): Promise<Array<{ name: string; version: string; description: string; enabled: boolean }>> {
@@ -194,17 +422,34 @@ export class SkillManager {
 
     for (const entry of entries) {
       if (entry.isDirectory()) {
-        const manifestPath = join(this.skillsDir, entry.name, 'skill.json');
-        try {
-          const content = await fs.readFile(manifestPath, 'utf-8');
-          const manifest = JSON.parse(content);
+        const skillPath = join(this.skillsDir, entry.name);
+        let manifest: any = null;
+        
+        const manifestFiles = ['skill.json', 'SKILL.md', 'package.json'];
+        for (const mf of manifestFiles) {
+          const manifestPath = join(skillPath, mf);
+          try {
+            const content = await fs.readFile(manifestPath, 'utf-8');
+            if (mf === 'skill.json' || mf === 'package.json') {
+              manifest = JSON.parse(content);
+            } else if (mf === 'SKILL.md') {
+              const fm = this.parseFrontmatter(content);
+              manifest = { name: fm.name, version: fm.version, description: fm.description };
+            }
+            break;
+          } catch {
+            continue;
+          }
+        }
+        
+        if (manifest) {
           skills.push({
             name: manifest.name || entry.name,
             version: manifest.version || '1.0.0',
             description: manifest.description || '',
             enabled: this.enabledSkills.has(entry.name),
           });
-        } catch {
+        } else {
           skills.push({ name: entry.name, version: 'unknown', description: '', enabled: false });
         }
       }
@@ -243,6 +488,17 @@ export class SkillManager {
       }
     }
     return tools;
+  }
+
+  getSkillDescriptions(): Array<{ name: string; description: string }> {
+    return Array.from(this.skills.values())
+      .filter(s => this.enabledSkills.has(s.name))
+      .map(s => ({ name: s.name, description: s.description }));
+  }
+
+  getSkillContent(name: string): string | undefined {
+    const skill = this.getEnabledSkills().find(s => s.name === name);
+    return skill?.skillContent;
   }
 
   async executeCommand(name: string, args: string[], ctx: SkillContext): Promise<string> {
@@ -295,6 +551,10 @@ export class SkillManager {
 
   disableSkill(name: string): void {
     this.enabledSkills.delete(name);
+  }
+
+  getSkillsDir(): string {
+    return this.skillsDir;
   }
 }
 

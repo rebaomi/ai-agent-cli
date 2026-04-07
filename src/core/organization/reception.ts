@@ -177,8 +177,12 @@ export class ReceptionAgent {
   }
 }
 
-export function createReceptionAgent(config: OrganizationConfig): ReceptionAgent | null {
-  const workflow = config.workflow;
+export function createReceptionAgent(config: OrganizationConfig | ReceptionConfig): ReceptionAgent | null {
+  if ('enabled' in config && 'welcomeMessage' in config) {
+    return new ReceptionAgent(config as ReceptionConfig);
+  }
+  
+  const workflow = (config as OrganizationConfig).workflow;
   if (!workflow?.reception?.enabled) {
     return null;
   }

@@ -18,10 +18,13 @@
 - 🎯 **Skills 系统** - 安装和管理第三方技能扩展
 - 🛡️ **安全沙箱** - 代码执行在受控环境中运行
 - 💬 **交互式对话** - 类 Claude Code 的命令行界面
+- ⌨️ **命令补全与输入历史** - 支持 Tab 补全 slash 命令与二级子命令，支持上下键浏览并持久化历史输入
 - 💾 **长期+短期记忆** - 模拟人脑记忆机制，Agent 专属记忆区域
 - 🌊 **流式输出** - AI 回复逐字显示，打字机效果
 - ⚡ **智能工具调用** - AI 自动调用合适工具完成任务
+- 🧰 **统一 Tool Registry** - 内置工具、Skills 工具、MCP 工具统一注册与分发
 - 📊 **任务规划器** - 复杂任务自动拆分成步骤执行，逐步完成
+- 📨 **任务与轻量协作工具** - 本地 Task、Team、Peer 消息、Cron 调度统一接入
 - 🏢 **多 Agent 组织架构** - 模拟企业团队协作，多角色 Agent 协同工作
 - 🐱 **AgentCat 电子宠物** - 健康提醒助手，提醒喝水、休息、运动
 - 📋 **任务进度追踪** - 实时查看任务执行进度和状态
@@ -122,12 +125,59 @@ sandbox:
 | `/memory` | 记忆管理 |
 | `/templates` | 查看组织架构模板 |
 | `/mcp` | 管理 MCP 服务器 |
+| `/cron` | 管理定时任务 |
 | `/perm` | 权限管理 |
 | `/sessions` | 查看历史会话 |
 | `/load <id>` | 加载历史会话 |
 | `/new` | 创建新会话（存档旧会话） |
 | `/reset` | 清空对话 |
 | `/wipe` | 重置用户数据（重新接待） |
+
+### 输入体验
+
+- `Tab` 补全 slash 命令与常用二级子命令，如 `/model switch`、`/cron create-news`
+- `↑ / ↓` 浏览历史输入
+- 输入历史持久化保存在 `~/.ai-agent-cli/input-history.json`
+- 历史输入同时覆盖普通对话和 slash 命令
+
+### 定时任务与新闻推送
+
+系统内置了持久化 cron 调度器，可以把内置工具挂到定时任务上。适合做新闻播报、例行检查、定时摘要。
+
+常用命令：
+
+```bash
+/cron list
+/cron create-news morning-brief morning 0 8 * * * Asia/Shanghai
+/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}
+/cron delete morning-brief
+```
+
+也可以单独启动 cron runner，不进入交互聊天：
+
+```bash
+coolAI --cron-daemon
+coolAI --cron-once
+```
+
+说明：
+- `--cron-daemon` 会常驻前台运行定时任务调度器
+- `--cron-once` 会立即检查一次当前到期任务并退出
+- cron 任务保存在 `~/.ai-agent-cli/cron/jobs.json`
+- 已内置腾讯新闻 CLI 对接，可直接调用 `tencent_hot_news`、`tencent_search_news`、`tencent_morning_news`、`tencent_evening_news`
+
+### 工具体系
+
+当前工具按八类能力组织：
+
+- 文件操作：读写、编辑、删除、复制、移动、glob、grep、多文件读取
+- 执行：命令执行、REPL、数学计算
+- 搜索与抓取：网页搜索、网页抓取、浏览器打开、腾讯新闻工具
+- Agents 与 Tasks：本地 task、team、peer 消息工具
+- 规划：plan mode、worktree、计划验证
+- MCP：MCP 工具、资源与认证入口
+- 系统：配置、权限、todo、cron、skill 配置
+- 实验：LSP、sleep 等
 
 ### 智能工具调用示例
 
@@ -202,6 +252,9 @@ AI：自动调用 open_browser 工具打开浏览器
 
 用户：获取这个网页的内容 https://example.com
 AI：自动调用 fetch_url 工具抓取网页
+
+用户：给我看今天的腾讯早报
+AI：自动调用 tencent_morning_news 工具
 ```
 
 #### 配合 MCP 扩展
@@ -214,6 +267,8 @@ AI：自动调用 Obsidian 搜索工具
 ### 多 Agent 组织架构
 
 coolAI 支持多 Agent 协作系统，模拟企业团队的工作方式。用户可以定义不同的角色（产品经理、项目经理、工程师、测试等），让它们协同完成复杂任务。
+
+重构设计建议见：`docs/organization-mode-refactor.md`
 
 #### 角色说明
 
@@ -884,10 +939,13 @@ An intelligent coding assistant CLI tool powered by Ollama, with support for MCP
 - 🎯 **Skills System** - Install and manage third-party skill extensions
 - 🛡️ **Secure Sandbox** - Code execution in controlled environment
 - 💬 **Interactive Chat** - Claude Code-like command line interface
+- ⌨️ **Tab Completion + Persistent History** - Tab completion for slash commands and subcommands, plus persisted input history
 - 💾 **Long-term + Short-term Memory** - Human brain-like memory with agent-specific areas
 - 🌊 **Streaming Output** - Typewriter effect for AI responses
 - ⚡ **Smart Tool Calling** - AI automatically calls appropriate tools to complete tasks
+- 🧰 **Unified Tool Registry** - Built-in tools, skill tools, and MCP tools are registered and dispatched through one registry
 - 📊 **Task Planner** - Complex tasks automatically split into steps for sequential execution
+- 📨 **Tasks, Teams, and Cron Jobs** - Local task records, peer messaging, lightweight teams, and persistent cron scheduling
 - 🏢 **Multi-Agent Organization** - Simulate enterprise team collaboration with multiple agent roles
 - 🐱 **AgentCat Companion** - Health reminder assistant for water, rest, and exercise
 - 📋 **Task Progress Tracking** - Real-time task execution progress and status
@@ -971,12 +1029,56 @@ sandbox:
 | `/memory` | Memory management |
 | `/templates` | List organization templates |
 | `/mcp` | Manage MCP servers |
+| `/cron` | Manage cron jobs |
 | `/perm` | Permission management |
 | `/sessions` | List conversation sessions |
 | `/load <id>` | Load a previous session |
 | `/new` | Create new session (archive old) |
 | `/reset` | Clear conversation |
 | `/wipe` | Reset user data (restart onboarding) |
+
+### Input Experience
+
+- `Tab` completes slash commands and common subcommands such as `/model switch` and `/cron create-news`
+- `Up / Down` browse previous inputs
+- Input history is persisted in `~/.ai-agent-cli/input-history.json`
+
+### Cron Jobs and News Delivery
+
+The CLI includes a persistent cron scheduler that can run built-in tools on schedule. This is useful for news briefings, recurring checks, and periodic summaries.
+
+```bash
+/cron list
+/cron create-news morning-brief morning 0 8 * * * Asia/Shanghai
+/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}
+/cron delete morning-brief
+```
+
+You can also run the scheduler without entering chat mode:
+
+```bash
+coolAI --cron-daemon
+coolAI --cron-once
+```
+
+Notes:
+- `--cron-daemon` keeps the scheduler running in the foreground
+- `--cron-once` checks due jobs once and exits
+- Cron jobs are stored in `~/.ai-agent-cli/cron/jobs.json`
+- Tencent News CLI tools are already wired in: `tencent_hot_news`, `tencent_search_news`, `tencent_morning_news`, `tencent_evening_news`
+
+### Tool System
+
+The current tool surface is organized into eight capability groups:
+
+- File operations
+- Execution
+- Search & fetch
+- Agents & tasks
+- Planning
+- MCP
+- System
+- Experimental
 
 ### Intelligent Tool Calling Examples
 
@@ -995,6 +1097,15 @@ AI: Automatically calls write_file tool
 ```
 User: Run npm install
 AI: Automatically calls execute_command
+```
+
+#### News Tools
+```
+User: Show me today's Tencent morning briefing
+AI: Automatically calls tencent_morning_news
+
+User: Schedule a hot news push for 9 AM every day
+AI: Can use cron_create with tencent_hot_news
 ```
 
 ### Task Planner
@@ -1205,6 +1316,11 @@ Available groups: `file_ops` (basic file), `file_dangerous` (dangerous file), `n
 | `lsp_complete` | Code completion |
 | `lsp_diagnostics` | Code diagnostics |
 | `lsp_definition` | Go to definition |
+| `task_create` / `task_get_list` / `task_update` / `task_stop` / `task_output` | Local task management |
+| `team_create` / `team_delete` / `list_peers` / `agent_send_message` | Lightweight collaboration tools |
+| `cron_create` / `cron_delete` / `cron_list` | Persistent cron scheduler |
+| `mcp_list` / `mcp_resources` / `read_mcp_resource` / `mcp_auth` | MCP management helpers |
+| `tencent_hot_news` / `tencent_search_news` / `tencent_morning_news` / `tencent_evening_news` | Tencent News integration |
 
 ### Tech Stack
 

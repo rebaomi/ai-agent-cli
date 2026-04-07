@@ -317,6 +317,10 @@ export class MCPManager {
     return Array.from(this.clients.values());
   }
 
+  getServerNames(): string[] {
+    return Array.from(this.clients.keys());
+  }
+
   async listAllTools(): Promise<Array<{ server: string; tool: MCPTool }>> {
     const tools: Array<{ server: string; tool: MCPTool }> = [];
     for (const [name, client] of this.clients) {
@@ -333,6 +337,32 @@ export class MCPManager {
       throw new Error(`MCP server ${serverName} not found`);
     }
     return client.callTool(toolName, args);
+  }
+
+  async listResources(serverName?: string): Promise<Array<{ server: string; resource: MCPResource }>> {
+    const resources: Array<{ server: string; resource: MCPResource }> = [];
+
+    const entries = serverName
+      ? Array.from(this.clients.entries()).filter(([name]) => name === serverName)
+      : Array.from(this.clients.entries());
+
+    for (const [name, client] of entries) {
+      await client.listResources();
+      for (const resource of client.getResources()) {
+        resources.push({ server: name, resource });
+      }
+    }
+
+    return resources;
+  }
+
+  async readResource(serverName: string, uri: string): Promise<{ contents: Array<{ uri: string; mimeType?: string; text?: string }> }> {
+    const client = this.clients.get(serverName);
+    if (!client) {
+      throw new Error(`MCP server ${serverName} not found`);
+    }
+
+    return client.readResource(uri);
   }
 
   async disconnectAll(): Promise<void> {

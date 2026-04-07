@@ -149,6 +149,8 @@ export class UserProfileManager {
     if (topic && !this.currentProfile.conversationTopics.includes(topic)) {
       this.currentProfile.conversationTopics.push(topic);
     }
+
+    this.saveProfile().catch(() => {});
   }
 
   recordFeedback(type: 'praise' | 'complaint' | 'suggestion'): void {
@@ -168,6 +170,8 @@ export class UserProfileManager {
       ...this.currentProfile.preferences,
       ...prefs,
     };
+
+    this.saveProfile().catch(() => {});
   }
 
   getPersonalityPrompt(): string {

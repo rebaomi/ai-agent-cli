@@ -19,11 +19,13 @@ export interface LLMResponse {
     completionTokens: number;
     totalTokens: number;
   };
+  toolCalls?: ToolCall[];
 }
 
 export interface LLMStreamChunk {
   content: string;
   done: boolean;
+  toolCalls?: ToolCall[];
 }
 
 export interface LLMProviderInterface {

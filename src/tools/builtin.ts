@@ -5,42 +5,102 @@ import { promisify } from 'util';
 import type { Tool, ToolResult } from '../types/index.js';
 import { Sandbox } from '../sandbox/executor.js';
 import { LSPManager } from '../lsp/client.js';
+import type { MCPManager } from '../mcp/client.js';
+import type { TaskManager } from '../core/task-manager.js';
+import type { CronManager } from '../core/cron-manager.js';
 
 const execAsync = promisify(exec);
+
+export interface BuiltInToolsOptions {
+  mcpManager?: MCPManager;
+  taskManager?: TaskManager;
+  cronManager?: CronManager;
+}
 
 export class BuiltInTools {
   private sandbox: Sandbox;
   private lspManager: LSPManager;
+  private mcpManager?: MCPManager;
+  private taskManager?: TaskManager;
+  private cronManager?: CronManager;
 
-  constructor(sandbox: Sandbox, lspManager: LSPManager) {
+  constructor(sandbox: Sandbox, lspManager: LSPManager, options: BuiltInToolsOptions = {}) {
     this.sandbox = sandbox;
     this.lspManager = lspManager;
+    this.mcpManager = options.mcpManager;
+    this.taskManager = options.taskManager;
+    this.cronManager = options.cronManager;
   }
 
   getTools(): Tool[] {
     return [
-      this.readFileTool(),
-      this.writeFileTool(),
-      this.editFileTool(),
-      this.deleteFileTool(),
-      this.copyFileTool(),
-      this.moveFileTool(),
-      this.fileInfoTool(),
-      this.listDirectoryTool(),
-      this.createDirectoryTool(),
-      this.searchFilesTool(),
-      this.grepTool(),
-      this.executeCommandTool(),
-      this.globTool(),
-      this.readMultipleFilesTool(),
-      this.getCurrentTimeTool(),
-      this.calculateTool(),
-      this.webSearchTool(),
-      this.fetchUrlTool(),
-      this.openBrowserTool(),
-      this.lspCompleteTool(),
-      this.lspDiagnosticsTool(),
-      this.lspDefinitionTool(),
+      // File Operations
+      { ...this.readFileTool(), category: 'file_operations' },
+      { ...this.writeFileTool(), category: 'file_operations' },
+      { ...this.editFileTool(), category: 'file_operations' },
+      { ...this.deleteFileTool(), category: 'file_operations' },
+      { ...this.copyFileTool(), category: 'file_operations' },
+      { ...this.moveFileTool(), category: 'file_operations' },
+      { ...this.fileInfoTool(), category: 'file_operations' },
+      { ...this.listDirectoryTool(), category: 'file_operations' },
+      { ...this.createDirectoryTool(), category: 'file_operations' },
+      { ...this.searchFilesTool(), category: 'file_operations' },
+      { ...this.grepTool(), category: 'file_operations' },
+      { ...this.globTool(), category: 'file_operations' },
+      { ...this.readMultipleFilesTool(), category: 'file_operations' },
+      
+      // Execution
+      { ...this.executeCommandTool(), category: 'execution' },
+      { ...this.calculateTool(), category: 'execution' },
+      { ...this.replTool(), category: 'execution' },
+      
+      // Search & Fetch
+      { ...this.webSearchTool(), category: 'search_fetch' },
+      { ...this.fetchUrlTool(), category: 'search_fetch' },
+      { ...this.openBrowserTool(), category: 'search_fetch' },
+
+      // Agents & Tasks
+      { ...this.agentSendMessageTool(), category: 'agents_tasks' },
+      { ...this.taskCreateTool(), category: 'agents_tasks' },
+      { ...this.taskGetListTool(), category: 'agents_tasks' },
+      { ...this.taskUpdateTool(), category: 'agents_tasks' },
+      { ...this.taskStopTool(), category: 'agents_tasks' },
+      { ...this.taskOutputTool(), category: 'agents_tasks' },
+      { ...this.teamCreateTool(), category: 'agents_tasks' },
+      { ...this.teamDeleteTool(), category: 'agents_tasks' },
+      { ...this.listPeersTool(), category: 'agents_tasks' },
+      
+      // Planning
+      { ...this.enterPlanModeTool(), category: 'planning' },
+      { ...this.exitPlanModeTool(), category: 'planning' },
+      { ...this.enterWorktreeTool(), category: 'planning' },
+      { ...this.exitWorktreeTool(), category: 'planning' },
+      { ...this.verifyPlanExecutionTool(), category: 'planning' },
+
+      // MCP
+      { ...this.mcpListTool(), category: 'mcp' },
+      { ...this.mcpResourcesTool(), category: 'mcp' },
+      { ...this.readMcpResourceTool(), category: 'mcp' },
+      { ...this.mcpAuthTool(), category: 'mcp' },
+      
+      // System
+      { ...this.getCurrentTimeTool(), category: 'system' },
+      { ...this.todoWriteTool(), category: 'system' },
+      { ...this.skillConfigTool(), category: 'system' },
+      { ...this.configTool(), category: 'system' },
+      { ...this.cronCreateTool(), category: 'system' },
+      { ...this.cronDeleteTool(), category: 'system' },
+      { ...this.cronListTool(), category: 'system' },
+      
+      // Experimental
+      { ...this.lspCompleteTool(), category: 'experimental' },
+      { ...this.lspDiagnosticsTool(), category: 'experimental' },
+      { ...this.lspDefinitionTool(), category: 'experimental' },
+      { ...this.sleepTool(), category: 'experimental' },
+      { ...this.tencentHotNewsTool(), category: 'search_fetch' },
+      { ...this.tencentSearchNewsTool(), category: 'search_fetch' },
+      { ...this.tencentMorningNewsTool(), category: 'search_fetch' },
+      { ...this.tencentEveningNewsTool(), category: 'search_fetch' },
     ];
   }
 
@@ -443,6 +503,431 @@ export class BuiltInTools {
     };
   }
 
+  private replTool(): Tool {
+    return {
+      name: 'repl',
+      description: 'Evaluate JavaScript code in a sandboxed REPL',
+      input_schema: {
+        type: 'object',
+        properties: {
+          code: { type: 'string', description: 'JavaScript code to evaluate' },
+        },
+        required: ['code'],
+      },
+    };
+  }
+
+  private agentSendMessageTool(): Tool {
+    return {
+      name: 'agent_send_message',
+      description: 'Queue a message for a local peer agent or team inbox',
+      input_schema: {
+        type: 'object',
+        properties: {
+          target: { type: 'string', description: 'Target agent or team name' },
+          message: { type: 'string', description: 'Message content' },
+        },
+        required: ['target', 'message'],
+      },
+    };
+  }
+
+  private taskCreateTool(): Tool {
+    return {
+      name: 'task_create',
+      description: 'Create a local task record',
+      input_schema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Task title' },
+          description: { type: 'string', description: 'Task description' },
+          assignee: { type: 'string', description: 'Optional assignee or target agent' },
+        },
+        required: ['title'],
+      },
+    };
+  }
+
+  private taskGetListTool(): Tool {
+    return {
+      name: 'task_get_list',
+      description: 'List local tasks',
+      input_schema: {
+        type: 'object',
+        properties: {
+          status: {
+            type: 'string',
+            enum: ['pending', 'in_progress', 'completed', 'stopped', 'failed'],
+            description: 'Optional task status filter',
+          },
+        },
+      },
+    };
+  }
+
+  private taskUpdateTool(): Tool {
+    return {
+      name: 'task_update',
+      description: 'Update a local task',
+      input_schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Task id' },
+          title: { type: 'string', description: 'New task title' },
+          description: { type: 'string', description: 'New description' },
+          status: {
+            type: 'string',
+            enum: ['pending', 'in_progress', 'completed', 'stopped', 'failed'],
+            description: 'New status',
+          },
+          output: { type: 'string', description: 'Task output or result' },
+        },
+        required: ['id'],
+      },
+    };
+  }
+
+  private taskStopTool(): Tool {
+    return {
+      name: 'task_stop',
+      description: 'Stop a local task',
+      input_schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Task id' },
+          reason: { type: 'string', description: 'Optional stop reason' },
+        },
+        required: ['id'],
+      },
+    };
+  }
+
+  private taskOutputTool(): Tool {
+    return {
+      name: 'task_output',
+      description: 'Get the output of a local task',
+      input_schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Task id' },
+        },
+        required: ['id'],
+      },
+    };
+  }
+
+  private teamCreateTool(): Tool {
+    return {
+      name: 'team_create',
+      description: 'Create a lightweight local team definition',
+      input_schema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Team name' },
+          description: { type: 'string', description: 'Team description' },
+          members: { type: 'array', items: { type: 'string' }, description: 'Team members' },
+        },
+        required: ['name'],
+      },
+    };
+  }
+
+  private teamDeleteTool(): Tool {
+    return {
+      name: 'team_delete',
+      description: 'Delete a lightweight local team definition',
+      input_schema: {
+        type: 'object',
+        properties: {
+          idOrName: { type: 'string', description: 'Team id or team name' },
+        },
+        required: ['idOrName'],
+      },
+    };
+  }
+
+  private listPeersTool(): Tool {
+    return {
+      name: 'list_peers',
+      description: 'List available local peers, teams, and MCP servers',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+    };
+  }
+
+  private enterPlanModeTool(): Tool {
+    return {
+      name: 'enter_plan_mode',
+      description: 'Enter planning mode to develop a multi-step plan before execution',
+      input_schema: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'The task to plan for' },
+        },
+        required: ['task'],
+      },
+    };
+  }
+
+  private exitPlanModeTool(): Tool {
+    return {
+      name: 'exit_plan_mode',
+      description: 'Exit planning mode and return to normal operation',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+    };
+  }
+
+  private enterWorktreeTool(): Tool {
+    return {
+      name: 'enter_worktree',
+      description: 'Create and enter a new git worktree for isolated development',
+      input_schema: {
+        type: 'object',
+        properties: {
+          branch: { type: 'string', description: 'Branch name for the worktree' },
+          path: { type: 'string', description: 'Path for the new worktree' },
+        },
+        required: ['branch', 'path'],
+      },
+    };
+  }
+
+  private exitWorktreeTool(): Tool {
+    return {
+      name: 'exit_worktree',
+      description: 'Exit current worktree and return to main repository',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+    };
+  }
+
+  private verifyPlanExecutionTool(): Tool {
+    return {
+      name: 'verify_plan_execution',
+      description: 'Verify that a plan was executed correctly',
+      input_schema: {
+        type: 'object',
+        properties: {
+          planId: { type: 'string', description: 'ID of the plan to verify' },
+        },
+        required: ['planId'],
+      },
+    };
+  }
+
+  private mcpListTool(): Tool {
+    return {
+      name: 'mcp_list',
+      description: 'List connected MCP servers and their tool counts',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+    };
+  }
+
+  private mcpResourcesTool(): Tool {
+    return {
+      name: 'mcp_resources',
+      description: 'List MCP resources for one server or all servers',
+      input_schema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'Optional MCP server name' },
+        },
+      },
+    };
+  }
+
+  private readMcpResourceTool(): Tool {
+    return {
+      name: 'read_mcp_resource',
+      description: 'Read a specific MCP resource',
+      input_schema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'MCP server name' },
+          uri: { type: 'string', description: 'Resource URI' },
+        },
+        required: ['server', 'uri'],
+      },
+    };
+  }
+
+  private mcpAuthTool(): Tool {
+    return {
+      name: 'mcp_auth',
+      description: 'Show MCP authentication guidance for a server',
+      input_schema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'Optional MCP server name' },
+        },
+      },
+    };
+  }
+
+  private todoWriteTool(): Tool {
+    return {
+      name: 'todo_write',
+      description: 'Write or update a todo item',
+      input_schema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'Todo content' },
+          done: { type: 'boolean', description: 'Mark as done' },
+        },
+        required: ['content'],
+      },
+    };
+  }
+
+  private skillConfigTool(): Tool {
+    return {
+      name: 'skill_config',
+      description: 'Configure or query skill settings',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'enable', 'disable', 'install', 'uninstall'], description: 'Action to perform' },
+          skillName: { type: 'string', description: 'Name of the skill' },
+        },
+        required: ['action'],
+      },
+    };
+  }
+
+  private configTool(): Tool {
+    return {
+      name: 'config',
+      description: 'Get or set configuration values',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['get', 'set', 'list'], description: 'Action to perform' },
+          key: { type: 'string', description: 'Config key' },
+          value: { type: 'string', description: 'Config value (for set)' },
+        },
+        required: ['action'],
+      },
+    };
+  }
+
+  private cronCreateTool(): Tool {
+    return {
+      name: 'cron_create',
+      description: 'Create a persistent cron job that runs a tool on schedule',
+      input_schema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Job name' },
+          schedule: { type: 'string', description: 'Cron expression, e.g. "0 8 * * *" or @daily' },
+          tool: { type: 'string', description: 'Tool name to run, e.g. tencent_morning_news' },
+          args: { type: 'object', description: 'Optional tool arguments' },
+          description: { type: 'string', description: 'Optional job description' },
+          timezone: { type: 'string', description: 'Optional IANA timezone' },
+        },
+        required: ['name', 'schedule', 'tool'],
+      },
+    };
+  }
+
+  private cronDeleteTool(): Tool {
+    return {
+      name: 'cron_delete',
+      description: 'Delete a persistent cron job',
+      input_schema: {
+        type: 'object',
+        properties: {
+          idOrName: { type: 'string', description: 'Cron job id or name' },
+        },
+        required: ['idOrName'],
+      },
+    };
+  }
+
+  private cronListTool(): Tool {
+    return {
+      name: 'cron_list',
+      description: 'List persistent cron jobs',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+    };
+  }
+
+  private sleepTool(): Tool {
+    return {
+      name: 'sleep',
+      description: 'Pause execution for a specified duration',
+      input_schema: {
+        type: 'object',
+        properties: {
+          seconds: { type: 'number', description: 'Number of seconds to sleep' },
+        },
+        required: ['seconds'],
+      },
+    };
+  }
+
+  private tencentHotNewsTool(): Tool {
+    return {
+      name: 'tencent_hot_news',
+      description: 'Query Tencent News hot ranking list',
+      input_schema: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', description: 'Number of news items (default: 10)' },
+        },
+      },
+    };
+  }
+
+  private tencentSearchNewsTool(): Tool {
+    return {
+      name: 'tencent_search_news',
+      description: 'Search Tencent News by keyword',
+      input_schema: {
+        type: 'object',
+        properties: {
+          keyword: { type: 'string', description: 'Search keyword' },
+          limit: { type: 'number', description: 'Number of results (default: 10)' },
+        },
+        required: ['keyword'],
+      },
+    };
+  }
+
+  private tencentMorningNewsTool(): Tool {
+    return {
+      name: 'tencent_morning_news',
+      description: 'Query Tencent News morning edition',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+    };
+  }
+
+  private tencentEveningNewsTool(): Tool {
+    return {
+      name: 'tencent_evening_news',
+      description: 'Query Tencent News evening edition',
+      input_schema: {
+        type: 'object',
+        properties: {},
+      },
+    };
+  }
+
   async executeTool(name: string, args: unknown): Promise<ToolResult> {
     try {
       let result: string;
@@ -602,15 +1087,193 @@ export class BuiltInTools {
           break;
         }
 
+        case 'agent_send_message': {
+          const { target, message } = args as { target: string; message: string };
+          result = await this.agentSendMessage(target, message);
+          break;
+        }
+
+        case 'task_create': {
+          const { title, description, assignee } = args as { title: string; description?: string; assignee?: string };
+          result = await this.taskCreate(title, description, assignee);
+          break;
+        }
+
+        case 'task_get_list': {
+          const { status } = args as { status?: 'pending' | 'in_progress' | 'completed' | 'stopped' | 'failed' };
+          result = this.taskGetList(status);
+          break;
+        }
+
+        case 'task_update': {
+          const { id, ...updates } = args as { id: string; title?: string; description?: string; status?: 'pending' | 'in_progress' | 'completed' | 'stopped' | 'failed'; output?: string };
+          result = await this.taskUpdate(id, updates);
+          break;
+        }
+
+        case 'task_stop': {
+          const { id, reason } = args as { id: string; reason?: string };
+          result = await this.taskStop(id, reason);
+          break;
+        }
+
+        case 'task_output': {
+          const { id } = args as { id: string };
+          result = this.taskOutput(id);
+          break;
+        }
+
+        case 'team_create': {
+          const { name: teamName, description, members } = args as { name: string; description?: string; members?: string[] };
+          result = await this.teamCreate(teamName, description, members);
+          break;
+        }
+
+        case 'team_delete': {
+          const { idOrName } = args as { idOrName: string };
+          result = await this.teamDelete(idOrName);
+          break;
+        }
+
+        case 'list_peers':
+          result = this.listPeers();
+          break;
+
+        case 'repl': {
+          const { code } = args as { code: string };
+          result = this.evaluateRepl(code);
+          break;
+        }
+
+        case 'enter_plan_mode':
+          result = 'Entered planning mode. Use exit_plan_mode to return to normal operation.';
+          break;
+
+        case 'exit_plan_mode':
+          result = 'Exited planning mode.';
+          break;
+
+        case 'enter_worktree': {
+          const { branch, path: worktreePath } = args as { branch: string; path: string };
+          result = await this.createWorktree(branch, worktreePath);
+          break;
+        }
+
+        case 'exit_worktree':
+          result = 'Worktree support requires git integration.';
+          break;
+
+        case 'verify_plan_execution': {
+          const { planId } = args as { planId: string };
+          result = `Plan ${planId} verification requires planner integration.`;
+          break;
+        }
+
+        case 'mcp_list':
+          result = await this.mcpList();
+          break;
+
+        case 'mcp_resources': {
+          const { server } = args as { server?: string };
+          result = await this.mcpResources(server);
+          break;
+        }
+
+        case 'read_mcp_resource': {
+          const { server, uri } = args as { server: string; uri: string };
+          result = await this.readMcpResource(server, uri);
+          break;
+        }
+
+        case 'mcp_auth': {
+          const { server } = args as { server?: string };
+          result = this.mcpAuth(server);
+          break;
+        }
+
+        case 'todo_write': {
+          const { content, done } = args as { content: string; done?: boolean };
+          result = `Todo "${content}" ${done ? 'completed' : 'added'}`;
+          break;
+        }
+
+        case 'skill_config': {
+          const { action, skillName } = args as { action: string; skillName?: string };
+          result = `Skill config: ${action} ${skillName || ''}`;
+          break;
+        }
+
+        case 'config': {
+          const { action, key, value } = args as { action: string; key?: string; value?: string };
+          result = `Config ${action}: ${key || ''} ${value || ''}`;
+          break;
+        }
+
+        case 'cron_create': {
+          const { name: jobName, schedule, tool, args: toolArgs, description, timezone } = args as {
+            name: string;
+            schedule: string;
+            tool: string;
+            args?: Record<string, unknown>;
+            description?: string;
+            timezone?: string;
+          };
+          result = await this.cronCreate(jobName, schedule, tool, toolArgs, description, timezone);
+          break;
+        }
+
+        case 'cron_delete': {
+          const { idOrName } = args as { idOrName: string };
+          result = await this.cronDelete(idOrName);
+          break;
+        }
+
+        case 'cron_list':
+          result = this.cronList();
+          break;
+
+        case 'sleep': {
+          const { seconds } = args as { seconds: number };
+          await new Promise(r => setTimeout(r, seconds * 1000));
+          result = `Slept for ${seconds} seconds`;
+          break;
+        }
+
+        case 'tencent_hot_news': {
+          const { limit } = args as { limit?: number };
+          result = await this.getTencentHotNews(limit ?? 10);
+          break;
+        }
+
+        case 'tencent_search_news': {
+          const { keyword, limit } = args as { keyword: string; limit?: number };
+          result = await this.searchTencentNews(keyword, limit ?? 10);
+          break;
+        }
+
+        case 'tencent_morning_news':
+          result = await this.getTencentMorningNews();
+          break;
+
+        case 'tencent_evening_news':
+          result = await this.getTencentEveningNews();
+          break;
+
         default:
           return { tool_call_id: '', output: `Unknown tool: ${name}`, is_error: true };
       }
 
-      return { tool_call_id: '', content: [{ type: 'text', text: result }] };
-    } catch (error) {
       return {
         tool_call_id: '',
-        content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        output: result,
+        content: [{ type: 'text', text: result }],
+      };
+    } catch (error) {
+      const errorText = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      return {
+        tool_call_id: '',
+        output: errorText,
+        content: [{ type: 'text', text: errorText }],
         is_error: true,
       };
     }
@@ -933,8 +1596,249 @@ export class BuiltInTools {
       return `Failed to open browser: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
+
+  private evaluateRepl(code: string): string {
+    try {
+      const result = new Function(`return ${code}`)();
+      return String(result);
+    } catch (error) {
+      return `Error: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async createWorktree(branch: string, path: string): Promise<string> {
+    try {
+      const { execSync } = await import('child_process');
+      execSync(`git worktree add "${path}" -b ${branch}`, { stdio: 'pipe' });
+      return `Created worktree at ${path} with branch ${branch}`;
+    } catch (error) {
+      return `Failed to create worktree: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async agentSendMessage(target: string, message: string): Promise<string> {
+    if (!this.taskManager) {
+      return 'Agent messaging is unavailable: task manager not initialized';
+    }
+
+    const queued = await this.taskManager.sendMessage(target, message);
+    return `Queued message ${queued.id} for ${target}`;
+  }
+
+  private async taskCreate(title: string, description?: string, assignee?: string): Promise<string> {
+    if (!this.taskManager) {
+      return 'Task manager not initialized';
+    }
+
+    const task = await this.taskManager.createTask({ title, description, assignee });
+    return JSON.stringify(task, null, 2);
+  }
+
+  private taskGetList(status?: 'pending' | 'in_progress' | 'completed' | 'stopped' | 'failed'): string {
+    if (!this.taskManager) {
+      return 'Task manager not initialized';
+    }
+
+    const tasks = this.taskManager.listTasks(status);
+    return tasks.length > 0 ? JSON.stringify(tasks, null, 2) : 'No tasks found';
+  }
+
+  private async taskUpdate(id: string, updates: { title?: string; description?: string; status?: 'pending' | 'in_progress' | 'completed' | 'stopped' | 'failed'; output?: string }): Promise<string> {
+    if (!this.taskManager) {
+      return 'Task manager not initialized';
+    }
+
+    const task = await this.taskManager.updateTask(id, updates);
+    return task ? JSON.stringify(task, null, 2) : `Task not found: ${id}`;
+  }
+
+  private async taskStop(id: string, reason?: string): Promise<string> {
+    if (!this.taskManager) {
+      return 'Task manager not initialized';
+    }
+
+    const task = await this.taskManager.stopTask(id, reason);
+    return task ? JSON.stringify(task, null, 2) : `Task not found: ${id}`;
+  }
+
+  private taskOutput(id: string): string {
+    if (!this.taskManager) {
+      return 'Task manager not initialized';
+    }
+
+    const task = this.taskManager.getTask(id);
+    if (!task) {
+      return `Task not found: ${id}`;
+    }
+
+    return task.output || '(empty)';
+  }
+
+  private async teamCreate(name: string, description?: string, members?: string[]): Promise<string> {
+    if (!this.taskManager) {
+      return 'Task manager not initialized';
+    }
+
+    const team = await this.taskManager.createTeam({ name, description, members });
+    return JSON.stringify(team, null, 2);
+  }
+
+  private async teamDelete(idOrName: string): Promise<string> {
+    if (!this.taskManager) {
+      return 'Task manager not initialized';
+    }
+
+    const team = await this.taskManager.deleteTeam(idOrName);
+    return team ? JSON.stringify(team, null, 2) : `Team not found: ${idOrName}`;
+  }
+
+  private listPeers(): string {
+    const peers = this.taskManager?.listPeers() || [];
+    const mcpServers = this.mcpManager?.getServerNames().map(name => ({ id: name, type: 'mcp', description: 'Connected MCP server' })) || [];
+    const merged = [...peers, ...mcpServers];
+    return merged.length > 0 ? JSON.stringify(merged, null, 2) : 'No peers found';
+  }
+
+  private async mcpList(): Promise<string> {
+    if (!this.mcpManager) {
+      return 'MCP manager not initialized';
+    }
+
+    const servers = this.mcpManager.getServerNames();
+    if (servers.length === 0) {
+      return 'No MCP servers connected';
+    }
+
+    const tools = await this.mcpManager.listAllTools();
+    const summary = servers.map(server => ({
+      server,
+      toolCount: tools.filter(item => item.server === server).length,
+    }));
+    return JSON.stringify(summary, null, 2);
+  }
+
+  private async mcpResources(server?: string): Promise<string> {
+    if (!this.mcpManager) {
+      return 'MCP manager not initialized';
+    }
+
+    const resources = await this.mcpManager.listResources(server);
+    return resources.length > 0 ? JSON.stringify(resources, null, 2) : 'No MCP resources found';
+  }
+
+  private async readMcpResource(server: string, uri: string): Promise<string> {
+    if (!this.mcpManager) {
+      return 'MCP manager not initialized';
+    }
+
+    const result = await this.mcpManager.readResource(server, uri);
+    return JSON.stringify(result, null, 2);
+  }
+
+  private mcpAuth(server?: string): string {
+    if (!this.mcpManager) {
+      return 'MCP manager not initialized';
+    }
+
+    return server
+      ? `MCP auth for ${server} is managed by the server command/env configuration. Reconnect the server after updating credentials.`
+      : 'MCP auth is managed by each server command/env configuration. Reconnect servers after updating credentials.';
+  }
+
+  private async cronCreate(
+    name: string,
+    schedule: string,
+    toolName: string,
+    args?: Record<string, unknown>,
+    description?: string,
+    timezone?: string,
+  ): Promise<string> {
+    if (!this.cronManager) {
+      return 'Cron manager not initialized';
+    }
+
+    const job = await this.cronManager.createJob({
+      name,
+      schedule,
+      toolName,
+      args,
+      description,
+      timezone,
+    });
+    return JSON.stringify(job, null, 2);
+  }
+
+  private async cronDelete(idOrName: string): Promise<string> {
+    if (!this.cronManager) {
+      return 'Cron manager not initialized';
+    }
+
+    const job = await this.cronManager.deleteJob(idOrName);
+    return job ? JSON.stringify(job, null, 2) : `Cron job not found: ${idOrName}`;
+  }
+
+  private cronList(): string {
+    if (!this.cronManager) {
+      return 'Cron manager not initialized';
+    }
+
+    const jobs = this.cronManager.listJobs();
+    return jobs.length > 0 ? JSON.stringify(jobs, null, 2) : 'No cron jobs found';
+  }
+
+  private async getTencentHotNews(limit: number): Promise<string> {
+    try {
+      const { execSync } = await import('child_process');
+      const output = execSync(`npx @tencentnews/cli hot --limit ${limit}`, { 
+        encoding: 'utf-8',
+        timeout: 30000,
+      });
+      return output;
+    } catch (error) {
+      return `Failed to get hot news: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async searchTencentNews(keyword: string, limit: number): Promise<string> {
+    try {
+      const { execSync } = await import('child_process');
+      const output = execSync(`npx @tencentnews/cli search "${keyword}" --limit ${limit}`, { 
+        encoding: 'utf-8',
+        timeout: 30000,
+      });
+      return output;
+    } catch (error) {
+      return `Failed to search news: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async getTencentMorningNews(): Promise<string> {
+    try {
+      const { execSync } = await import('child_process');
+      const output = execSync(`npx @tencentnews/cli morning`, { 
+        encoding: 'utf-8',
+        timeout: 30000,
+      });
+      return output;
+    } catch (error) {
+      return `Failed to get morning news: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async getTencentEveningNews(): Promise<string> {
+    try {
+      const { execSync } = await import('child_process');
+      const output = execSync(`npx @tencentnews/cli evening`, { 
+        encoding: 'utf-8',
+        timeout: 30000,
+      });
+      return output;
+    } catch (error) {
+      return `Failed to get evening news: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
 }
 
-export function createBuiltInTools(sandbox: Sandbox, lspManager: LSPManager): BuiltInTools {
-  return new BuiltInTools(sandbox, lspManager);
+export function createBuiltInTools(sandbox: Sandbox, lspManager: LSPManager, options: BuiltInToolsOptions = {}): BuiltInTools {
+  return new BuiltInTools(sandbox, lspManager, options);
 }

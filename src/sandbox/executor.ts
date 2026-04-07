@@ -55,7 +55,9 @@ export class Sandbox {
     }
 
     if (!this.isPathAllowed(filePath)) {
-      throw new Error(`Path not allowed: ${filePath}`);
+      const resolved = path.resolve(filePath);
+      const allowedList = this.allowedPaths.map(p => path.resolve(p));
+      throw new Error(`Path not allowed: ${filePath}\nResolved: ${resolved}\nAllowed: ${allowedList.join(', ')}`);
     }
 
     return fs.readFile(filePath, 'utf-8');

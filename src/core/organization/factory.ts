@@ -1,12 +1,14 @@
 import type { AgentMember, AgentRole, ROLE_DESCRIPTIONS } from './types.js';
 import type { LLMProviderInterface } from '../../llm/types.js';
 import { Agent } from '../agent.js';
+import type { SkillManager } from '../skills.js';
 
 export interface AgentFactoryOptions {
   llm: LLMProviderInterface;
   mcpManager?: any;
   lspManager?: any;
   sandbox?: any;
+  skillManager?: SkillManager;
 }
 
 export class AgentFactory {
@@ -14,6 +16,7 @@ export class AgentFactory {
   private mcpManager: any;
   private lspManager: any;
   private sandbox: any;
+  private skillManager?: SkillManager;
   private agentInstances: Map<string, Agent> = new Map();
 
   constructor(options: AgentFactoryOptions) {
@@ -21,6 +24,11 @@ export class AgentFactory {
     this.mcpManager = options.mcpManager;
     this.lspManager = options.lspManager;
     this.sandbox = options.sandbox;
+    this.skillManager = options.skillManager;
+  }
+
+  setSkillManager(skillManager: SkillManager): void {
+    this.skillManager = skillManager;
   }
 
   createAgent(member: AgentMember): Agent {
@@ -108,8 +116,10 @@ export class AgentFactory {
       mcpManager: this.mcpManager,
       lspManager: this.lspManager,
       sandbox: this.sandbox,
+      skillManager: this.skillManager,
       systemPrompt: systemPrompts[member.role],
-      maxIterations: 50,
+      maxIterations: member.maxIterations || 50,
+      agentRole: member.role,
     });
 
     this.agentInstances.set(member.id, agent);
@@ -130,6 +140,34 @@ export class AgentFactory {
 
   getAgentCount(): number {
     return this.agentInstances.size;
+  }
+
+  getAllAgents(): Map<string, Agent> {
+    return this.agentInstances;
+  }
+
+  getAgentByRole(role: string): Agent | undefined {
+    for (const [id, agent] of this.agentInstances) {
+      if (agent.getRole?.() === role) {
+        return agent;
+      }
+    }
+    return undefined;
+  }
+
+  assignSkillToAgent(memberId: string, skillName: string): void {
+    const agent = this.agentInstances.get(memberId);
+    if (agent && agent.addSkill) {
+      agent.addSkill(skillName);
+    }
+  }
+
+  getAgentSkills(memberId: string): string[] {
+    const agent = this.agentInstances.get(memberId);
+    if (agent && agent.getSkills) {
+      return agent.getSkills();
+    }
+    return [];
   }
 }
 

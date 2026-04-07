@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import { Command } from 'commander';
 import { promises as fs } from 'fs';
+import { fileURLToPath } from 'url';
 import * as path from 'path';
 import * as os from 'os';
 import { configManager } from '../core/config.js';
@@ -21,8 +22,12 @@ import type { Organization } from '../core/organization/index.js';
 import { createAgentCat, AgentCat } from '../core/companion/index.js';
 import { UserProfileManager, userProfileManager } from '../core/user-profile.js';
 import { ContentModerator, contentModerator } from '../core/content-moderator.js';
+import { createDirectActionRouter, DirectActionRouter } from '../core/direct-action-router.js';
+import { parseOnboardingInput } from '../core/onboarding.js';
 import { PermissionManager, permissionManager } from '../core/permission-manager.js';
 import { Planner } from '../core/planner.js';
+import { createTaskManager, TaskManager } from '../core/task-manager.js';
+import { createCronManager, CronManager } from '../core/cron-manager.js';
 import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import * as readline from 'readline';
@@ -35,6 +40,16 @@ const logo = `
 `;
 
 export class CLI {
+  private static readonly SLASH_COMMANDS = [
+    '/?', '/help', '/h', '/quit', '/exit', '/bye', '/q',
+    '/clear', '/cls', '/history', '/hi', '/tools', '/t',
+    '/config', '/c', '/model', '/m', '/workspace', '/w',
+    '/reset', '/r', '/new', '/sessions', '/load', '/mcp',
+    '/lsp', '/skill', '/skills', '/org', '/team', '/cat',
+    '/progress', '/p', '/memory', '/templates', '/profile',
+    '/wipe', '/perm', '/permission', '/cron',
+  ];
+
   private agent?: Agent;
   private llm?: LLMProviderInterface;
   private currentProvider = 'ollama';
@@ -57,14 +72,21 @@ export class CLI {
   private userProfile?: UserProfileManager;
   private moderator?: ContentModerator;
   private permissionMgr?: PermissionManager;
+  private directActionRouter?: DirectActionRouter;
+  private taskManager?: TaskManager;
+  private cronManager?: CronManager;
   private isFirstInteraction = true;
+  private awaitingOnboardingInput = false;
   private permissionHandlerSetup = false;
+  private activePlannedTaskId?: string;
+  private inputHistoryPath: string;
 
   constructor() {
     this.mcpManager = new MCPManager();
     this.lspManager = new LSPManager();
     this.skillManager = createSkillManager();
     this.workspace = process.cwd();
+    this.inputHistoryPath = path.join(os.homedir(), '.ai-agent-cli', 'input-history.json');
   }
 
   async initialize(): Promise<void> {
@@ -77,13 +99,23 @@ export class CLI {
     await this.memoryManager.initialize();
     printSuccess('Memory manager ready');
 
+    await this.loadInputHistory();
+
+    this.enhancedMemory = createEnhancedMemoryManager();
+    await this.enhancedMemory.initialize();
+    printSuccess('Enhanced memory ready');
+
     this.userProfile = userProfileManager;
     await this.userProfile.initialize();
     const profile = this.userProfile.getProfile();
     if (profile) {
+      this.isFirstInteraction = false;
+      this.awaitingOnboardingInput = false;
       printSuccess('User profile loaded');
+      this.syncProfileToEnhancedMemory();
     } else {
       this.isFirstInteraction = true;
+      this.awaitingOnboardingInput = true;
     }
 
     this.moderator = contentModerator;
@@ -91,6 +123,14 @@ export class CLI {
     this.permissionMgr = permissionManager;
     await this.permissionMgr.initialize();
     this.setupPermissionHandler();
+
+    this.taskManager = createTaskManager();
+    await this.taskManager.initialize();
+    printSuccess('Task manager ready');
+
+    this.cronManager = createCronManager();
+    await this.cronManager.initialize();
+    printSuccess('Cron manager ready');
 
     this.currentProvider = config.defaultProvider || 'ollama';
     
@@ -149,8 +189,35 @@ export class CLI {
       printSuccess(skills.length + ' skills loaded');
     }
 
-    this.builtInTools = new BuiltInTools(this.sandbox, this.lspManager);
+    this.builtInTools = new BuiltInTools(this.sandbox, this.lspManager, {
+      mcpManager: this.mcpManager,
+      taskManager: this.taskManager,
+      cronManager: this.cronManager,
+    });
     printSuccess(this.builtInTools.getTools().length + ' built-in tools');
+
+    this.cronManager.setExecutor((toolName, args) => this.builtInTools!.executeTool(toolName, args));
+    this.cronManager.setNotifier(async ({ job, result }) => {
+      const content = this.getToolResultDisplayText(result) || '(无输出)';
+      console.log();
+      console.log(chalk.magenta(`[Cron] ${job.name}`));
+      if (result.is_error) {
+        printError(content);
+      } else {
+        console.log(chalk.gray(`schedule: ${job.schedule} -> ${job.toolName}`));
+        console.log(content);
+      }
+      console.log();
+    });
+    this.cronManager.start();
+
+    this.directActionRouter = createDirectActionRouter({
+      builtInTools: this.builtInTools,
+      skillManager: this.skillManager,
+      permissionManager: this.permissionMgr,
+      workspace: this.workspace,
+      config,
+    });
 
     if (config.mcp && config.mcp.length > 0) {
       console.log(chalk.gray('Connecting to MCP servers...'));
@@ -182,9 +249,20 @@ export class CLI {
       lspManager: this.lspManager,
       sandbox: this.sandbox,
       builtInTools: this.builtInTools,
+      skillManager: this.skillManager,
       maxIterations: config.maxIterations,
       planner: new Planner({ llm: this.llm! }),
     });
+
+    const restoredMessages = this.memoryManager.getMessages();
+    if (restoredMessages.length > 0) {
+      this.agent.setMessages(restoredMessages);
+      printInfo(`Resumed session: ${this.memoryManager.getCurrentSessionId()} (${restoredMessages.length} messages)`);
+    }
+
+    if (this.awaitingOnboardingInput) {
+      await this.showWelcomeQuestions();
+    }
 
     console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
   }
@@ -230,7 +308,27 @@ export class CLI {
         if (input.startsWith('/')) {
           await this.handleCommand(input);
         } else {
-          await this.handleMessage(input);
+          if (this.awaitingOnboardingInput) {
+            await this.handleOnboardingInput(input);
+            continue;
+          }
+
+          const confirmationStatus = this.agent?.getConfirmationStatus();
+          if (confirmationStatus?.pending) {
+            const isConfirmed = input.toLowerCase() === '是' || input.toLowerCase() === 'yes' || input.toLowerCase() === 'y';
+            console.log(chalk.cyan(isConfirmed ? '✅ 确认执行计划...' : '❌ 取消执行'));
+            const result = await this.agent?.confirmAction(isConfirmed);
+            if (!isConfirmed) {
+              this.failTrackedTask('用户取消执行计划');
+            }
+            if (result) {
+              console.log(chalk.green('\nAssistant: '));
+              await this.streamResponse(result);
+              console.log();
+            }
+          } else {
+            await this.handleMessage(input);
+          }
         }
       } catch (error) {
         if (error instanceof Error && error.message === 'Exit') {
@@ -246,13 +344,115 @@ export class CLI {
       const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
+        historySize: 200,
+        removeHistoryDuplicates: false,
+        completer: (line: string) => this.completeInput(line),
       });
+
+      const historyEnabledRl = rl as unknown as { history: string[] };
+      historyEnabledRl.history = this.getReadlineHistory();
       rl.on('close', () => {});
       rl.question(chalk.blue('> '), (answer) => {
         rl.close();
-        resolve(answer.trim());
+
+        const trimmed = answer.trim();
+        if (trimmed.length > 0) {
+          this.recordHistory(trimmed);
+        }
+
+        resolve(trimmed);
       });
     });
+  }
+
+  private completeInput(line: string): [string[], string] {
+    if (!line.startsWith('/')) {
+      return [[], line];
+    }
+
+    const candidates = this.getCompletionCandidates(line);
+    const matches = candidates
+      .filter(command => command.startsWith(line))
+      .sort((left, right) => left.localeCompare(right));
+
+    return [matches.length > 0 ? matches : candidates, line];
+  }
+
+  private getCompletionCandidates(line: string): string[] {
+    const trimmed = line.trimStart();
+    const tokens = trimmed.split(/\s+/).filter(Boolean);
+    const command = tokens[0] || '';
+
+    if (tokens.length <= 1 && !trimmed.endsWith(' ')) {
+      return CLI.SLASH_COMMANDS;
+    }
+
+    const providers = ['ollama', 'deepseek', 'kimi', 'glm', 'doubao', 'minimax', 'openai', 'claude', 'gemini'];
+    const staticCandidates: Record<string, string[]> = {
+      '/model': ['/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
+      '/m': ['/m', '/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
+      '/mcp': ['/mcp list', '/mcp tools'],
+      '/lsp': ['/lsp list', '/lsp status'],
+      '/skill': ['/skill list', '/skill ls', '/skill install', '/skill add', '/skill uninstall', '/skill remove', '/skill enable', '/skill disable'],
+      '/skills': ['/skills list', '/skills install', '/skills uninstall', '/skills enable', '/skills disable'],
+      '/org': ['/org view', '/org load', '/org mode', '/org workflow', '/org help'],
+      '/team': ['/team view', '/team load', '/team mode', '/team workflow', '/team help'],
+      '/memory': ['/memory long', '/memory short', '/memory clear'],
+      '/profile': ['/profile view', '/profile set job', '/profile set purpose', '/profile set interests', '/profile personality', '/profile style'],
+      '/perm': [
+        '/perm view', '/perm grant', '/perm revoke', '/perm revokeall',
+        '/perm group', '/perm group grant', '/perm group revoke',
+        '/perm audit', '/perm trust', '/perm allow', '/perm deny', '/perm auto', '/perm ask',
+      ],
+      '/permission': [
+        '/permission view', '/permission grant', '/permission revoke', '/permission revokeall',
+        '/permission group', '/permission group grant', '/permission group revoke',
+        '/permission audit', '/permission trust', '/permission allow', '/permission deny', '/permission auto', '/permission ask',
+      ],
+      '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron delete', '/cron run-due'],
+      '/load': ['/load'],
+      '/workspace': ['/workspace'],
+    };
+
+    return staticCandidates[command] || CLI.SLASH_COMMANDS;
+  }
+
+  private getReadlineHistory(): string[] {
+    return [...this.cmdHistory].reverse();
+  }
+
+  private recordHistory(input: string): void {
+    const lastEntry = this.cmdHistory[this.cmdHistory.length - 1];
+    if (lastEntry === input) {
+      this.historyIndex = this.cmdHistory.length - 1;
+      return;
+    }
+
+    this.cmdHistory.push(input);
+    if (this.cmdHistory.length > 200) {
+      this.cmdHistory = this.cmdHistory.slice(-200);
+    }
+    this.historyIndex = this.cmdHistory.length - 1;
+    this.saveInputHistory().catch(() => {});
+  }
+
+  private async loadInputHistory(): Promise<void> {
+    try {
+      const raw = await fs.readFile(this.inputHistoryPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        this.cmdHistory = parsed.filter(item => typeof item === 'string').slice(-200);
+        this.historyIndex = this.cmdHistory.length - 1;
+      }
+    } catch {
+      this.cmdHistory = [];
+      this.historyIndex = -1;
+    }
+  }
+
+  private async saveInputHistory(): Promise<void> {
+    await fs.mkdir(path.dirname(this.inputHistoryPath), { recursive: true });
+    await fs.writeFile(this.inputHistoryPath, JSON.stringify(this.cmdHistory.slice(-200), null, 2), 'utf-8');
   }
 
   private async handleCommand(input: string): Promise<void> {
@@ -363,15 +563,15 @@ export class CLI {
       case 'permission':
         this.handlePermissionCommand(args);
         break;
+      case 'cron':
+        await this.handleCronCommand(args);
+        break;
       default:
         console.log(chalk.yellow(`Unknown command: ${command}. Type /? for help.`));
     }
   }
 
   private async handleMessage(input: string): Promise<void> {
-    this.cmdHistory.push(input);
-    this.historyIndex = this.cmdHistory.length;
-
     const moderationResult = this.moderator?.moderateUserInput(input);
     if (moderationResult) {
       if (!moderationResult.allowed) {
@@ -386,13 +586,31 @@ export class CLI {
       this.moderator?.recordWarning(input);
     }
 
-    if (this.isFirstInteraction && this.userProfile) {
-      this.showWelcomeQuestions();
-      this.isFirstInteraction = false;
+    this.userProfile?.recordInteraction();
+
+    const directResult = await this.directActionRouter?.tryHandle(input);
+    if (directResult?.handled) {
+      if (this.agent) {
+        this.agent.appendMessages([
+          { role: 'user', content: input },
+          { role: 'assistant', content: directResult.output || '(无输出)' },
+        ]);
+        this.memoryManager.setMessages(this.agent.getMessages());
+      }
+
+      console.log();
+      if (directResult.title) {
+        console.log(chalk.cyan(directResult.title));
+      }
+      if (directResult.isError) {
+        printError(directResult.output || 'Direct action failed');
+      } else {
+        console.log(chalk.green('\nAssistant: '));
+        await this.streamResponse(directResult.output || '(无输出)');
+      }
+      console.log();
       return;
     }
-
-    this.userProfile?.recordInteraction();
 
     if (this.organizationMode && this.organization) {
       await this.handleOrganizationMessage(input);
@@ -421,20 +639,31 @@ export class CLI {
           console.log(chalk.cyan('\n🔧 ' + event.content));
           break;
         case 'tool_result':
+          console.log(chalk.cyan('\n[工具结果]'));
           if (event.toolResult?.is_error) {
-            printError(event.toolResult.output || 'Tool execution failed');
+            printError(this.getToolResultDisplayText(event.toolResult) || 'Tool execution failed');
           } else {
-            const output = event.toolResult?.output || '';
-            if (output.length > 200) {
-              console.log(chalk.gray(output.slice(0, 200) + '...'));
-            } else if (output) {
-              console.log(chalk.gray(output));
+            const output = this.getToolResultDisplayText(event.toolResult);
+            if (output.length > 0) {
+              console.log(chalk.green('--- 工具输出 START ---'));
+              console.log(output);
+              console.log(chalk.green('--- 工具输出 END ---'));
+            } else {
+              console.log(chalk.gray('(无输出)'));
             }
           }
           break;
+        case 'plan_summary':
+          this.trackPlannedTask(event);
+          break;
+        case 'plan_progress':
+          this.updateTrackedTaskFromPlanEvent(event);
+          break;
         case 'response':
+          this.completeTrackedTaskIfNeeded(event.content);
           break;
         case 'error':
+          this.failTrackedTask(event.content);
           printError(event.content);
           break;
       }
@@ -442,6 +671,7 @@ export class CLI {
 
     try {
       const response = await this.agent.chat(input);
+      this.memoryManager.setMessages(this.agent.getMessages());
       this.streamingOutput.clear();
       console.log(chalk.green('\nAssistant: '));
       await this.streamResponse(response);
@@ -471,6 +701,134 @@ export class CLI {
     console.log(chalk.gray('或者输入 ') + chalk.cyan('/profile') + chalk.gray(' 稍后设置\n'));
   }
 
+  private async handleOnboardingInput(input: string): Promise<void> {
+    this.awaitingOnboardingInput = false;
+    this.isFirstInteraction = false;
+
+    const onboarding = parseOnboardingInput(input);
+    if (!this.userProfile?.getProfile()) {
+      if (onboarding) {
+        await this.userProfile?.createProfile(onboarding);
+        printSuccess('已根据首条输入创建用户档案');
+      } else {
+        await this.userProfile?.createProfile();
+        printInfo('已创建默认用户档案，可稍后用 /profile 补充信息');
+      }
+      this.syncProfileToEnhancedMemory();
+      return;
+    }
+
+    if (onboarding) {
+      await this.userProfile?.updateFromOnboarding(onboarding);
+      printSuccess('已更新用户档案');
+      this.syncProfileToEnhancedMemory();
+    }
+  }
+
+  private syncProfileToEnhancedMemory(): void {
+    if (!this.enhancedMemory || !this.userProfile) return;
+
+    const profile = this.userProfile.getProfile();
+    if (!profile) return;
+
+    if (profile.job) {
+      this.enhancedMemory.setUserPreference('job', profile.job);
+    }
+    if (profile.purpose) {
+      this.enhancedMemory.setUserPreference('purpose', profile.purpose);
+    }
+    this.enhancedMemory.setUserPreference('personality', profile.preferences.personality);
+    this.enhancedMemory.setUserPreference('communicationStyle', profile.preferences.communicationStyle);
+  }
+
+  private getToolResultDisplayText(toolResult?: { output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }): string {
+    if (!toolResult) return '';
+    if (toolResult.output) return toolResult.output;
+    if (toolResult.content) {
+      return toolResult.content
+        .filter(item => item.type === 'text' && typeof item.text === 'string')
+        .map(item => item.text || '')
+        .join('\n');
+    }
+    return '';
+  }
+
+  private trackPlannedTask(event: AgentEvent): void {
+    if (!this.enhancedMemory || !event.plan) return;
+
+    const stepDescriptions = event.plan.steps.map(step => step.description);
+    const progress = this.enhancedMemory.createTaskProgress(event.plan.originalTask, stepDescriptions);
+    this.activePlannedTaskId = progress.taskId;
+    this.enhancedMemory.updateTaskProgress(progress.taskId, {
+      status: 'in_progress',
+      currentStep: stepDescriptions[0],
+    });
+  }
+
+  private completeTrackedTaskIfNeeded(content: string): void {
+    if (!this.enhancedMemory || !this.activePlannedTaskId) return;
+    if (!content.startsWith('## ✅ 任务完成')) return;
+
+    const task = this.enhancedMemory.getTaskProgress(this.activePlannedTaskId);
+    if (!task) return;
+
+    this.enhancedMemory.completeTask(this.activePlannedTaskId, content);
+    this.enhancedMemory.updateTaskProgress(this.activePlannedTaskId, {
+      completedSteps: [...task.completedSteps, ...task.pendingSteps],
+      pendingSteps: [],
+      currentStep: undefined,
+    });
+    this.activePlannedTaskId = undefined;
+  }
+
+  private failTrackedTask(error: string): void {
+    if (!this.enhancedMemory || !this.activePlannedTaskId) return;
+    this.enhancedMemory.failTask(this.activePlannedTaskId, error);
+    this.activePlannedTaskId = undefined;
+  }
+
+  private updateTrackedTaskFromPlanEvent(event: AgentEvent): void {
+    if (!this.enhancedMemory || !this.activePlannedTaskId || !event.planProgress) return;
+
+    const task = this.enhancedMemory.getTaskProgress(this.activePlannedTaskId);
+    if (!task) return;
+
+    const allSteps = Array.from(new Set([...task.completedSteps, ...task.pendingSteps]));
+    const stepIndex = event.planProgress.stepIndex;
+    const completedSteps = allSteps.filter((_, index) => index < stepIndex);
+    const pendingSteps = allSteps.filter((_, index) => index >= stepIndex);
+
+    if (event.planProgress.status === 'started') {
+      this.enhancedMemory.updateTaskProgress(this.activePlannedTaskId, {
+        status: 'in_progress',
+        currentStep: event.planProgress.stepDescription,
+        completedSteps,
+        pendingSteps,
+      });
+      return;
+    }
+
+    if (event.planProgress.status === 'completed') {
+      this.enhancedMemory.updateTaskProgress(this.activePlannedTaskId, {
+        status: 'in_progress',
+        currentStep: pendingSteps[1],
+        completedSteps: allSteps.filter((_, index) => index <= stepIndex),
+        pendingSteps: allSteps.filter((_, index) => index > stepIndex),
+      });
+      return;
+    }
+
+    if (event.planProgress.status === 'failed') {
+      this.enhancedMemory.updateTaskProgress(this.activePlannedTaskId, {
+        status: 'failed',
+        currentStep: event.planProgress.stepDescription,
+        completedSteps,
+        pendingSteps,
+        error: event.planProgress.result,
+      });
+    }
+  }
+
   private async handleOrganizationMessage(input: string): Promise<void> {
     if (!this.organization) {
       printError('Organization not loaded');
@@ -482,6 +840,13 @@ export class CLI {
 
     try {
       const response = await this.organization.processUserInput(input);
+      if (this.agent) {
+        this.agent.appendMessages([
+          { role: 'user', content: input },
+          { role: 'assistant', content: response },
+        ]);
+        this.memoryManager.setMessages(this.agent.getMessages());
+      }
       this.streamingOutput?.clear();
       console.log(chalk.green('\n--- Result ---\n'));
       await this.streamResponse(response);
@@ -666,7 +1031,18 @@ export class CLI {
     const subcommand = args[0]?.toLowerCase();
 
     if (!this.userProfile) {
-      printError('User profile not initialized');
+      printError('用户档案未初始化');
+      return;
+    }
+
+    if (!this.userProfile.getProfile()) {
+      console.log(chalk.cyan('\n👋 欢迎设置用户档案！\n'));
+      console.log(chalk.gray('请告诉我一些关于您的信息：\n'));
+      console.log(chalk.cyan('1. 您的工作是？') + chalk.gray(' (如：学生、程序员、产品经理...)'));
+      console.log(chalk.cyan('2. 您主要用 coolAI 来做什么？') + chalk.gray(' (如：编程、写文章、数据处理...)'));
+      console.log(chalk.cyan('3. 您喜欢什么性格？') + chalk.gray(' (专业/友好/幽默/温柔/活力)\n'));
+      console.log(chalk.gray('直接输入您的信息，例如：'));
+      console.log(chalk.gray('  我是程序员，主要用来写代码，喜欢幽默风格\n'));
       return;
     }
 
@@ -925,7 +1301,9 @@ ${chalk.gray('权限组:')}
     console.log(`新会话: ${chalk.cyan(this.memoryManager.getCurrentSessionId())}`);
     console.log(chalk.gray('\n旧会话已存档，可以随时通过 /load <id> 加载回\n'));
     
-    this.isFirstInteraction = true;
+    const hasProfile = !!this.userProfile?.getProfile();
+    this.isFirstInteraction = !hasProfile;
+    this.awaitingOnboardingInput = !hasProfile;
   }
 
   private async wipeUserData(): Promise<void> {
@@ -949,9 +1327,11 @@ ${chalk.gray('权限组:')}
     
     if (answer.toLowerCase() === 'yes') {
       await this.userProfile?.reset();
+      this.syncProfileToEnhancedMemory();
       this.memoryManager.clearHistory();
       this.agent?.clearMessages();
-      this.isFirstInteraction = true;
+      this.isFirstInteraction = false;
+      this.awaitingOnboardingInput = false;
       printSuccess('所有用户数据已清除');
     } else {
       printInfo('取消操作');
@@ -1125,6 +1505,7 @@ ${chalk.bold('Quick Commands:')}
   ${chalk.cyan('/tools')}    ${chalk.gray('List tools')}
   ${chalk.cyan('/model')}    ${chalk.gray('Show/change model')}
   ${chalk.cyan('/sessions')} ${chalk.gray('Show sessions')}
+  ${chalk.cyan('/cron')}     ${chalk.gray('Manage cron jobs')}
   ${chalk.cyan('/reset')}    ${chalk.gray('Clear chat')}
 `);
   }
@@ -1151,8 +1532,241 @@ ${chalk.cyan('/load')} <id>        Load a previous session
 ${chalk.cyan('/mcp')}              Manage MCP servers
 ${chalk.cyan('/lsp')}              Manage LSP servers
 ${chalk.cyan('/skill')}            Manage skills
+${chalk.cyan('/cron')}             Manage cron jobs
 ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
 `);
+  }
+
+  private async handleCronCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.cronManager || !this.builtInTools) {
+      printError('Cron manager not initialized');
+      return;
+    }
+
+    switch (subcommand) {
+      case undefined:
+      case 'list': {
+        const jobs = this.cronManager.listJobs();
+        console.log(chalk.bold('\nCron Jobs:\n'));
+        if (jobs.length === 0) {
+          console.log(chalk.gray('No cron jobs found.'));
+        } else {
+          for (const job of jobs) {
+            console.log(chalk.cyan(`  • ${job.name}`) + chalk.gray(` (${job.id})`));
+            console.log(`    schedule: ${job.schedule}`);
+            console.log(`    tool: ${job.toolName}`);
+            if (job.description) {
+              console.log(chalk.gray(`    ${job.description}`));
+            }
+            if (job.nextRunAt) {
+              console.log(chalk.gray(`    next: ${new Date(job.nextRunAt).toLocaleString()}`));
+            }
+            console.log();
+          }
+        }
+        break;
+      }
+      case 'create': {
+        const name = args[1];
+        const parsed = this.parseCronCreateArgs(args.slice(2));
+
+        if (!name || !parsed) {
+          printError('Usage: /cron create <name> <schedule> <tool> [jsonArgs]');
+          return;
+        }
+
+        const { schedule, tool, rawArgs } = parsed;
+
+        let parsedArgs: Record<string, unknown> = {};
+        if (rawArgs) {
+          try {
+            parsedArgs = JSON.parse(rawArgs);
+          } catch {
+            printError('Invalid JSON args for /cron create');
+            return;
+          }
+        }
+
+        const result = await this.builtInTools.executeTool('cron_create', {
+          name,
+          schedule,
+          tool,
+          args: parsedArgs,
+        });
+
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to create cron job');
+        } else {
+          printSuccess(`Cron job created: ${name}`);
+          console.log(this.getToolResultDisplayText(result));
+        }
+        break;
+      }
+      case 'create-news': {
+        const name = args[1];
+        const newsType = args[2]?.toLowerCase();
+        const parsed = this.parseCronNewsArgs(args.slice(3));
+
+        if (!name || !newsType || !parsed) {
+          printError('Usage: /cron create-news <name> <morning|evening|hot> <schedule> [timezone]');
+          return;
+        }
+
+        const { schedule, timezone } = parsed;
+
+        const mapping: Record<string, { tool: string; args?: Record<string, unknown>; description: string }> = {
+          morning: { tool: 'tencent_morning_news', description: 'Tencent morning news push' },
+          evening: { tool: 'tencent_evening_news', description: 'Tencent evening news push' },
+          hot: { tool: 'tencent_hot_news', args: { limit: 10 }, description: 'Tencent hot news push' },
+        };
+
+        const preset = mapping[newsType];
+        if (!preset) {
+          printError('Unknown news type. Use morning, evening, or hot.');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('cron_create', {
+          name,
+          schedule,
+          tool: preset.tool,
+          args: preset.args || {},
+          description: preset.description,
+          timezone,
+        });
+
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to create news cron job');
+        } else {
+          printSuccess(`News cron job created: ${name}`);
+          console.log(this.getToolResultDisplayText(result));
+        }
+        break;
+      }
+      case 'delete': {
+        const idOrName = args[1];
+        if (!idOrName) {
+          printError('Usage: /cron delete <idOrName>');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('cron_delete', { idOrName });
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to delete cron job');
+        } else {
+          printSuccess(`Cron job deleted: ${idOrName}`);
+        }
+        break;
+      }
+      case 'run-due': {
+        await this.cronManager.runDueJobs(new Date());
+        printSuccess('Triggered due cron jobs check');
+        break;
+      }
+      case 'help':
+      default:
+        console.log(`
+${chalk.bold('Cron Commands:')}
+${chalk.cyan('/cron')}                         查看 cron 列表
+${chalk.cyan('/cron list')}                    列出 cron 任务
+${chalk.cyan('/cron create')} <name> <schedule> <tool> [jsonArgs]
+${chalk.cyan('/cron create-news')} <name> <morning|evening|hot> <schedule> [timezone]
+${chalk.cyan('/cron delete')} <idOrName>      删除 cron 任务
+${chalk.cyan('/cron run-due')}                立即检查当前到期任务
+
+${chalk.gray('示例:')}
+${chalk.gray('/cron create-news morning-brief morning 0 8 * * * Asia/Shanghai')}
+${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
+`);
+    }
+  }
+
+  async runCronDaemon(runOnce = false): Promise<void> {
+    if (!this.cronManager) {
+      throw new Error('Cron manager not initialized');
+    }
+
+    const jobs = this.cronManager.listJobs();
+    console.log(chalk.bold('\nCron Runner\n'));
+    console.log(chalk.gray(`Loaded ${jobs.length} cron job(s).`));
+    if (jobs.length > 0) {
+      for (const job of jobs) {
+        console.log(chalk.cyan(`  • ${job.name}`) + chalk.gray(` -> ${job.toolName} @ ${job.schedule}`));
+      }
+    }
+    console.log();
+
+    await this.cronManager.runDueJobs(new Date());
+    if (runOnce) {
+      return;
+    }
+
+    console.log(chalk.gray('Cron daemon is running. Press Ctrl+C to stop.\n'));
+    return new Promise(() => {});
+  }
+
+  private parseCronCreateArgs(args: string[]): { schedule: string; tool: string; rawArgs: string } | null {
+    if (args.length < 2) {
+      return null;
+    }
+
+    if (args[0]?.startsWith('@')) {
+      const schedule = args[0];
+      const tool = args[1];
+      if (!schedule || !tool) {
+        return null;
+      }
+
+      return {
+        schedule: this.normalizeCronToken(schedule),
+        tool,
+        rawArgs: args.slice(2).join(' ').trim(),
+      };
+    }
+
+    if (args.length < 6) {
+      return null;
+    }
+
+    const schedule = args.slice(0, 5).join(' ');
+    const tool = args[5];
+    if (!tool) {
+      return null;
+    }
+
+    return {
+      schedule: this.normalizeCronToken(schedule),
+      tool,
+      rawArgs: args.slice(6).join(' ').trim(),
+    };
+  }
+
+  private parseCronNewsArgs(args: string[]): { schedule: string; timezone?: string } | null {
+    if (args.length === 0) {
+      return null;
+    }
+
+    if (args[0]?.startsWith('@')) {
+      return {
+        schedule: this.normalizeCronToken(args[0]),
+        timezone: args[1],
+      };
+    }
+
+    if (args.length < 5) {
+      return null;
+    }
+
+    return {
+      schedule: this.normalizeCronToken(args.slice(0, 5).join(' ')),
+      timezone: args[5],
+    };
+  }
+
+  private normalizeCronToken(value: string): string {
+    return value.replace(/^['"]|['"]$/g, '');
   }
 
   private showHistory(): void {
@@ -1540,6 +2154,7 @@ ${chalk.bold('Organization Roles:')}
   }
 
   async shutdown(): Promise<void> {
+    this.cronManager?.stop();
     await this.mcpManager.disconnectAll();
     await this.lspManager.disconnectAll();
     await this.sandbox.cleanup();
@@ -1556,6 +2171,8 @@ export async function runCLI(): Promise<void> {
     .option('-c, --config <path>', 'Path to configuration file')
     .option('-m, --model <name>', 'Model to use')
     .option('-w, --workspace <path>', 'Workspace directory')
+    .option('--cron-daemon', 'Run only the cron scheduler in the foreground')
+    .option('--cron-once', 'Run a single due-jobs check and exit')
     .parse(process.argv);
 
   const options = program.opts();
@@ -1581,10 +2198,25 @@ export async function runCLI(): Promise<void> {
   });
 
   await cli.initialize();
+  if (options.cronOnce) {
+    await cli.runCronDaemon(true);
+    await cli.shutdown();
+    return;
+  }
+
+  if (options.cronDaemon) {
+    await cli.runCronDaemon(false);
+    return;
+  }
+
   await cli.run();
 }
 
-runCLI().catch(err => {
-  printError('Fatal error: ' + (err instanceof Error ? err.message : String(err)));
-  process.exit(1);
-});
+const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url);
+
+if (isDirectExecution) {
+  runCLI().catch(err => {
+    printError('Fatal error: ' + (err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  });
+}

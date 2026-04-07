@@ -166,6 +166,26 @@ class ConfigManager {
       throw new Error(`Failed to save config to ${path}: ${error}`);
     }
   }
+
+  async savePartial(key: keyof ConfigSchema, value: any): Promise<void> {
+    try {
+      let content = '';
+      try {
+        content = await fs.readFile(this.configPath, 'utf-8');
+      } catch {
+        return;
+      }
+      const { parse, stringify } = await import('yaml');
+      const existingConfig = parse(content) || {};
+      
+      existingConfig[key] = value;
+      
+      await fs.writeFile(this.configPath, stringify(existingConfig), 'utf-8');
+      this.config = { ...this.config, [key]: value };
+    } catch (error) {
+      console.error('Failed to save config:', error);
+    }
+  }
 }
 
 export const configManager = new ConfigManager();

@@ -89,6 +89,15 @@ const toolPermissionMappings: ToolPermissionMapping[] = [
     permissionType: 'file_read',
     resourceExtractor: (args) => args.path as string | undefined,
   },
+  {
+    toolPattern: /^(agent_send_message|task_create|task_get_list|task_update|task_stop|task_output|team_create|team_delete|list_peers|todo_write|cron_create|cron_delete|cron_list|config|skill_config)$/,
+    permissionType: 'tool_execute',
+  },
+  {
+    toolPattern: /^(mcp_list|mcp_resources|read_mcp_resource|mcp_auth)$/,
+    permissionType: 'mcp_access',
+    resourceExtractor: (args) => (args.server as string | undefined) || (args.uri as string | undefined),
+  },
 ];
 
 export interface PermissionCheck {
