@@ -25,11 +25,13 @@ import { ContentModerator, contentModerator } from '../core/content-moderator.js
 import { createDirectActionRouter, DirectActionRouter } from '../core/direct-action-router.js';
 import { parseOnboardingInput } from '../core/onboarding.js';
 import { PermissionManager, permissionManager } from '../core/permission-manager.js';
-import { Planner } from '../core/planner.js';
+import { createPlanner } from '../core/planner.js';
 import { createTaskManager, TaskManager } from '../core/task-manager.js';
 import { createCronManager, CronManager } from '../core/cron-manager.js';
+import { createMemoryProvider, type MemoryProvider } from '../core/memory-provider.js';
 import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
+import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
 import * as readline from 'readline';
 
 const logo = `
@@ -59,6 +61,7 @@ export class CLI {
   private skillManager: ReturnType<typeof createSkillManager>;
   private memoryManager!: MemoryManager;
   private enhancedMemory?: EnhancedMemoryManager;
+  private memoryProvider?: MemoryProvider;
   private builtInTools?: BuiltInTools;
   private workspace: string;
   private running = true;
@@ -81,6 +84,7 @@ export class CLI {
   private activePlannedTaskId?: string;
   private activeProgressDisplayTaskId?: string;
   private inputHistoryPath: string;
+  private newsOutputDir: string;
 
   constructor() {
     this.mcpManager = new MCPManager();
@@ -88,6 +92,7 @@ export class CLI {
     this.skillManager = createSkillManager();
     this.workspace = process.cwd();
     this.inputHistoryPath = path.join(os.homedir(), '.ai-agent-cli', 'input-history.json');
+    this.newsOutputDir = path.join(os.homedir(), '.ai-agent-cli', 'outputs', 'tencent-news');
   }
 
   async initialize(): Promise<void> {
@@ -174,6 +179,17 @@ export class CLI {
     if (!sandboxConfig.allowedPaths) {
       sandboxConfig.allowedPaths = [config.workspace || process.cwd()];
     }
+    const artifactOutputDir = getArtifactOutputDir({
+      workspace: this.workspace,
+      artifactOutputDir: config.artifactOutputDir,
+      documentOutputDir: config.documentOutputDir,
+    });
+    const desktopPath = getDesktopPath();
+    for (const extraPath of [artifactOutputDir, desktopPath]) {
+      if (!sandboxConfig.allowedPaths.includes(extraPath)) {
+        sandboxConfig.allowedPaths.push(extraPath);
+      }
+    }
     const permConfig = this.permissionMgr.getConfig();
     for (const allowedPath of permConfig.allowedPaths) {
       if (!sandboxConfig.allowedPaths.includes(allowedPath)) {
@@ -183,6 +199,7 @@ export class CLI {
     this.sandbox = new Sandbox(sandboxConfig);
     await this.sandbox.initialize();
     printSuccess('Sandbox ready');
+    printInfo(`当前 artifact 输出目录: ${artifactOutputDir}`);
 
     await this.skillManager.initialize();
     const skills = await this.skillManager.listSkills();
@@ -194,6 +211,8 @@ export class CLI {
       mcpManager: this.mcpManager,
       taskManager: this.taskManager,
       cronManager: this.cronManager,
+      workspace: this.workspace,
+      config: config as unknown as Record<string, unknown>,
     });
     printSuccess(this.builtInTools.getTools().length + ' built-in tools');
 
@@ -218,6 +237,7 @@ export class CLI {
       permissionManager: this.permissionMgr,
       workspace: this.workspace,
       config,
+      getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
     });
 
     if (config.mcp && config.mcp.length > 0) {
@@ -230,6 +250,22 @@ export class CLI {
           printError('MCP server ' + mcpConfig.name + ': ' + (error instanceof Error ? error.message : String(error)));
         }
       }
+    }
+
+    if (this.enhancedMemory) {
+      this.memoryProvider = createMemoryProvider({
+        enhancedMemory: this.enhancedMemory,
+        mcpManager: this.mcpManager,
+        config: config.memory,
+        skillManager: this.skillManager,
+      });
+      printSuccess(`Memory provider ready (${this.memoryProvider.backend})`);
+      await this.memoryProvider.store({
+        kind: 'project',
+        key: 'artifact_output_dir',
+        title: 'artifact_output_dir',
+        content: artifactOutputDir,
+      });
     }
 
     if (config.lsp && config.lsp.length > 0) {
@@ -252,12 +288,16 @@ export class CLI {
       builtInTools: this.builtInTools,
       skillManager: this.skillManager,
       maxIterations: config.maxIterations,
-      planner: new Planner({ llm: this.llm! }),
+      maxToolCallsPerTurn: config.maxToolCallsPerTurn,
+      planner: createPlanner({ llm: this.llm!, memoryProvider: this.memoryProvider, skillManager: this.skillManager }),
+      memoryProvider: this.memoryProvider,
+      config: config as unknown as Record<string, unknown>,
     });
 
     const restoredMessages = this.memoryManager.getMessages();
     if (restoredMessages.length > 0) {
       this.agent.setMessages(restoredMessages);
+      await this.memoryProvider?.syncSession(restoredMessages);
       printInfo(`Resumed session: ${this.memoryManager.getCurrentSessionId()} (${restoredMessages.length} messages)`);
     }
 
@@ -321,6 +361,10 @@ export class CLI {
             const result = await this.agent?.confirmAction(isConfirmed);
             if (!isConfirmed) {
               this.failTrackedTask('用户取消执行计划');
+            }
+            if (this.agent) {
+              this.memoryManager.setMessages(this.agent.getMessages());
+              await this.memoryProvider?.syncSession(this.agent.getMessages());
             }
             if (result) {
               console.log(chalk.green('\nAssistant: '));
@@ -392,10 +436,10 @@ export class CLI {
     const staticCandidates: Record<string, string[]> = {
       '/model': ['/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
       '/m': ['/m', '/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
-      '/mcp': ['/mcp list', '/mcp tools', '/mcp check', '/mcp check mempalace'],
+      '/mcp': ['/mcp list', '/mcp tools', '/mcp check', '/mcp check mempalace', '/mcp check lark', '/mcp reconnect lark', '/mcp check obsidian'],
       '/lsp': ['/lsp list', '/lsp status'],
-      '/skill': ['/skill list', '/skill ls', '/skill install', '/skill add', '/skill uninstall', '/skill remove', '/skill enable', '/skill disable'],
-      '/skills': ['/skills list', '/skills install', '/skills uninstall', '/skills enable', '/skills disable'],
+      '/skill': ['/skill list', '/skill ls', '/skill candidates', '/skill drafts', '/skill todos', '/skill adopt', '/skill adopt-from-todo', '/skill install', '/skill add', '/skill uninstall', '/skill remove', '/skill enable', '/skill disable'],
+      '/skills': ['/skills list', '/skills candidates', '/skills adopt', '/skills adopt-from-todo', '/skills install', '/skills uninstall', '/skills enable', '/skills disable'],
       '/org': ['/org view', '/org load', '/org mode', '/org workflow', '/org help'],
       '/team': ['/team view', '/team load', '/team mode', '/team workflow', '/team help'],
       '/memory': ['/memory long', '/memory short', '/memory clear'],
@@ -410,8 +454,8 @@ export class CLI {
         '/permission group', '/permission group grant', '/permission group revoke',
         '/permission audit', '/permission trust', '/permission allow', '/permission deny', '/permission auto', '/permission ask',
       ],
-      '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron delete', '/cron run-due'],
-      '/news': ['/news hot', '/news search', '/news morning', '/news evening', '/news help'],
+      '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron create-news-lark', '/cron create-morning-feishu', '/cron create-morning-feishu-group', '/cron delete', '/cron run-due'],
+      '/news': ['/news hot', '/news search', '/news morning', '/news evening', '/news save hot', '/news save search', '/news save morning', '/news save evening', '/news push morning --user-id ou_xxx', '/news push hot --chat-id oc_xxx --limit 5', '/news output-dir', '/news help'],
       '/load': ['/load'],
       '/workspace': ['/workspace'],
     };
@@ -601,6 +645,7 @@ export class CLI {
           { role: 'assistant', content: directResult.output || '(无输出)' },
         ]);
         this.memoryManager.setMessages(this.agent.getMessages());
+        await this.memoryProvider?.syncSession(this.agent.getMessages());
       }
 
       console.log();
@@ -674,6 +719,15 @@ export class CLI {
             printWarning(`[MemPalace] ${event.content}`);
           }
           break;
+        case 'skill_learning':
+          printInfo(`${event.content}。可用 /skill candidates 查看，/skill adopt ${event.skillLearning?.candidateName || '<name>'} 转正启用。`);
+          if (event.skillLearning?.candidatePath) {
+            console.log(chalk.gray(`候选草稿: ${event.skillLearning.candidatePath}`));
+          }
+          break;
+        case 'skill_learning_todo':
+          printInfo(`${event.content}。可用 /skill todos 查看待学习清单。`);
+          break;
         case 'error':
           this.failTrackedTask(event.content);
           printError(event.content);
@@ -682,8 +736,33 @@ export class CLI {
     });
 
     try {
-      const response = await this.agent.chat(input);
+      const config = configManager.getAgentConfig();
+      const recallLimit = configManager.get('memory')?.recallLimit || 6;
+      const memoryContext = await this.memoryProvider?.buildContext(input, recallLimit);
+      this.agent.setRuntimeMemoryContext(memoryContext || '');
+
+      let response = await this.agent.chat(input);
+      const autoContinueOnToolLimit = config.autoContinueOnToolLimit ?? true;
+      const maxContinuationTurns = config.maxContinuationTurns ?? 3;
+      let continuationTurns = 0;
+
+      while (autoContinueOnToolLimit && this.agent.needsContinuation() && continuationTurns < maxContinuationTurns) {
+        continuationTurns++;
+        printInfo(`当前响应达到单轮工具上限，自动继续第 ${continuationTurns}/${maxContinuationTurns} 轮...`);
+        const continuedResponse = await this.agent.continueResponse();
+        if (continuedResponse.trim()) {
+          response = response.trim()
+            ? `${response.trim()}\n${continuedResponse.trim()}`
+            : continuedResponse.trim();
+        }
+      }
+
+      if (this.agent.needsContinuation()) {
+        printWarning('当前任务在自动续跑后仍未完成。可直接回复“继续”，或调大 maxToolCallsPerTurn / maxContinuationTurns。');
+      }
+
       this.memoryManager.setMessages(this.agent.getMessages());
+      await this.memoryProvider?.syncSession(this.agent.getMessages());
       this.streamingOutput.clear();
       console.log(chalk.green('\nAssistant: '));
       await this.streamResponse(response);
@@ -1707,13 +1786,43 @@ ${chalk.cyan('/news hot')} [limit]             查看热榜新闻
 ${chalk.cyan('/news search')} <keyword> [limit] 搜索相关新闻
 ${chalk.cyan('/news morning')}                  查看早报
 ${chalk.cyan('/news evening')}                  查看晚报
+${chalk.cyan('/news save hot')} [limit]        保存热榜到本地输出目录
+${chalk.cyan('/news save search')} <keyword> [limit] 保存搜索结果到本地输出目录
+${chalk.cyan('/news save morning')}             保存早报到本地输出目录
+${chalk.cyan('/news save evening')}             保存晚报到本地输出目录
+${chalk.cyan('/news push')} <type> [flags]      抓取新闻并发送到飞书
+${chalk.cyan('/news output-dir')}               查看本地输出目录
 
 ${chalk.gray('示例:')}
 ${chalk.gray('/news hot 5')}
 ${chalk.gray('/news search AI 5')}
 ${chalk.gray('/news morning')}
+${chalk.gray('/news save hot 10')}
+${chalk.gray('/news push morning --save')}
 `);
         return;
+      case 'output-dir':
+        console.log();
+        console.log(chalk.cyan('Tencent News Output Directory'));
+        console.log(this.newsOutputDir);
+        console.log();
+        return;
+      case 'save':
+      case 'export': {
+        await this.handleNewsSaveCommand(args.slice(1));
+        return;
+      }
+      case 'push': {
+        const parsed = this.parseNewsPushArgs(args.slice(1));
+        if (!parsed) {
+          printError('Usage: /news push <morning|evening|hot|search> [--user-id <ou_xxx>] [--limit <n>] [--keyword <text>] [--title <text>] [--save] [--dry-run] [--timezone <Asia/Shanghai>]\n默认接收目标读取 notifications.lark.morningNews.chatId');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('push_news_to_lark', parsed);
+        this.displayDirectToolResult(result, '飞书新闻推送');
+        return;
+      }
       case 'hot': {
         const limit = Number.parseInt(args[1] || '10', 10);
         const result = await this.builtInTools.executeTool('tencent_hot_news', {
@@ -1751,7 +1860,218 @@ ${chalk.gray('/news morning')}
         return;
       }
       default:
-        printError('Usage: /news [hot [limit]|search <keyword> [limit]|morning|evening|help]');
+        printError('Usage: /news [hot [limit]|search <keyword> [limit]|morning|evening|save <subcommand>|push <type> [flags]|output-dir|help]');
+    }
+  }
+
+  private parseNewsPushArgs(args: string[]): {
+    newsType: 'hot' | 'search' | 'morning' | 'evening';
+    userId?: string;
+    chatId?: string;
+    keyword?: string;
+    limit?: number;
+    title?: string;
+    timezone?: string;
+    saveOutput?: boolean;
+    dryRun?: boolean;
+  } | null {
+    const newsType = args[0]?.toLowerCase();
+    if (!newsType || !['hot', 'search', 'morning', 'evening'].includes(newsType)) {
+      return null;
+    }
+
+    const flags = this.parseCliFlags(args.slice(1));
+    let userId = flags['user-id'];
+    let chatId = flags['chat-id'];
+    if (userId && chatId) {
+      return null;
+    }
+
+    if (!userId && !chatId) {
+      const configuredTarget = this.getDefaultLarkNewsTarget();
+      userId = configuredTarget?.userId;
+      chatId = configuredTarget?.chatId;
+      if (!userId && !chatId) {
+        return null;
+      }
+    }
+
+    const parsed = {
+      newsType: newsType as 'hot' | 'search' | 'morning' | 'evening',
+      userId,
+      chatId,
+      keyword: flags.keyword,
+      limit: flags.limit ? Number.parseInt(flags.limit, 10) : undefined,
+      title: flags.title,
+      timezone: flags.timezone,
+      saveOutput: flags.save === 'true',
+      dryRun: flags['dry-run'] === 'true',
+    };
+
+    if (parsed.newsType === 'search' && !parsed.keyword) {
+      return null;
+    }
+
+    return parsed;
+  }
+
+  private parseCliFlags(args: string[]): Record<string, string> {
+    const parsed: Record<string, string> = {};
+    let index = 0;
+    while (index < args.length) {
+      const token = args[index];
+      if (!token || !token.startsWith('--')) {
+        index += 1;
+        continue;
+      }
+
+      const key = token.slice(2).toLowerCase();
+      const values: string[] = [];
+      index += 1;
+      while (index < args.length) {
+        const current = args[index];
+        if (!current || current.startsWith('--')) {
+          break;
+        }
+        values.push(current);
+        index += 1;
+      }
+
+      parsed[key] = values.length > 0 ? values.join(' ') : 'true';
+    }
+
+    return parsed;
+  }
+
+  private async handleNewsSaveCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.builtInTools) {
+      printError('Built-in tools not initialized');
+      return;
+    }
+
+    switch (subcommand) {
+      case 'hot': {
+        const limit = Number.parseInt(args[1] || '10', 10);
+        const safeLimit = Number.isFinite(limit) && limit > 0 ? limit : 10;
+        const result = await this.builtInTools.executeTool('tencent_hot_news', { limit: safeLimit });
+        await this.displayAndMaybePersistNewsResult(result, '腾讯热榜', 'hot', undefined, safeLimit);
+        return;
+      }
+      case 'search': {
+        const limitCandidate = args[args.length - 1];
+        const parsedLimit = limitCandidate ? Number.parseInt(limitCandidate, 10) : Number.NaN;
+        const hasNumericLimit = Number.isFinite(parsedLimit);
+        const keyword = args.slice(1, hasNumericLimit ? -1 : undefined).join(' ').trim();
+
+        if (!keyword) {
+          printError('Usage: /news save search <keyword> [limit]');
+          return;
+        }
+
+        const safeLimit = hasNumericLimit && parsedLimit > 0 ? parsedLimit : 10;
+        const result = await this.builtInTools.executeTool('tencent_search_news', { keyword, limit: safeLimit });
+        await this.displayAndMaybePersistNewsResult(result, `腾讯新闻搜索: ${keyword}`, 'search', keyword, safeLimit);
+        return;
+      }
+      case 'morning': {
+        const result = await this.builtInTools.executeTool('tencent_morning_news', {});
+        await this.displayAndMaybePersistNewsResult(result, '腾讯早报', 'morning');
+        return;
+      }
+      case 'evening': {
+        const result = await this.builtInTools.executeTool('tencent_evening_news', {});
+        await this.displayAndMaybePersistNewsResult(result, '腾讯晚报', 'evening');
+        return;
+      }
+      default:
+        printError('Usage: /news save [hot [limit]|search <keyword> [limit]|morning|evening]');
+    }
+  }
+
+  private async displayAndMaybePersistNewsResult(
+    result: { is_error?: boolean; output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> },
+    title: string,
+    newsType: 'hot' | 'search' | 'morning' | 'evening',
+    keyword?: string,
+    limit?: number,
+  ): Promise<void> {
+    this.displayDirectToolResult(result, title);
+
+    if (result.is_error) {
+      return;
+    }
+
+    const output = this.getToolResultDisplayText(result);
+    if (output.length === 0) {
+      return;
+    }
+
+    const filePath = await this.saveNewsOutput({
+      newsType,
+      content: output,
+      keyword,
+      limit,
+    });
+
+    await this.memoryProvider?.store({
+      kind: 'project',
+      key: 'last_output_file',
+      title: 'last_output_file',
+      content: `腾讯新闻输出: ${filePath}`,
+      metadata: { path: filePath, newsType },
+    });
+    await this.memoryProvider?.store({
+      kind: 'project',
+      key: 'last_txt_output_file',
+      title: 'last_txt_output_file',
+      content: `腾讯新闻输出: ${filePath}`,
+      metadata: { path: filePath, newsType },
+    });
+
+    printSuccess(`已保存到本地输出目录: ${filePath}`);
+  }
+
+  private async saveNewsOutput(input: {
+    newsType: 'hot' | 'search' | 'morning' | 'evening';
+    content: string;
+    keyword?: string;
+    limit?: number;
+  }): Promise<string> {
+    await fs.mkdir(this.newsOutputDir, { recursive: true });
+
+    const timestamp = new Date().toISOString().replace(/[:]/g, '-').replace(/\..+$/, '');
+    const baseName = this.buildNewsOutputBaseName(input.newsType, input.keyword);
+    const fileName = `${baseName}_${timestamp}.txt`;
+    const filePath = path.join(this.newsOutputDir, fileName);
+    const header = [
+      `Title: ${baseName}`,
+      `Type: ${input.newsType}`,
+      input.keyword ? `Keyword: ${input.keyword}` : undefined,
+      input.limit ? `Limit: ${input.limit}` : undefined,
+      `GeneratedAt: ${new Date().toISOString()}`,
+      '',
+    ].filter(Boolean).join('\n');
+
+    await fs.writeFile(filePath, `${header}${input.content}`.trim() + '\n', 'utf-8');
+    return filePath;
+  }
+
+  private buildNewsOutputBaseName(newsType: 'hot' | 'search' | 'morning' | 'evening', keyword?: string): string {
+    const sanitizedKeyword = keyword
+      ? `_${keyword.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40)}`
+      : '';
+
+    switch (newsType) {
+      case 'hot':
+        return '腾讯新闻热榜';
+      case 'search':
+        return `腾讯新闻搜索${sanitizedKeyword}`;
+      case 'morning':
+        return '腾讯新闻早报';
+      case 'evening':
+        return '腾讯新闻晚报';
     }
   }
 
@@ -1881,6 +2201,49 @@ ${chalk.gray('/news morning')}
         }
         break;
       }
+      case 'create-news-lark': {
+        const name = args[1];
+        const newsType = args[2]?.toLowerCase();
+        const parsed = this.parseCronNewsLarkArgs(args.slice(3));
+
+        if (!name || !newsType || !parsed) {
+          printError('Usage: /cron create-news-lark <name> <morning|evening|hot|search> <schedule> [--user-id <ou_xxx>] [--limit <n>] [--keyword <text>] [--title <text>] [--save] [--timezone <Asia/Shanghai>]\n默认接收目标读取 notifications.lark.morningNews.chatId');
+          return;
+        }
+
+        if (!['morning', 'evening', 'hot', 'search'].includes(newsType)) {
+          printError('Unknown news type. Use morning, evening, hot, or search.');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('cron_create', {
+          name,
+          schedule: parsed.schedule,
+          tool: 'push_news_to_lark',
+          args: {
+            newsType,
+            ...parsed.toolArgs,
+          },
+          description: `Tencent ${newsType} news to Lark`,
+          timezone: parsed.timezone,
+        });
+
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to create Lark news cron job');
+        } else {
+          printSuccess(`Lark news cron job created: ${name}`);
+          console.log(this.getToolResultDisplayText(result));
+        }
+        break;
+      }
+      case 'create-morning-feishu': {
+        await this.createPresetMorningFeishuCron('user', args[1]);
+        break;
+      }
+      case 'create-morning-feishu-group': {
+        await this.createPresetMorningFeishuCron('group', args[1]);
+        break;
+      }
       case 'delete': {
         const idOrName = args[1];
         if (!idOrName) {
@@ -1909,14 +2272,177 @@ ${chalk.cyan('/cron')}                         查看 cron 列表
 ${chalk.cyan('/cron list')}                    列出 cron 任务
 ${chalk.cyan('/cron create')} <name> <schedule> <tool> [jsonArgs]
 ${chalk.cyan('/cron create-news')} <name> <morning|evening|hot> <schedule> [timezone]
+${chalk.cyan('/cron create-news-lark')} <name> <type> <schedule> [flags]
+${chalk.cyan('/cron create-morning-feishu')} [ou_xxx]
+${chalk.cyan('/cron create-morning-feishu-group')} [oc_xxx]
 ${chalk.cyan('/cron delete')} <idOrName>      删除 cron 任务
 ${chalk.cyan('/cron run-due')}                立即检查当前到期任务
 
 ${chalk.gray('示例:')}
 ${chalk.gray('/cron create-news morning-brief morning 0 8 * * * Asia/Shanghai')}
 ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
+${chalk.gray('/cron create-news-lark morning-feishu morning 0 8 * * * --save')}
+${chalk.gray('/cron create-morning-feishu')}
+${chalk.gray('/cron create-morning-feishu-group')}
 `);
     }
+  }
+
+  private async createPresetMorningFeishuCron(targetType: 'user' | 'group', overrideTarget?: string): Promise<void> {
+    if (!this.builtInTools) {
+      printError('Built-in tools not initialized');
+      return;
+    }
+
+    const preset = this.getMorningFeishuPreset(targetType, overrideTarget);
+    if (!preset) {
+      const requiredKey = targetType === 'user' ? 'notifications.lark.morningNews.userId' : 'notifications.lark.morningNews.chatId';
+      printError(`Missing target. 请传入参数，或在配置文件中设置 ${requiredKey}`);
+      return;
+    }
+
+    const result = await this.builtInTools.executeTool('cron_create', {
+      name: preset.name,
+      schedule: preset.schedule,
+      tool: 'push_news_to_lark',
+      args: preset.toolArgs,
+      description: preset.description,
+      timezone: preset.timezone,
+    });
+
+    if (result.is_error) {
+      printError(this.getToolResultDisplayText(result) || 'Failed to create preset morning Lark cron job');
+      return;
+    }
+
+    printSuccess(`Morning Lark cron job created: ${preset.name}`);
+    console.log(this.getToolResultDisplayText(result));
+  }
+
+  private getMorningFeishuPreset(targetType: 'user' | 'group', overrideTarget?: string): {
+    name: string;
+    schedule: string;
+    timezone?: string;
+    description: string;
+    toolArgs: Record<string, unknown>;
+  } | null {
+    const config = configManager.getAll();
+    const morningNews = config.notifications?.lark?.morningNews;
+    const target = (overrideTarget || (targetType === 'user' ? morningNews?.userId : morningNews?.chatId) || '').trim();
+    if (!target) {
+      return null;
+    }
+
+    const schedule = morningNews?.schedule || '0 8 * * *';
+    const timezone = morningNews?.timezone || 'Asia/Shanghai';
+    const saveOutput = morningNews?.saveOutput ?? true;
+    const title = morningNews?.title;
+    const toolArgs: Record<string, unknown> = {
+      newsType: 'morning',
+      timezone,
+    };
+
+    if (targetType === 'user') {
+      toolArgs.userId = target;
+    } else {
+      toolArgs.chatId = target;
+    }
+
+    if (saveOutput) {
+      toolArgs.saveOutput = true;
+    }
+    if (title) {
+      toolArgs.title = title;
+    }
+
+    return {
+      name: targetType === 'user' ? 'morning-feishu' : 'morning-feishu-group',
+      schedule,
+      timezone,
+      description: targetType === 'user' ? 'Tencent morning news to configured Lark user' : 'Tencent morning news to configured Lark group',
+      toolArgs,
+    };
+  }
+
+  private parseCronNewsLarkArgs(args: string[]): { schedule: string; timezone?: string; toolArgs: Record<string, unknown> } | null {
+    if (args.length === 0) {
+      return null;
+    }
+
+    let schedule = '';
+    let rest: string[] = [];
+    if (args[0]?.startsWith('@')) {
+      schedule = this.normalizeCronToken(args[0]);
+      rest = args.slice(1);
+    } else if (args.length >= 5) {
+      schedule = this.normalizeCronToken(args.slice(0, 5).join(' '));
+      rest = args.slice(5);
+    } else {
+      return null;
+    }
+
+    const flags = this.parseCliFlags(rest);
+    let userId = flags['user-id'];
+    let chatId = flags['chat-id'];
+    if (userId && chatId) {
+      return null;
+    }
+
+    if (!userId && !chatId) {
+      const configuredTarget = this.getDefaultLarkNewsTarget();
+      userId = configuredTarget?.userId;
+      chatId = configuredTarget?.chatId;
+      if (!userId && !chatId) {
+        return null;
+      }
+    }
+
+    const toolArgs: Record<string, unknown> = {};
+    if (userId) {
+      toolArgs.userId = userId;
+    }
+    if (chatId) {
+      toolArgs.chatId = chatId;
+    }
+    if (flags.keyword) {
+      toolArgs.keyword = flags.keyword;
+    }
+    if (flags.limit) {
+      const parsedLimit = Number.parseInt(flags.limit, 10);
+      if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+        toolArgs.limit = parsedLimit;
+      }
+    }
+    if (flags.title) {
+      toolArgs.title = flags.title;
+    }
+    if (flags.save === 'true') {
+      toolArgs.saveOutput = true;
+    }
+    if (flags.timezone) {
+      toolArgs.timezone = flags.timezone;
+    }
+
+    return {
+      schedule,
+      timezone: flags.timezone,
+      toolArgs,
+    };
+  }
+
+  private getDefaultLarkNewsTarget(): { userId?: string; chatId?: string } | null {
+    const morningNews = configManager.getAll().notifications?.lark?.morningNews;
+    const chatId = morningNews?.chatId?.trim();
+    const userId = morningNews?.userId?.trim();
+
+    if (chatId) {
+      return { chatId };
+    }
+    if (userId) {
+      return { userId };
+    }
+
+    return null;
   }
 
   async runCronDaemon(runOnce = false): Promise<void> {
@@ -2039,6 +2565,11 @@ ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
     console.log(chalk.gray('\nMemory:'));
     console.log(`  Session: ${this.memoryManager.getCurrentSessionId()}`);
     console.log(`  Messages: ${this.memoryManager.getMessages().length}`);
+    console.log(chalk.gray('\nNotifications:'));
+    console.log(`  Morning Lark User: ${config.notifications?.lark?.morningNews?.userId || '(not set)'}`);
+    console.log(`  Morning Lark Group: ${config.notifications?.lark?.morningNews?.chatId || '(not set)'}`);
+    console.log(`  Morning Schedule: ${config.notifications?.lark?.morningNews?.schedule || '0 8 * * *'}`);
+    console.log(`  Morning Timezone: ${config.notifications?.lark?.morningNews?.timezone || 'Asia/Shanghai'}`);
     console.log();
   }
 
@@ -2161,9 +2692,40 @@ ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
       case 'status':
         await this.checkMCPServer(args[1]?.toLowerCase() || 'mempalace');
         break;
+      case 'reconnect':
+      case 'reload':
+        await this.reconnectMCPServer(args[1]?.toLowerCase());
+        break;
       default:
-        console.log(chalk.yellow('Usage: /mcp [list|tools|check|status]'));
+        console.log(chalk.yellow('Usage: /mcp [list|tools|check|status|reconnect]'));
     }
+  }
+
+  private async reconnectMCPServer(serverName?: string): Promise<void> {
+    const targetName = serverName || 'lark';
+    const config = configManager.getAll();
+    const serverConfig = config.mcp?.find(item => item.name.toLowerCase() === targetName);
+
+    console.log(chalk.bold(`\nMCP Reconnect: ${targetName}\n`));
+
+    if (!serverConfig) {
+      printError(`MCP server not configured: ${targetName}`);
+      console.log();
+      return;
+    }
+
+    try {
+      await this.mcpManager.removeServer(serverConfig.name);
+      await this.mcpManager.addServer(serverConfig);
+      printSuccess(`Reconnected MCP server: ${serverConfig.name}`);
+      console.log();
+    } catch (error) {
+      printError(`Reconnect failed: ${error instanceof Error ? error.message : String(error)}`);
+      console.log();
+      return;
+    }
+
+    await this.checkMCPServer(serverConfig.name.toLowerCase());
   }
 
   private async checkMCPServer(serverName: string): Promise<void> {
@@ -2191,6 +2753,18 @@ ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
         }
       } catch (error) {
         printWarning(`MemPalace status failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else if (serverName === 'lark') {
+      try {
+        const result = await this.mcpManager.callTool('lark', 'auth_status', { verify: true });
+        const output = this.getToolResultDisplayText(result);
+        if (output.length > 0) {
+          console.log();
+          console.log(output);
+        }
+      } catch (error) {
+        printWarning(`Lark auth status failed: ${error instanceof Error ? error.message : String(error)}`);
+        printInfo('Try: /mcp reconnect lark');
       }
     } else if (tools.length > 0) {
       console.log();
@@ -2247,6 +2821,79 @@ ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
         console.log();
         break;
 
+      case 'candidates':
+      case 'drafts': {
+        console.log(chalk.bold('\nSkill Candidates:\n'));
+        const candidates = await this.skillManager.listSkillCandidates();
+        if (candidates.length === 0) {
+          console.log(chalk.gray('No learned skill candidates yet. Complex successful tasks will create drafts here.'));
+        } else {
+          for (const candidate of candidates) {
+            console.log(`${chalk.yellow('•')} ${chalk.cyan(candidate.name)} ${chalk.gray(candidate.createdAt)}`);
+            if (candidate.description) {
+              console.log(chalk.gray(`  ${candidate.description}`));
+            }
+            if (candidate.sourceTask) {
+              console.log(chalk.gray(`  source: ${candidate.sourceTask}`));
+            }
+          }
+        }
+        console.log();
+        break;
+      }
+
+      case 'todos': {
+        console.log(chalk.bold('\nSkill Learning Todos:\n'));
+        const todos = await this.skillManager.listLearningTodos();
+        if (todos.length === 0) {
+          console.log(chalk.gray('No pending learning todos. Unresolved tasks will add items here.'));
+        } else {
+          for (const todo of todos) {
+            console.log(`${chalk.yellow('•')} ${chalk.cyan(todo.suggestedSkill)} ${chalk.gray(todo.createdAt)} ${chalk.gray(`[${todo.id}]`)}`);
+            console.log(chalk.gray(`  task: ${todo.sourceTask}`));
+            console.log(chalk.gray(`  issue: ${todo.issueSummary}`));
+            if (todo.nextActions.length > 0) {
+              console.log(chalk.gray(`  next: ${todo.nextActions.join(' | ')}`));
+            }
+            if (todo.draftedCandidateName) {
+              console.log(chalk.gray(`  draft: ${todo.draftedCandidateName} (${todo.draftedAt || 'unknown time'})`));
+            } else {
+              console.log(chalk.gray(`  hint: /skill adopt-from-todo ${todo.id}`));
+            }
+          }
+        }
+        console.log();
+        break;
+      }
+
+      case 'adopt':
+        if (!skillName) {
+          console.log(chalk.yellow('Usage: /skill adopt <candidate-name>'));
+          return;
+        }
+        try {
+          await this.skillManager.adoptCandidate(skillName);
+          printSuccess('Skill candidate adopted and enabled: ' + skillName);
+        } catch (error) {
+          printError('Failed to adopt candidate: ' + (error instanceof Error ? error.message : String(error)));
+        }
+        break;
+
+      case 'adopt-from-todo':
+        if (!skillName) {
+          console.log(chalk.yellow('Usage: /skill adopt-from-todo <todo-id|suggested-skill>'));
+          return;
+        }
+        try {
+          const candidate = await this.skillManager.createCandidateFromTodo(skillName);
+          printSuccess(`Learning todo converted into candidate draft: ${candidate.name}`);
+          console.log(chalk.gray(`草稿路径: ${candidate.path}`));
+          console.log(chalk.gray(`下一步可执行: /skill adopt ${candidate.name}`));
+        } catch (error) {
+          printError('Failed to create candidate from todo: ' + (error instanceof Error ? error.message : String(error)));
+        }
+        break;
+
       case 'install':
       case 'add':
         if (!skillName) {
@@ -2299,7 +2946,7 @@ ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
         break;
 
       default:
-        console.log(chalk.yellow('Usage: /skill [list|install|uninstall|enable|disable]'));
+        console.log(chalk.yellow('Usage: /skill [list|candidates|todos|adopt|adopt-from-todo|install|uninstall|enable|disable]'));
     }
   }
 

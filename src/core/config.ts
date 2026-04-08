@@ -4,6 +4,18 @@ import { z } from 'zod';
 import { parse } from 'yaml';
 import type { AgentConfig } from '../types/index.js';
 
+function getDefaultArtifactOutputDir(): string {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || process.cwd();
+  return join(homeDir, '.ai-agent-cli', 'outputs');
+}
+
+const memorySchema = z.object({
+  backend: z.enum(['local', 'mempalace', 'hybrid']).default('hybrid'),
+  recallLimit: z.number().int().min(1).max(20).default(6),
+  enableSessionSync: z.boolean().default(true),
+  enableAutoArchive: z.boolean().default(true),
+});
+
 const mcpServerSchema = z.object({
   name: z.string(),
   command: z.string(),
@@ -37,6 +49,25 @@ const providerSchema = z.object({
   systemPrompt: z.string().optional(),
 });
 
+const larkMorningNewsSchema = z.object({
+  userId: z.string().optional(),
+  chatId: z.string().optional(),
+  schedule: z.string().default('0 8 * * *'),
+  timezone: z.string().default('Asia/Shanghai'),
+  saveOutput: z.boolean().default(true),
+  title: z.string().optional(),
+});
+
+const notificationsSchema = z.object({
+  lark: z.object({
+    morningNews: larkMorningNewsSchema.default({
+      schedule: '0 8 * * *',
+      timezone: 'Asia/Shanghai',
+      saveOutput: true,
+    }),
+  }).optional(),
+}).optional();
+
 const configSchema = z.object({
   defaultProvider: z.string().default('ollama'),
   ollama: providerSchema.merge(z.object({ baseUrl: z.string().default('http://localhost:11434') })),
@@ -51,9 +82,16 @@ const configSchema = z.object({
   mcp: z.array(mcpServerSchema).optional(),
   lsp: z.array(lspServerSchema).optional(),
   sandbox: sandboxSchema.optional(),
+  memory: memorySchema.optional(),
+  artifactOutputDir: z.string().default(getDefaultArtifactOutputDir()),
+  documentOutputDir: z.string().optional(),
   workspace: z.string().default(process.cwd()),
   maxIterations: z.number().default(100),
+  maxToolCallsPerTurn: z.number().int().min(1).max(200).default(10),
+  autoContinueOnToolLimit: z.boolean().default(true),
+  maxContinuationTurns: z.number().int().min(0).max(20).default(3),
   toolTimeout: z.number().default(60000),
+  notifications: notificationsSchema,
 });
 
 export type ConfigSchema = z.infer<typeof configSchema>;
@@ -67,11 +105,30 @@ const defaultConfig: ConfigSchema = {
     temperature: 0.7,
     maxTokens: 4096,
   },
+  artifactOutputDir: getDefaultArtifactOutputDir(),
   workspace: process.cwd(),
   maxIterations: 100,
+  maxToolCallsPerTurn: 10,
+  autoContinueOnToolLimit: true,
+  maxContinuationTurns: 3,
   toolTimeout: 60000,
+  notifications: {
+    lark: {
+      morningNews: {
+        schedule: '0 8 * * *',
+        timezone: 'Asia/Shanghai',
+        saveOutput: true,
+      },
+    },
+  },
   mcp: [],
   lsp: [],
+  memory: {
+    backend: 'hybrid',
+    recallLimit: 6,
+    enableSessionSync: true,
+    enableAutoArchive: true,
+  },
   sandbox: {
     enabled: true,
     timeout: 30000,
@@ -94,8 +151,9 @@ class ConfigManager {
       const content = readFileSync(this.configPath, 'utf-8');
       const parsed = parse(content);
       this.config = configSchema.parse(parsed);
-    } catch {
-      // Use default config if file doesn't exist
+    } catch (error) {
+      this.config = { ...defaultConfig };
+      console.warn(`[Config] Failed to load ${this.configPath}; falling back to defaults. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -129,8 +187,9 @@ class ConfigManager {
       const { parse } = await import('yaml');
       const parsed = parse(content);
       this.config = configSchema.parse(parsed);
-    } catch {
+    } catch (error) {
       this.config = { ...defaultConfig };
+      console.warn(`[Config] Failed to load ${this.configPath}; falling back to defaults. ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

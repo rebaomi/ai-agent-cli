@@ -84,7 +84,16 @@ gemini:
 
 workspace: .
 maxIterations: 100
+maxToolCallsPerTurn: 10
+autoContinueOnToolLimit: true
+maxContinuationTurns: 3
 toolTimeout: 60000
+
+# 全局产物输出目录（docx/pdf/xlsx/txt/md 等相对输出默认落这里）
+# 支持使用“桌面”或“Desktop”别名，例如：artifactOutputDir: 桌面/coolAI
+artifactOutputDir: ~/.ai-agent-cli/outputs
+# documentOutputDir 可作为兼容别名，未设置 artifactOutputDir 时生效
+# documentOutputDir: ~/Documents/coolAI
 
 # ===========================================
 # 沙箱配置
@@ -117,6 +126,14 @@ mcp:
   #     - @modelcontextprotocol/server-filesystem
   #   env:
   #     ALLOWED_DIRECTORY: /tmp
+
+  # Obsidian Vault（推荐把 vault 目录直接挂成 filesystem MCP）
+  # - name: obsidian
+  #   command: npx.cmd
+  #   args:
+  #     - -y
+  #     - @modelcontextprotocol/server-filesystem
+  #     - C:/Users/your-name/Documents/Your-Obsidian-Vault
 
   # 飞书
   # - name: feishu
@@ -222,6 +239,20 @@ mcp:
   #     - mempalace.mcp_server
   #   env:
   #     MEMPALACE_PALACE_PATH: C:\Users\your-name\.mempalace\palace
+
+  # 飞书官方 lark-cli MCP bridge
+  # 先全局安装官方 CLI:
+  #   npm install -g @larksuite/cli
+  # 初始化与登录:
+  #   lark-cli config init --new
+  #   lark-cli auth login --recommend
+  # 然后先在本项目执行一次 npm run build，再把下面路径改成你本机仓库路径
+  # - name: lark
+  #   command: node
+  #   args:
+  #     - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+  #   env:
+  #     LARK_CLI_BIN: lark-cli
 
 # ===========================================
 # LSP 服务器配置

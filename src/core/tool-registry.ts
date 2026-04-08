@@ -112,7 +112,7 @@ export class ToolRegistry {
       } catch (error) {
         return {
           tool_call_id: '',
-          output: `Skill tool error: ${error instanceof Error ? error.message : String(error)}`,
+          output: this.normalizeSkillExecutionError(name, error),
           is_error: true,
         };
       }
@@ -166,6 +166,44 @@ export class ToolRegistry {
       .filter(item => item.type === 'text' && typeof item.text === 'string')
       .map(item => item.text || '')
       .join('\n');
+  }
+
+  private normalizeSkillExecutionError(name: string, error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (this.isUnavailableDocxSkill(name, message)) {
+      return [
+        '无可用 docx skill。',
+        '当前安装的 minimax-docx 不可用，原因是缺少可运行的 .NET SDK。',
+        '可改用 PDF、Markdown 或 TXT 导出，或在安装 .NET SDK 后再试 DOCX。',
+      ].join('\n');
+    }
+
+    if (this.isUnavailablePdfSkill(name, message)) {
+      return [
+        '无可用 pdf skill。',
+        '当前安装的 minimax-pdf 不可用，原因是缺少 Playwright/Chromium 运行环境。',
+        '可先执行 npm install -g playwright，并运行 npx playwright install chromium；或者先导出为 Markdown、TXT、DOCX。',
+      ].join('\n');
+    }
+
+    return `Skill tool error: ${message}`;
+  }
+
+  private isUnavailableDocxSkill(name: string, message: string): boolean {
+    if (!/docx/i.test(name)) {
+      return false;
+    }
+
+    return /minimax-docx 当前不可用|缺少 .*\.net sdk|No \.NET SDKs were found|application 'run' does not exist|dotnet run/i.test(message);
+  }
+
+  private isUnavailablePdfSkill(name: string, message: string): boolean {
+    if (!/pdf/i.test(name)) {
+      return false;
+    }
+
+    return /playwright not found|npx playwright install chromium|chromium/i.test(message);
   }
 }
 

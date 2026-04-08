@@ -50,6 +50,28 @@ export interface LLMConfig {
   apiKey?: string;
 }
 
+export interface MemoryConfig {
+  backend?: 'local' | 'mempalace' | 'hybrid';
+  recallLimit?: number;
+  enableSessionSync?: boolean;
+  enableAutoArchive?: boolean;
+}
+
+export interface LarkMorningNewsConfig {
+  userId?: string;
+  chatId?: string;
+  schedule?: string;
+  timezone?: string;
+  saveOutput?: boolean;
+  title?: string;
+}
+
+export interface NotificationsConfig {
+  lark?: {
+    morningNews?: LarkMorningNewsConfig;
+  };
+}
+
 export interface AgentConfig {
   defaultProvider?: string;
   ollama: LLMConfig;
@@ -64,9 +86,16 @@ export interface AgentConfig {
   mcp?: MCPConfig[];
   lsp?: LSPServerConfig[];
   sandbox?: SandboxConfig;
+  memory?: MemoryConfig;
+  artifactOutputDir?: string;
+  documentOutputDir?: string;
   workspace?: string;
   maxIterations?: number;
+  maxToolCallsPerTurn?: number;
+  autoContinueOnToolLimit?: boolean;
+  maxContinuationTurns?: number;
   toolTimeout?: number;
+  notifications?: NotificationsConfig;
 }
 
 export interface MCPConfig {

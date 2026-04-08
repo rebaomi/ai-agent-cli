@@ -27,11 +27,33 @@ export class Sandbox {
     }
   }
 
+  private normalizeComparisonPath(targetPath: string): string {
+    const resolved = path.resolve(targetPath);
+    const normalized = path.normalize(resolved);
+    const root = path.parse(normalized).root;
+    const trimmed = normalized === root ? normalized : normalized.replace(/[\\/]+$/, '');
+    return process.platform === 'win32' ? trimmed.toLowerCase() : trimmed;
+  }
+
+  private isWithinPath(targetPath: string, basePath: string): boolean {
+    const normalizedTarget = this.normalizeComparisonPath(targetPath);
+    const normalizedBase = this.normalizeComparisonPath(basePath);
+
+    if (normalizedTarget === normalizedBase) {
+      return true;
+    }
+
+    const relative = path.relative(normalizedBase, normalizedTarget);
+    if (!relative) {
+      return true;
+    }
+
+    return !relative.startsWith('..') && !path.isAbsolute(relative);
+  }
+
   private isPathAllowed(filePath: string): boolean {
-    const resolved = path.resolve(filePath);
-    
     for (const denied of this.deniedPaths) {
-      if (resolved.startsWith(path.resolve(denied))) {
+      if (this.isWithinPath(filePath, denied)) {
         return false;
       }
     }
@@ -41,7 +63,7 @@ export class Sandbox {
     }
 
     for (const allowed of this.allowedPaths) {
-      if (resolved.startsWith(path.resolve(allowed))) {
+      if (this.isWithinPath(filePath, allowed)) {
         return true;
       }
     }
@@ -55,8 +77,8 @@ export class Sandbox {
     }
 
     if (!this.isPathAllowed(filePath)) {
-      const resolved = path.resolve(filePath);
-      const allowedList = this.allowedPaths.map(p => path.resolve(p));
+      const resolved = this.normalizeComparisonPath(filePath);
+      const allowedList = this.allowedPaths.map(p => this.normalizeComparisonPath(p));
       throw new Error(`Path not allowed: ${filePath}\nResolved: ${resolved}\nAllowed: ${allowedList.join(', ')}`);
     }
 
@@ -70,7 +92,9 @@ export class Sandbox {
     }
 
     if (!this.isPathAllowed(filePath)) {
-      throw new Error(`Path not allowed: ${filePath}`);
+      const resolved = this.normalizeComparisonPath(filePath);
+      const allowedList = this.allowedPaths.map(p => this.normalizeComparisonPath(p));
+      throw new Error(`Path not allowed: ${filePath}\nResolved: ${resolved}\nAllowed: ${allowedList.join(', ')}`);
     }
 
     const dir = path.dirname(filePath);
@@ -85,7 +109,9 @@ export class Sandbox {
     }
 
     if (!this.isPathAllowed(filePath)) {
-      throw new Error(`Path not allowed: ${filePath}`);
+      const resolved = this.normalizeComparisonPath(filePath);
+      const allowedList = this.allowedPaths.map(p => this.normalizeComparisonPath(p));
+      throw new Error(`Path not allowed: ${filePath}\nResolved: ${resolved}\nAllowed: ${allowedList.join(', ')}`);
     }
 
     await fs.unlink(filePath);
@@ -97,7 +123,9 @@ export class Sandbox {
     }
 
     if (!this.isPathAllowed(dirPath)) {
-      throw new Error(`Path not allowed: ${dirPath}`);
+      const resolved = this.normalizeComparisonPath(dirPath);
+      const allowedList = this.allowedPaths.map(p => this.normalizeComparisonPath(p));
+      throw new Error(`Path not allowed: ${dirPath}\nResolved: ${resolved}\nAllowed: ${allowedList.join(', ')}`);
     }
 
     return fs.readdir(dirPath);

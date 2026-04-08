@@ -1,4 +1,5 @@
 import { promises as fs } from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -8,6 +9,7 @@ import { LSPManager } from '../lsp/client.js';
 import type { MCPManager } from '../mcp/client.js';
 import type { TaskManager } from '../core/task-manager.js';
 import type { CronManager } from '../core/cron-manager.js';
+import { resolveOutputPath, resolveUserPath } from '../utils/path-resolution.js';
 
 const execAsync = promisify(exec);
 
@@ -15,6 +17,8 @@ export interface BuiltInToolsOptions {
   mcpManager?: MCPManager;
   taskManager?: TaskManager;
   cronManager?: CronManager;
+  workspace?: string;
+  config?: Record<string, unknown>;
 }
 
 export class BuiltInTools {
@@ -23,6 +27,8 @@ export class BuiltInTools {
   private mcpManager?: MCPManager;
   private taskManager?: TaskManager;
   private cronManager?: CronManager;
+  private workspace?: string;
+  private config?: Record<string, unknown>;
 
   constructor(sandbox: Sandbox, lspManager: LSPManager, options: BuiltInToolsOptions = {}) {
     this.sandbox = sandbox;
@@ -30,6 +36,24 @@ export class BuiltInTools {
     this.mcpManager = options.mcpManager;
     this.taskManager = options.taskManager;
     this.cronManager = options.cronManager;
+    this.workspace = options.workspace;
+    this.config = options.config;
+  }
+
+  private resolveInputPath(filePath: string): string {
+    return resolveUserPath(filePath, {
+      workspace: this.workspace,
+      artifactOutputDir: typeof this.config?.artifactOutputDir === 'string' ? this.config.artifactOutputDir : undefined,
+      documentOutputDir: typeof this.config?.documentOutputDir === 'string' ? this.config.documentOutputDir : undefined,
+    });
+  }
+
+  private resolveOutputFilePath(filePath: string): string {
+    return resolveOutputPath(filePath, {
+      workspace: this.workspace,
+      artifactOutputDir: typeof this.config?.artifactOutputDir === 'string' ? this.config.artifactOutputDir : undefined,
+      documentOutputDir: typeof this.config?.documentOutputDir === 'string' ? this.config.documentOutputDir : undefined,
+    });
   }
 
   getTools(): Tool[] {
@@ -101,6 +125,7 @@ export class BuiltInTools {
       { ...this.tencentSearchNewsTool(), category: 'search_fetch' },
       { ...this.tencentMorningNewsTool(), category: 'search_fetch' },
       { ...this.tencentEveningNewsTool(), category: 'search_fetch' },
+      { ...this.pushNewsToLarkTool(), category: 'mcp' },
     ];
   }
 
@@ -928,19 +953,42 @@ export class BuiltInTools {
     };
   }
 
+  private pushNewsToLarkTool(): Tool {
+    return {
+      name: 'push_news_to_lark',
+      description: 'Fetch Tencent News and send it to a Lark user or chat via the configured lark MCP bridge',
+      input_schema: {
+        type: 'object',
+        properties: {
+          newsType: { type: 'string', description: 'One of morning, evening, hot, search' },
+          userId: { type: 'string', description: 'Optional Lark user open_id (ou_xxx); falls back to notifications.lark.morningNews.userId' },
+          chatId: { type: 'string', description: 'Optional Lark chat id (oc_xxx); falls back to notifications.lark.morningNews.chatId' },
+          keyword: { type: 'string', description: 'Required for search news type' },
+          limit: { type: 'number', description: 'Limit for hot/search news, default 10' },
+          title: { type: 'string', description: 'Optional custom message title' },
+          timezone: { type: 'string', description: 'Optional timezone for the header, default Asia/Shanghai' },
+          saveOutput: { type: 'boolean', description: 'Save the generated message to local output directory' },
+          dryRun: { type: 'boolean', description: 'Return the outgoing message without sending it to Lark' },
+        },
+        required: ['newsType'],
+      },
+    };
+  }
+
   async executeTool(name: string, args: unknown): Promise<ToolResult> {
     try {
       let result: string;
 
       switch (name) {
         case 'read_file':
-          result = await this.sandbox.readFile((args as { path: string }).path);
+          result = await this.sandbox.readFile(this.resolveInputPath((args as { path: string }).path));
           break;
 
         case 'write_file': {
           const { path: filePath, content } = args as { path: string; content: string };
-          await this.sandbox.writeFile(filePath, content);
-          result = `File written successfully: ${filePath}`;
+          const resolvedPath = this.resolveOutputFilePath(filePath);
+          await this.sandbox.writeFile(resolvedPath, content);
+          result = `File written successfully: ${resolvedPath}`;
           break;
         }
 
@@ -950,27 +998,28 @@ export class BuiltInTools {
             old_string: string;
             new_string: string;
           };
-          const content = await this.sandbox.readFile(filePath);
+          const resolvedPath = this.resolveOutputFilePath(filePath);
+          const content = await this.sandbox.readFile(resolvedPath);
           const newContent = content.replace(old_string, new_string);
           if (content === newContent) {
             return { tool_call_id: '', output: 'No changes made - old_string not found', is_error: true };
           }
-          await this.sandbox.writeFile(filePath, newContent);
-          result = `File edited successfully: ${filePath}`;
+          await this.sandbox.writeFile(resolvedPath, newContent);
+          result = `File edited successfully: ${resolvedPath}`;
           break;
         }
 
         case 'delete_file':
-          await this.sandbox.deleteFile((args as { path: string }).path);
+          await this.sandbox.deleteFile(this.resolveInputPath((args as { path: string }).path));
           result = 'File deleted successfully';
           break;
 
         case 'list_directory':
-          result = (await this.sandbox.listDirectory((args as { path: string }).path)).join('\n');
+          result = (await this.sandbox.listDirectory(this.resolveInputPath((args as { path: string }).path))).join('\n');
           break;
 
         case 'create_directory': {
-          const dirPath = (args as { path: string }).path;
+          const dirPath = this.resolveOutputFilePath((args as { path: string }).path);
           await fs.mkdir(dirPath, { recursive: true });
           result = `Directory created: ${dirPath}`;
           break;
@@ -982,7 +1031,7 @@ export class BuiltInTools {
             pattern?: string;
             content?: string;
           };
-          result = await this.searchFiles(searchPath, pattern, content);
+          result = await this.searchFiles(this.resolveInputPath(searchPath), pattern, content);
           break;
         }
 
@@ -994,11 +1043,14 @@ export class BuiltInTools {
         }
 
         case 'glob':
-          result = await this.glob((args as { pattern: string; cwd?: string }).pattern, (args as { pattern: string; cwd?: string }).cwd);
+          result = await this.glob(
+            (args as { pattern: string; cwd?: string }).pattern,
+            (args as { pattern: string; cwd?: string }).cwd ? this.resolveInputPath((args as { pattern: string; cwd?: string }).cwd as string) : undefined,
+          );
           break;
 
         case 'read_multiple_files':
-          result = await this.readMultipleFiles((args as { paths: string[] }).paths);
+          result = await this.readMultipleFiles((args as { paths: string[] }).paths.map(filePath => this.resolveInputPath(filePath)));
           break;
 
         case 'lsp_complete': {
@@ -1024,23 +1076,28 @@ export class BuiltInTools {
 
         case 'copy_file': {
           const { source, destination } = args as { source: string; destination: string };
-          await fs.copyFile(source, destination);
-          result = `Copied: ${source} -> ${destination}`;
+          const resolvedSource = this.resolveInputPath(source);
+          const resolvedDestination = this.resolveOutputFilePath(destination);
+          await fs.copyFile(resolvedSource, resolvedDestination);
+          result = `Copied: ${resolvedSource} -> ${resolvedDestination}`;
           break;
         }
 
         case 'move_file': {
           const { source, destination } = args as { source: string; destination: string };
-          await fs.rename(source, destination);
-          result = `Moved: ${source} -> ${destination}`;
+          const resolvedSource = this.resolveInputPath(source);
+          const resolvedDestination = this.resolveOutputFilePath(destination);
+          await fs.rename(resolvedSource, resolvedDestination);
+          result = `Moved: ${resolvedSource} -> ${resolvedDestination}`;
           break;
         }
 
         case 'file_info': {
           const { path: filePath } = args as { path: string };
-          const stats = await fs.stat(filePath);
+          const resolvedPath = this.resolveInputPath(filePath);
+          const stats = await fs.stat(resolvedPath);
           result = JSON.stringify({
-            path: filePath,
+            path: resolvedPath,
             size: stats.size,
             isDirectory: stats.isDirectory(),
             isFile: stats.isFile(),
@@ -1053,7 +1110,7 @@ export class BuiltInTools {
 
         case 'grep': {
           const { pattern, path: searchPath, include } = args as { pattern: string; path: string; include?: string };
-          result = await this.grep(searchPath, pattern, include);
+          result = await this.grep(this.resolveInputPath(searchPath), pattern, include);
           break;
         }
 
@@ -1258,6 +1315,21 @@ export class BuiltInTools {
         case 'tencent_evening_news':
           result = await this.getTencentEveningNews();
           break;
+
+        case 'push_news_to_lark': {
+          result = await this.pushNewsToLark(args as {
+            newsType: string;
+            userId?: string;
+            chatId?: string;
+            keyword?: string;
+            limit?: number;
+            title?: string;
+            timezone?: string;
+            saveOutput?: boolean;
+            dryRun?: boolean;
+          });
+          break;
+        }
 
         default:
           return { tool_call_id: '', output: `Unknown tool: ${name}`, is_error: true };
@@ -1836,6 +1908,196 @@ export class BuiltInTools {
     } catch (error) {
       return `Failed to get evening news: ${error instanceof Error ? error.message : String(error)}`;
     }
+  }
+
+  private async pushNewsToLark(input: {
+    newsType: string;
+    userId?: string;
+    chatId?: string;
+    keyword?: string;
+    limit?: number;
+    title?: string;
+    timezone?: string;
+    saveOutput?: boolean;
+    dryRun?: boolean;
+  }): Promise<string> {
+    if (!this.mcpManager) {
+      throw new Error('MCP manager not initialized');
+    }
+
+    if (!this.mcpManager.getServerNames().includes('lark')) {
+      throw new Error('Lark MCP server not connected');
+    }
+
+    const configuredTarget = this.getConfiguredLarkNewsTarget();
+    const userId = typeof input.userId === 'string' && input.userId.trim().length > 0
+      ? input.userId.trim()
+      : configuredTarget.userId;
+    const chatId = typeof input.chatId === 'string' && input.chatId.trim().length > 0
+      ? input.chatId.trim()
+      : configuredTarget.chatId;
+    if (!userId && !chatId) {
+      throw new Error('push_news_to_lark requires userId or chatId, or notifications.lark.morningNews.chatId/userId in config');
+    }
+    if (userId && chatId) {
+      throw new Error('push_news_to_lark accepts either userId or chatId, not both');
+    }
+
+    const newsType = (input.newsType || '').trim().toLowerCase();
+    const limit = Number.isFinite(input.limit) && (input.limit || 0) > 0 ? Math.floor(input.limit as number) : 10;
+    const timezone = typeof input.timezone === 'string' && input.timezone.trim().length > 0
+      ? input.timezone.trim()
+      : 'Asia/Shanghai';
+
+    let newsBody: string;
+    switch (newsType) {
+      case 'morning':
+        newsBody = await this.getTencentMorningNews();
+        break;
+      case 'evening':
+        newsBody = await this.getTencentEveningNews();
+        break;
+      case 'hot':
+        newsBody = await this.getTencentHotNews(limit);
+        break;
+      case 'search':
+        if (!input.keyword?.trim()) {
+          throw new Error('newsType=search requires keyword');
+        }
+        newsBody = await this.searchTencentNews(input.keyword.trim(), limit);
+        break;
+      default:
+        throw new Error(`Unsupported newsType: ${input.newsType}`);
+    }
+
+    if (/^Failed to /i.test(newsBody)) {
+      throw new Error(newsBody);
+    }
+
+    const title = typeof input.title === 'string' && input.title.trim().length > 0
+      ? input.title.trim()
+      : this.buildNewsPushTitle(newsType, input.keyword, limit);
+    const message = this.buildNewsPushMessage(title, newsBody, timezone);
+    const savedPath = input.saveOutput ? await this.savePushedNewsOutput(newsType, message, input.keyword, limit) : null;
+
+    if (input.dryRun) {
+      return [
+        'DRY RUN: 未发送到飞书',
+        savedPath ? `Saved to: ${savedPath}` : undefined,
+        '',
+        message,
+      ].filter(Boolean).join('\n');
+    }
+
+    const flags: Record<string, unknown> = {
+      text: message,
+    };
+    if (userId) {
+      flags['user-id'] = userId;
+    }
+    if (chatId) {
+      flags['chat-id'] = chatId;
+    }
+
+    const result = await this.mcpManager.callTool('lark', 'shortcut', {
+      service: 'im',
+      command: '+messages-send',
+      as: 'bot',
+      flags,
+    });
+    const responseText = this.normalizeMcpTextResult(result);
+
+    return [
+      `新闻已发送到飞书${chatId ? ` 群 ${chatId}` : ` 用户 ${userId}`}`,
+      savedPath ? `Saved to: ${savedPath}` : undefined,
+      responseText || undefined,
+    ].filter(Boolean).join('\n');
+  }
+
+  private getConfiguredLarkNewsTarget(): { userId?: string; chatId?: string } {
+    const notifications = this.config?.notifications as {
+      lark?: {
+        morningNews?: {
+          userId?: string;
+          chatId?: string;
+        };
+      };
+    } | undefined;
+    const morningNews = notifications?.lark?.morningNews;
+    const chatId = typeof morningNews?.chatId === 'string' ? morningNews.chatId.trim() : '';
+    const userId = typeof morningNews?.userId === 'string' ? morningNews.userId.trim() : '';
+
+    if (chatId) {
+      return { chatId };
+    }
+    if (userId) {
+      return { userId };
+    }
+
+    return {};
+  }
+
+  private buildNewsPushTitle(newsType: string, keyword?: string, limit?: number): string {
+    switch (newsType) {
+      case 'morning':
+        return '腾讯新闻早报';
+      case 'evening':
+        return '腾讯新闻晚报';
+      case 'hot':
+        return `腾讯热点新闻 Top ${limit || 10}`;
+      case 'search':
+        return `腾讯新闻搜索: ${keyword || ''}`.trim();
+      default:
+        return '腾讯新闻推送';
+    }
+  }
+
+  private buildNewsPushMessage(title: string, content: string, timezone: string): string {
+    const timestamp = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(new Date());
+
+    const maxBodyLength = 3600;
+    const safeContent = content.length > maxBodyLength
+      ? `${content.slice(0, maxBodyLength)}\n\n[内容过长，已截断]`
+      : content;
+
+    return `${title}\n时间: ${timestamp}\n\n${safeContent}`;
+  }
+
+  private async savePushedNewsOutput(newsType: string, content: string, keyword?: string, limit?: number): Promise<string> {
+    const dir = path.join(os.homedir(), '.ai-agent-cli', 'outputs', 'tencent-news');
+    await fs.mkdir(dir, { recursive: true });
+
+    const timestamp = new Date().toISOString().replace(/[:]/g, '-').replace(/\..+$/, '');
+    const keywordSuffix = keyword ? `_${keyword.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40)}` : '';
+    const fileName = `lark_push_${newsType}${keywordSuffix}_${timestamp}.txt`;
+    const filePath = path.join(dir, fileName);
+    const header = [
+      `Type: ${newsType}`,
+      keyword ? `Keyword: ${keyword}` : undefined,
+      limit ? `Limit: ${limit}` : undefined,
+      `GeneratedAt: ${new Date().toISOString()}`,
+      '',
+    ].filter(Boolean).join('\n');
+
+    await fs.writeFile(filePath, `${header}${content}`.trim() + '\n', 'utf-8');
+    return filePath;
+  }
+
+  private normalizeMcpTextResult(result: { content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }): string {
+    return (result.content || [])
+      .filter(item => item.type === 'text' && typeof item.text === 'string')
+      .map(item => item.text || '')
+      .join('\n')
+      .trim();
   }
 }
 

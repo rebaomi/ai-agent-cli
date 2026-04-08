@@ -50,6 +50,63 @@ export interface SkillContext {
   skillsDir: string;
 }
 
+export interface SkillLearningInput {
+  originalTask: string;
+  stepDescriptions: string[];
+  stepResults: string[];
+  completedSteps: number;
+  totalSteps: number;
+  refinement?: SkillCandidateRefinement;
+}
+
+export interface SkillCandidateRefinement {
+  shouldCreate?: boolean;
+  confidence?: number;
+  refinedDescription?: string;
+  whenToUse?: string;
+  procedure?: string[];
+  verification?: string[];
+  tags?: string[];
+  qualitySummary?: string;
+  suggestedName?: string;
+}
+
+export interface SkillCandidate {
+  name: string;
+  description: string;
+  path: string;
+  createdAt: string;
+  sourceTask: string;
+  confidence?: number;
+  qualitySummary?: string;
+  tags?: string[];
+}
+
+export interface SkillCandidateSearchResult extends SkillCandidate {
+  score: number;
+  whenToUse: string;
+  procedureSteps: string[];
+  verification: string[];
+}
+
+export interface SkillLearningTodo {
+  id: string;
+  createdAt: string;
+  sourceTask: string;
+  issueSummary: string;
+  suggestedSkill: string;
+  blockers: string[];
+  nextActions: string[];
+  tags?: string[];
+  confidence?: number;
+  draftedCandidateName?: string;
+  draftedAt?: string;
+}
+
+export interface SkillLearningTodoSearchResult extends SkillLearningTodo {
+  score: number;
+}
+
 const skillManifestSchema = z.object({
   name: z.string(),
   version: z.string(),
@@ -70,14 +127,25 @@ const skillManifestSchema = z.object({
 export class SkillManager {
   private skills: Map<string, Skill> = new Map();
   private skillsDir: string;
+  private candidatesDir: string;
+  private learningTodoFile: string;
   private enabledSkills: Set<string> = new Set();
+  private readonly manifestFiles = ['skill.json', 'SKILL.md', 'package.json'];
+
+  private get shouldLogDiscovery(): boolean {
+    return process.env.AI_AGENT_CLI_QUIET_SKILL_LOGS !== '1';
+  }
 
   constructor(skillsDir: string) {
     this.skillsDir = skillsDir;
+    this.candidatesDir = resolve(this.skillsDir, '..', 'skill-candidates');
+    this.learningTodoFile = join(this.candidatesDir, 'learning-todos.json');
   }
 
   async initialize(): Promise<void> {
     await fs.mkdir(this.skillsDir, { recursive: true });
+    await fs.mkdir(this.candidatesDir, { recursive: true });
+    await this.ensureLearningTodoStore();
     await this.discoverSkills();
   }
 
@@ -115,24 +183,96 @@ export class SkillManager {
     
     for (const path of searchPaths) {
       try {
-        const entries = await fs.readdir(path, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.isDirectory() && !discovered.has(entry.name)) {
-            if (!this.isValidSkillName(entry.name)) {
-              console.log(chalk.gray(`[Skill] Invalid name skipped: ${entry.name}`));
-              continue;
+        const candidates = await this.findSkillDirectories(path, 2);
+        for (const candidate of candidates) {
+          if (discovered.has(candidate.name)) {
+            continue;
+          }
+          discovered.add(candidate.name);
+          try {
+            await this.loadSkill(candidate.name, candidate.path);
+            if (this.shouldLogDiscovery) {
+              console.log(chalk.cyan(`[Skill] Loaded: ${candidate.name}`));
             }
-            discovered.add(entry.name);
-            try {
-              await this.loadSkill(entry.name, join(path, entry.name));
-              console.log(chalk.cyan(`[Skill] Loaded: ${entry.name}`));
-            } catch (e) {
-              console.log(chalk.gray(`[Skill] Skipped: ${entry.name}`));
+          } catch {
+            if (this.shouldLogDiscovery) {
+              console.log(chalk.gray(`[Skill] Skipped: ${candidate.name}`));
             }
           }
         }
       } catch {}
     }
+  }
+
+  private async findSkillDirectories(rootPath: string, maxDepth: number): Promise<Array<{ name: string; path: string }>> {
+    const found: Array<{ name: string; path: string }> = [];
+
+    const walk = async (currentPath: string, depth: number): Promise<void> => {
+      let entries;
+      try {
+        entries = await fs.readdir(currentPath, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        const traversable = await this.isTraversableDirectory(currentPath, entry);
+        if (!traversable) {
+          continue;
+        }
+
+        const entryPath = join(currentPath, entry.name);
+        const hasManifest = await this.hasSkillManifest(entryPath);
+
+        if (hasManifest) {
+          if (!this.isValidSkillName(entry.name)) {
+            if (this.shouldLogDiscovery) {
+              console.log(chalk.gray(`[Skill] Invalid name skipped: ${entry.name}`));
+            }
+          } else {
+            found.push({ name: entry.name, path: entryPath });
+          }
+          continue;
+        }
+
+        if (depth < maxDepth) {
+          await walk(entryPath, depth + 1);
+        }
+      }
+    };
+
+    await walk(rootPath, 1);
+    return found;
+  }
+
+  private async isTraversableDirectory(rootPath: string, entry: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean }): Promise<boolean> {
+    if (entry.isDirectory()) {
+      return true;
+    }
+
+    if (!entry.isSymbolicLink()) {
+      return false;
+    }
+
+    try {
+      const stats = await fs.stat(join(rootPath, entry.name));
+      return stats.isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  private async hasSkillManifest(skillPath: string): Promise<boolean> {
+    for (const manifestFile of this.manifestFiles) {
+      try {
+        await fs.access(join(skillPath, manifestFile));
+        return true;
+      } catch {
+        continue;
+      }
+    }
+
+    return false;
   }
 
   private isValidSkillName(name: string): boolean {
@@ -287,10 +427,15 @@ export class SkillManager {
     
     let manifest: any = null;
     let mainPath: string | undefined;
+    let skillContent = '';
+
+    try {
+      const skillMdPath = join(skillPath, 'SKILL.md');
+      await fs.access(skillMdPath);
+      skillContent = await fs.readFile(skillMdPath, 'utf-8');
+    } catch {}
     
-    const manifestFiles = ['skill.json', 'SKILL.md', 'package.json'];
-    
-    for (const mf of manifestFiles) {
+    for (const mf of this.manifestFiles) {
       const manifestPath = join(skillPath, mf);
       try {
         const content = await fs.readFile(manifestPath, 'utf-8');
@@ -304,7 +449,7 @@ export class SkillManager {
           manifest = {
             name: frontmatter.name || name,
             version: frontmatter.version || '1.0.0',
-            description: frontmatter.description || '',
+            description: this.normalizeSkillDescription(frontmatter.description, content, name),
             ...frontmatter,
           };
           mainPath = 'index.js';
@@ -326,19 +471,8 @@ export class SkillManager {
     
     if (!manifest.name) manifest.name = name;
     if (!manifest.version) manifest.version = '1.0.0';
-    if (!manifest.description) manifest.description = '';
-    
-    if (manifest.description.length < 1 || manifest.description.length > 1024) {
-      throw new Error(`Invalid description length: ${manifest.description.length}`);
-    }
-    
-    let skillContent = '';
-    try {
-      const skillMdPath = join(skillPath, 'SKILL.md');
-      await fs.access(skillMdPath);
-      skillContent = await fs.readFile(skillMdPath, 'utf-8');
-      skillContent = skillContent.replace(/^---[\s\S]*?---\n/, '');
-    } catch {}
+    manifest.description = this.normalizeSkillDescription(manifest.description, skillContent, name);
+    skillContent = skillContent.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
     
     const skill: Skill = {
       name: manifest.name || name,
@@ -374,7 +508,9 @@ export class SkillManager {
     }
     
     if (!loadedEntry) {
-      console.log(chalk.gray(`[Skill] ${name}: no entry file, using SKILL.md content`));
+      if (this.shouldLogDiscovery) {
+        console.log(chalk.gray(`[Skill] ${name}: no entry file, using SKILL.md content`));
+      }
     }
     
     this.skills.set(name, skill);
@@ -382,7 +518,7 @@ export class SkillManager {
   }
   
   private parseFrontmatter(content: string): Record<string, any> {
-    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
     if (!fmMatch || !fmMatch[1]) return {};
     
     const fm: Record<string, any> = {};
@@ -416,46 +552,132 @@ export class SkillManager {
     return fm;
   }
 
-  async listSkills(): Promise<Array<{ name: string; version: string; description: string; enabled: boolean }>> {
-    const entries = await fs.readdir(this.skillsDir, { withFileTypes: true });
-    const skills: Array<{ name: string; version: string; description: string; enabled: boolean }> = [];
-
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const skillPath = join(this.skillsDir, entry.name);
-        let manifest: any = null;
-        
-        const manifestFiles = ['skill.json', 'SKILL.md', 'package.json'];
-        for (const mf of manifestFiles) {
-          const manifestPath = join(skillPath, mf);
-          try {
-            const content = await fs.readFile(manifestPath, 'utf-8');
-            if (mf === 'skill.json' || mf === 'package.json') {
-              manifest = JSON.parse(content);
-            } else if (mf === 'SKILL.md') {
-              const fm = this.parseFrontmatter(content);
-              manifest = { name: fm.name, version: fm.version, description: fm.description };
-            }
-            break;
-          } catch {
-            continue;
-          }
-        }
-        
-        if (manifest) {
-          skills.push({
-            name: manifest.name || entry.name,
-            version: manifest.version || '1.0.0',
-            description: manifest.description || '',
-            enabled: this.enabledSkills.has(entry.name),
-          });
-        } else {
-          skills.push({ name: entry.name, version: 'unknown', description: '', enabled: false });
-        }
+  private normalizeSkillDescription(description: unknown, skillContent: string, name: string): string {
+    const raw = typeof description === 'string' ? description.trim() : '';
+    if (raw.length > 0) {
+      const cleaned = this.cleanMarkdownText(raw);
+      if (cleaned.length > 0) {
+        return this.summarizeDescription(cleaned).slice(0, 1024);
       }
     }
 
-    return skills;
+    const inferred = this.extractDescriptionFromContent(skillContent);
+    if (inferred.length > 0) {
+      return inferred.slice(0, 1024);
+    }
+
+    return `Skill: ${name}`;
+  }
+
+  private extractDescriptionFromContent(skillContent: string): string {
+    const body = skillContent.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
+    const lines = body.split(/\r?\n/);
+    const paragraphs: string[] = [];
+    let currentParagraph: string[] = [];
+    let inCodeFence = false;
+
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+
+      if (/^(```|~~~)/.test(trimmed)) {
+        inCodeFence = !inCodeFence;
+        continue;
+      }
+
+      if (inCodeFence) {
+        continue;
+      }
+
+      if (trimmed.length === 0) {
+        if (currentParagraph.length > 0) {
+          paragraphs.push(currentParagraph.join(' '));
+          currentParagraph = [];
+        }
+        continue;
+      }
+
+      if (this.isSkippableDescriptionLine(trimmed)) {
+        if (currentParagraph.length > 0) {
+          paragraphs.push(currentParagraph.join(' '));
+          currentParagraph = [];
+        }
+        continue;
+      }
+
+      const cleaned = this.cleanMarkdownText(trimmed);
+      if (cleaned.length === 0 || this.looksLikeStandaloneHeading(cleaned)) {
+        if (currentParagraph.length > 0) {
+          paragraphs.push(currentParagraph.join(' '));
+          currentParagraph = [];
+        }
+        continue;
+      }
+
+      currentParagraph.push(cleaned);
+    }
+
+    if (currentParagraph.length > 0) {
+      paragraphs.push(currentParagraph.join(' '));
+    }
+
+    for (const paragraph of paragraphs) {
+      const summary = this.summarizeDescription(paragraph);
+      if (summary.length > 0) {
+        return summary;
+      }
+    }
+
+    return '';
+  }
+
+  private isSkippableDescriptionLine(line: string): boolean {
+    return /^#{1,6}\s+/.test(line)
+      || /^>\s*/.test(line)
+      || /^[-*+]\s+/.test(line)
+      || /^\d+[.)]\s+/.test(line)
+      || /^\|.*\|$/.test(line)
+      || /^([-*_]\s*){3,}$/.test(line)
+      || /^<!--.*-->$/.test(line);
+  }
+
+  private looksLikeStandaloneHeading(line: string): boolean {
+    return line.length <= 24 && /[:：]$/.test(line);
+  }
+
+  private cleanMarkdownText(text: string): string {
+    return text
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/[*_~#>]+/g, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/^[-*+]\s+/, '')
+      .replace(/^\d+[.)]\s+/, '')
+      .replace(/\s*([，。！？；：])/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private summarizeDescription(text: string): string {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return '';
+    }
+
+    const sentenceMatch = normalized.match(/^(.+?[。！？!?；;.])(?:\s|$)/);
+    const candidate = sentenceMatch?.[1]?.trim() || normalized;
+    return candidate.length > 220 ? `${candidate.slice(0, 217).trim()}...` : candidate;
+  }
+
+  async listSkills(): Promise<Array<{ name: string; version: string; description: string; enabled: boolean }>> {
+    return this.getAllSkills()
+      .map(skill => ({
+        name: skill.name,
+        version: skill.version,
+        description: skill.description,
+        enabled: this.enabledSkills.has(skill.name),
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name));
   }
 
   getSkill(name: string): Skill | undefined {
@@ -555,6 +777,568 @@ export class SkillManager {
 
   getSkillsDir(): string {
     return this.skillsDir;
+  }
+
+  getSkillCandidatesDir(): string {
+    return this.candidatesDir;
+  }
+
+  async maybeCreateCandidateFromExecution(input: SkillLearningInput): Promise<SkillCandidate | null> {
+    if (input.completedSteps !== input.totalSteps) {
+      return null;
+    }
+
+    if (input.totalSteps < 2 && input.stepResults.length < 2) {
+      return null;
+    }
+
+    if (input.refinement?.shouldCreate === false) {
+      return null;
+    }
+
+    const confidence = this.normalizeCandidateConfidence(input.refinement?.confidence);
+    if (confidence !== undefined && confidence < 0.35) {
+      return null;
+    }
+
+    const description = input.refinement?.refinedDescription?.trim() || this.buildLearnedSkillDescription(input.originalTask);
+    const candidateName = await this.allocateCandidateName(input.refinement?.suggestedName || input.originalTask);
+    const createdAt = new Date().toISOString();
+    const candidateDir = join(this.candidatesDir, candidateName);
+    const skillMdPath = join(candidateDir, 'SKILL.md');
+    const content = this.buildCandidateSkillContent(candidateName, description, createdAt, input);
+
+    await fs.mkdir(candidateDir, { recursive: true });
+    await fs.writeFile(skillMdPath, content, 'utf-8');
+
+    return {
+      name: candidateName,
+      description,
+      path: skillMdPath,
+      createdAt,
+      sourceTask: input.originalTask,
+      confidence,
+      qualitySummary: input.refinement?.qualitySummary?.trim() || undefined,
+      tags: this.normalizeCandidateTags(input.refinement?.tags),
+    };
+  }
+
+  async listSkillCandidates(): Promise<SkillCandidate[]> {
+    const entries = await fs.readdir(this.candidatesDir, { withFileTypes: true }).catch(() => []);
+    const candidates: SkillCandidate[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const skillMdPath = join(this.candidatesDir, entry.name, 'SKILL.md');
+      try {
+        const content = await fs.readFile(skillMdPath, 'utf-8');
+        const parsed = this.parseSkillCandidateDocument(content, entry.name);
+        const stats = await fs.stat(skillMdPath);
+        candidates.push({
+          name: parsed.name,
+          description: parsed.description,
+          path: skillMdPath,
+          createdAt: stats.mtime.toISOString(),
+          sourceTask: parsed.sourceTask,
+          confidence: parsed.confidence,
+          qualitySummary: parsed.qualitySummary,
+          tags: parsed.tags,
+        });
+      } catch {
+        continue;
+      }
+    }
+
+    return candidates.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async searchSkillCandidates(query: string, limit = 5): Promise<SkillCandidateSearchResult[]> {
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) {
+      return [];
+    }
+
+    const entries = await fs.readdir(this.candidatesDir, { withFileTypes: true }).catch(() => []);
+    const results: SkillCandidateSearchResult[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const skillMdPath = join(this.candidatesDir, entry.name, 'SKILL.md');
+      try {
+        const content = await fs.readFile(skillMdPath, 'utf-8');
+        const parsed = this.parseSkillCandidateDocument(content, entry.name);
+        const score = this.computeCandidateRelevance(normalizedQuery, parsed);
+        if (score < 0.18) {
+          continue;
+        }
+
+        const stats = await fs.stat(skillMdPath);
+        results.push({
+          name: parsed.name,
+          description: parsed.description,
+          path: skillMdPath,
+          createdAt: stats.mtime.toISOString(),
+          sourceTask: parsed.sourceTask,
+          confidence: parsed.confidence,
+          qualitySummary: parsed.qualitySummary,
+          tags: parsed.tags,
+          whenToUse: parsed.whenToUse,
+          procedureSteps: parsed.procedureSteps,
+          verification: parsed.verification,
+          score,
+        });
+      } catch {
+        continue;
+      }
+    }
+
+    return results
+      .sort((left, right) => right.score - left.score || right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit);
+  }
+
+  async listLearningTodos(): Promise<SkillLearningTodo[]> {
+    await this.ensureLearningTodoStore();
+    try {
+      const content = await fs.readFile(this.learningTodoFile, 'utf-8');
+      const parsed = JSON.parse(content);
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+
+      return parsed
+        .filter((item): item is SkillLearningTodo => !!item && typeof item.id === 'string' && typeof item.sourceTask === 'string')
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    } catch {
+      return [];
+    }
+  }
+
+  async searchLearningTodos(query: string, limit = 5): Promise<SkillLearningTodoSearchResult[]> {
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) {
+      return [];
+    }
+
+    const todos = await this.listLearningTodos();
+    return todos
+      .map(todo => ({
+        ...todo,
+        score: this.computeLearningTodoRelevance(normalizedQuery, todo),
+      }))
+      .filter(todo => todo.score >= 0.18)
+      .sort((left, right) => right.score - left.score || right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit);
+  }
+
+  async addLearningTodo(input: Omit<SkillLearningTodo, 'id' | 'createdAt'>): Promise<SkillLearningTodo> {
+    await this.ensureLearningTodoStore();
+    const existing = await this.listLearningTodos();
+    const todo: SkillLearningTodo = {
+      id: `todo_${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      sourceTask: input.sourceTask,
+      issueSummary: input.issueSummary,
+      suggestedSkill: input.suggestedSkill,
+      blockers: input.blockers,
+      nextActions: input.nextActions,
+      tags: input.tags,
+      confidence: input.confidence,
+    };
+    const deduped = [todo, ...existing.filter(item => !(item.sourceTask === todo.sourceTask && item.suggestedSkill === todo.suggestedSkill))];
+    await fs.writeFile(this.learningTodoFile, JSON.stringify(deduped, null, 2), 'utf-8');
+    return todo;
+  }
+
+  async createCandidateFromTodo(reference: string): Promise<SkillCandidate> {
+    const normalizedReference = reference.trim();
+    if (!normalizedReference) {
+      throw new Error('Missing todo reference');
+    }
+
+    const todos = await this.listLearningTodos();
+    const todo = this.resolveLearningTodoReference(normalizedReference, todos);
+    if (!todo) {
+      throw new Error(`Learning todo not found: ${reference}`);
+    }
+
+    const candidateName = await this.allocateCandidateName(todo.suggestedSkill || todo.sourceTask);
+    const createdAt = new Date().toISOString();
+    const candidateDir = join(this.candidatesDir, candidateName);
+    const skillMdPath = join(candidateDir, 'SKILL.md');
+    const description = `Draft candidate created from learning todo: ${todo.issueSummary.replace(/\s+/g, ' ').trim()}`.slice(0, 240);
+    const content = this.buildCandidateFromTodoContent(candidateName, description, createdAt, todo);
+
+    await fs.mkdir(candidateDir, { recursive: true });
+    await fs.writeFile(skillMdPath, content, 'utf-8');
+
+    const updatedTodos = todos.map(item => item.id === todo.id ? {
+      ...item,
+      draftedCandidateName: candidateName,
+      draftedAt: createdAt,
+    } : item);
+    await fs.writeFile(this.learningTodoFile, JSON.stringify(updatedTodos, null, 2), 'utf-8');
+
+    return {
+      name: candidateName,
+      description,
+      path: skillMdPath,
+      createdAt,
+      sourceTask: todo.sourceTask,
+      confidence: this.normalizeCandidateConfidence(todo.confidence),
+      qualitySummary: `Seeded from learning todo ${todo.id}`,
+      tags: this.normalizeCandidateTags(todo.tags),
+    };
+  }
+
+  async adoptCandidate(name: string): Promise<void> {
+    const candidateDir = join(this.candidatesDir, name);
+    const targetDir = join(this.skillsDir, name);
+
+    await fs.access(join(candidateDir, 'SKILL.md'));
+    await fs.rm(targetDir, { recursive: true, force: true });
+    await this.copyDirectory(candidateDir, targetDir);
+    await this.loadSkill(name, targetDir);
+    this.enableSkill(name);
+  }
+
+  private buildLearnedSkillDescription(task: string): string {
+    const normalized = task.replace(/\s+/g, ' ').trim();
+    const shortened = normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+    return `Auto-generated draft skill learned from task: ${shortened}`;
+  }
+
+  private buildCandidateFromTodoContent(name: string, description: string, createdAt: string, todo: SkillLearningTodo): string {
+    const confidence = this.normalizeCandidateConfidence(todo.confidence);
+    const tags = this.normalizeCandidateTags(todo.tags);
+    const procedureLines = todo.nextActions.length > 0
+      ? todo.nextActions.map((step, index) => `${index + 1}. ${step.replace(/\s+/g, ' ').trim()}`)
+      : [
+          '1. 重现这个能力缺口对应的失败场景。',
+          '2. 选定需要补齐的 skill 或转换流程。',
+          '3. 实现后补验证步骤并回填这个草稿。',
+        ];
+    const verificationLines = [
+      ...todo.blockers.map(item => `- 解除阻塞: ${item.replace(/^[-*+]\s*/, '').trim()}`),
+      '- 验证目标输出文件或目标副作用真实产生。',
+      '- 确认回复文案会如实说明成功、降级或失败。',
+    ];
+
+    return [
+      '---',
+      `name: ${name}`,
+      `description: ${description.replace(/\r?\n/g, ' ')}`,
+      'version: 0.1.0',
+      `sourceTask: ${JSON.stringify(todo.sourceTask)}`,
+      `createdAt: ${createdAt}`,
+      `sourceTodoId: ${todo.id}`,
+      confidence !== undefined ? `confidence: ${confidence.toFixed(2)}` : undefined,
+      tags.length > 0 ? `tags: ${tags.join(', ')}` : undefined,
+      `qualitySummary: ${JSON.stringify(`Seeded from known gap: ${todo.issueSummary}`)}`,
+      '---',
+      '',
+      `# ${name}`,
+      '',
+      '## Status',
+      'This draft was seeded from a learning todo. It represents a known capability gap and still needs implementation details before reuse.',
+      '',
+      '## Assessment',
+      todo.issueSummary,
+      '',
+      '## When to Use',
+      `Use this skill when the user asks for a workflow similar to: ${todo.sourceTask}`,
+      '',
+      '## Procedure',
+      procedureLines.join('\n'),
+      '',
+      '## Verification',
+      verificationLines.join('\n'),
+      '',
+      '## Known Blockers',
+      ...(todo.blockers.length > 0 ? todo.blockers.map(item => `- ${item.replace(/^[-*+]\s*/, '').trim()}`) : ['- 暂无补充阻塞信息。']),
+      '',
+      '## Source Todo Snapshot',
+      `Todo ID: ${todo.id}`,
+      `Suggested skill: ${todo.suggestedSkill}`,
+      `Created at: ${todo.createdAt}`,
+      ...(todo.nextActions.length > 0 ? ['', 'Next actions:', ...todo.nextActions.map(item => `- ${item}`)] : []),
+      '',
+    ].filter((line): line is string => typeof line === 'string').join('\n');
+  }
+
+  private buildCandidateSkillContent(name: string, description: string, createdAt: string, input: SkillLearningInput): string {
+    const refinement = input.refinement;
+    const whenToUse = refinement?.whenToUse?.trim() || input.originalTask.replace(/\s+/g, ' ').trim();
+    const procedureLines = refinement?.procedure && refinement.procedure.length > 0
+      ? refinement.procedure.map((step, index) => `${index + 1}. ${step.replace(/\s+/g, ' ').trim()}`)
+      : input.stepDescriptions.map((step, index) => {
+      const preview = (input.stepResults[index] || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200);
+      return `${index + 1}. ${step}${preview ? `\n   - Observed result: ${preview}` : ''}`;
+    });
+    const verificationLines = refinement?.verification && refinement.verification.length > 0
+      ? refinement.verification.map(item => `- ${item.replace(/^[-*+]\s*/, '').trim()}`)
+      : [
+          '- Verify the produced output matches the expected artifacts or side effects from the original task.',
+          '- If any step was environment-specific, patch this draft before regular reuse.',
+        ];
+    const tags = this.normalizeCandidateTags(refinement?.tags);
+    const confidence = this.normalizeCandidateConfidence(refinement?.confidence);
+    const qualitySummary = refinement?.qualitySummary?.replace(/\r?\n/g, ' ').trim();
+
+    return [
+      '---',
+      `name: ${name}`,
+      `description: ${description.replace(/\r?\n/g, ' ')}`,
+      'version: 0.1.0',
+      `sourceTask: ${JSON.stringify(input.originalTask)}`,
+      `createdAt: ${createdAt}`,
+      confidence !== undefined ? `confidence: ${confidence.toFixed(2)}` : undefined,
+      tags.length > 0 ? `tags: ${tags.join(', ')}` : undefined,
+      qualitySummary ? `qualitySummary: ${JSON.stringify(qualitySummary)}` : undefined,
+      '---',
+      '',
+      `# ${name}`,
+      '',
+      '## Status',
+      'This is an auto-generated draft skill candidate. Review and refine it before relying on it as a stable workflow.',
+      '',
+      '## Assessment',
+      qualitySummary || 'Auto-generated after self-review. Validate the procedure before repeated reuse.',
+      confidence !== undefined ? `Confidence: ${confidence.toFixed(2)}` : undefined,
+      tags.length > 0 ? `Tags: ${tags.join(', ')}` : undefined,
+      '',
+      '## When to Use',
+      `Use this skill when the user asks for a similar workflow to: ${whenToUse}`,
+      '',
+      '## Procedure',
+      procedureLines.join('\n'),
+      '',
+      '## Verification',
+      verificationLines.join('\n'),
+      '',
+      '## Source Task Snapshot',
+      `Original task: ${input.originalTask}`,
+      `Completed steps: ${input.completedSteps}/${input.totalSteps}`,
+      '',
+    ].filter((line): line is string => typeof line === 'string').join('\n');
+  }
+
+  private async allocateCandidateName(task: string): Promise<string> {
+    const base = this.slugify(task).slice(0, 48) || 'learned-workflow';
+    let candidate = base;
+    let counter = 2;
+
+    while (await this.skillNameExists(candidate)) {
+      candidate = `${base}-${counter}`;
+      counter++;
+    }
+
+    return candidate;
+  }
+
+  private async skillNameExists(name: string): Promise<boolean> {
+    if (this.skills.has(name)) {
+      return true;
+    }
+
+    try {
+      await fs.access(join(this.candidatesDir, name, 'SKILL.md'));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private slugify(input: string): string {
+    return input
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .replace(/-{2,}/g, '-');
+  }
+
+  private normalizeCandidateConfidence(confidence: number | undefined): number | undefined {
+    if (typeof confidence !== 'number' || Number.isNaN(confidence)) {
+      return undefined;
+    }
+
+    return Math.max(0, Math.min(1, confidence));
+  }
+
+  private normalizeCandidateTags(tags: string[] | undefined): string[] {
+    return (tags || [])
+      .map(tag => tag.trim().toLowerCase())
+      .filter(Boolean)
+      .slice(0, 12);
+  }
+
+  private parseSkillCandidateDocument(content: string, fallbackName: string): {
+    name: string;
+    description: string;
+    sourceTask: string;
+    confidence?: number;
+    qualitySummary?: string;
+    tags: string[];
+    whenToUse: string;
+    procedureSteps: string[];
+    verification: string[];
+  } {
+    const frontmatter = this.parseFrontmatter(content);
+    const description = this.normalizeSkillDescription(frontmatter.description, content, fallbackName);
+    return {
+      name: typeof frontmatter.name === 'string' ? frontmatter.name : fallbackName,
+      description,
+      sourceTask: typeof frontmatter.sourceTask === 'string' ? frontmatter.sourceTask : '',
+      confidence: this.parseConfidence(frontmatter.confidence),
+      qualitySummary: typeof frontmatter.qualitySummary === 'string' ? frontmatter.qualitySummary : this.extractSection(content, 'Assessment').split(/\r?\n/)[0]?.trim() || undefined,
+      tags: this.parseTags(frontmatter.tags),
+      whenToUse: this.extractSection(content, 'When to Use').replace(/\s+/g, ' ').trim(),
+      procedureSteps: this.extractListSection(content, 'Procedure'),
+      verification: this.extractListSection(content, 'Verification'),
+    };
+  }
+
+  private parseConfidence(value: unknown): number | undefined {
+    if (typeof value === 'number') {
+      return this.normalizeCandidateConfidence(value);
+    }
+
+    if (typeof value === 'string') {
+      const parsed = Number.parseFloat(value);
+      return this.normalizeCandidateConfidence(parsed);
+    }
+
+    return undefined;
+  }
+
+  private parseTags(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return this.normalizeCandidateTags(value.filter((item): item is string => typeof item === 'string'));
+    }
+
+    if (typeof value === 'string') {
+      return this.normalizeCandidateTags(value.split(','));
+    }
+
+    return [];
+  }
+
+  private extractSection(content: string, heading: string): string {
+    const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
+    const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = body.match(new RegExp(`##\\s+${escaped}\\r?\\n([\\s\\S]*?)(?=\\r?\\n##\\s+|$)`, 'i'));
+    return match?.[1]?.trim() || '';
+  }
+
+  private extractListSection(content: string, heading: string): string[] {
+    const section = this.extractSection(content, heading);
+    if (!section) {
+      return [];
+    }
+
+    return section
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map(line => line.replace(/^[-*+]\s+/, '').replace(/^\d+[.)]\s+/, '').trim())
+      .filter(Boolean);
+  }
+
+  private computeCandidateRelevance(query: string, candidate: {
+    name: string;
+    description: string;
+    sourceTask: string;
+    whenToUse: string;
+    procedureSteps: string[];
+    verification: string[];
+    tags: string[];
+    confidence?: number;
+  }): number {
+    const haystack = [
+      candidate.name,
+      candidate.description,
+      candidate.sourceTask,
+      candidate.whenToUse,
+      candidate.procedureSteps.join(' '),
+      candidate.verification.join(' '),
+      candidate.tags.join(' '),
+    ].join(' ').toLowerCase();
+    const queryTerms = this.extractRelevanceTerms(query.toLowerCase());
+    if (queryTerms.length === 0) {
+      return 0;
+    }
+
+    const hitCount = queryTerms.filter(term => haystack.includes(term)).length;
+    const overlapScore = hitCount / queryTerms.length;
+    const exactBonus = haystack.includes(query.toLowerCase().trim()) ? 0.25 : 0;
+    const confidenceBonus = (candidate.confidence || 0) * 0.15;
+    return Math.min(1, overlapScore + exactBonus + confidenceBonus);
+  }
+
+  private computeLearningTodoRelevance(query: string, todo: SkillLearningTodo): number {
+    const haystack = [
+      todo.sourceTask,
+      todo.issueSummary,
+      todo.suggestedSkill,
+      todo.blockers.join(' '),
+      todo.nextActions.join(' '),
+      (todo.tags || []).join(' '),
+    ].join(' ').toLowerCase();
+    const queryTerms = this.extractRelevanceTerms(query.toLowerCase());
+    if (queryTerms.length === 0) {
+      return 0;
+    }
+
+    const hitCount = queryTerms.filter(term => haystack.includes(term)).length;
+    const overlapScore = hitCount / queryTerms.length;
+    const exactBonus = haystack.includes(query.toLowerCase().trim()) ? 0.25 : 0;
+    const confidenceBonus = (todo.confidence || 0) * 0.12;
+    return Math.min(1, overlapScore + exactBonus + confidenceBonus);
+  }
+
+  private resolveLearningTodoReference(reference: string, todos: SkillLearningTodo[]): SkillLearningTodo | null {
+    const normalized = reference.trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+
+    return todos.find(todo => todo.id.toLowerCase() === normalized)
+      || todos.find(todo => todo.suggestedSkill.toLowerCase() === normalized)
+      || todos.find(todo => todo.draftedCandidateName?.toLowerCase() === normalized)
+      || null;
+  }
+
+  private extractRelevanceTerms(input: string): string[] {
+    const baseTerms = input.match(/[a-z0-9]+|[\u4e00-\u9fff]{2,}/g) || [];
+    const expanded = new Set<string>();
+
+    for (const term of baseTerms) {
+      expanded.add(term);
+      if (/^[\u4e00-\u9fff]+$/.test(term) && term.length >= 4) {
+        for (let index = 0; index < term.length - 1; index++) {
+          expanded.add(term.slice(index, index + 2));
+        }
+      }
+    }
+
+    return Array.from(expanded).filter(term => term.length >= 2);
+  }
+
+  private async ensureLearningTodoStore(): Promise<void> {
+    try {
+      await fs.access(this.learningTodoFile);
+    } catch {
+      await fs.writeFile(this.learningTodoFile, '[]', 'utf-8');
+    }
   }
 }
 

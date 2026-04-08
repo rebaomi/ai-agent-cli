@@ -67,8 +67,9 @@ export class MCPClient extends EventEmitter {
     return new Promise((resolve, reject) => {
       const { command, args = [], env = {} } = this.config;
       let settled = false;
+      const spawnSpec = this.buildSpawnSpec(command, args);
       
-      this.process = spawn(command, args, {
+      this.process = spawn(spawnSpec.command, spawnSpec.args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, ...env },
         windowsHide: true,
@@ -135,6 +136,34 @@ export class MCPClient extends EventEmitter {
       this.process.once('error', clearOnSettle);
       this.process.once('exit', clearOnSettle);
     });
+  }
+
+  private buildSpawnSpec(command: string, args: string[]): { command: string; args: string[] } {
+    if (process.platform !== 'win32') {
+      return { command, args };
+    }
+
+    if (!/\.(cmd|bat)$/i.test(command)) {
+      return { command, args };
+    }
+
+    const escaped = [command, ...args].map(value => this.escapeWindowsShellArg(value)).join(' ');
+    return {
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', escaped],
+    };
+  }
+
+  private escapeWindowsShellArg(value: string): string {
+    if (value.length === 0) {
+      return '""';
+    }
+
+    if (!/[\s"]/g.test(value)) {
+      return value;
+    }
+
+    return `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1')}"`;
   }
 
   private processStdout(buffer: string): void {

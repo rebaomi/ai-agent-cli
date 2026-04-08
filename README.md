@@ -100,6 +100,10 @@ ollama:
 
 workspace: .
 maxIterations: 100
+artifactOutputDir: C:/Users/your-name/.ai-agent-cli/outputs
+maxToolCallsPerTurn: 10
+autoContinueOnToolLimit: true
+maxContinuationTurns: 3
 
 sandbox:
   enabled: true
@@ -120,6 +124,8 @@ sandbox:
 | `/tools` | 列出可用工具 |
 | `/config` | 显示配置 |
 | `/skill` | 管理 Skills |
+| `/skill candidates` | 查看自动学习生成的 skill 草稿 |
+| `/skill adopt <name>` | 将候选草稿转正并启用 |
 | `/org` | 管理组织架构/团队 |
 | `/cat` | 电子宠物 AgentCat |
 | `/progress` | 查看任务进度 |
@@ -176,6 +182,11 @@ coolAI --cron-once
 /news search AI 5
 /news morning
 /news evening
+/news save hot 10
+/news save search AI 5
+/news push morning --save
+/news push hot --limit 5
+/news output-dir
 ```
 
 说明：
@@ -183,7 +194,36 @@ coolAI --cron-once
 - `/news search <keyword> [limit]` 搜索腾讯新闻
 - `/news morning` 查看腾讯早报
 - `/news evening` 查看腾讯晚报
+- `/news save ...` 固定保存到 `~/.ai-agent-cli/outputs/tencent-news`
+- `/news output-dir` 查看本地输出目录
 - `/news help` 查看帮助
+
+### Obsidian Vault 接入
+
+Obsidian 本质上是一个 Markdown vault。当前最稳的接法是直接把 vault 目录挂成 `filesystem MCP`，让 Agent 通过 MCP 方式读写笔记，而不是依赖一个额外的专有 bridge。
+
+配置示例：
+
+```yaml
+mcp:
+  - name: obsidian
+    command: npx.cmd
+    args:
+      - -y
+      - @modelcontextprotocol/server-filesystem
+      - C:/Users/your-name/Documents/Your-Obsidian-Vault
+```
+
+推荐目录结构：
+
+- `Inbox/`：Agent 临时整理的初稿
+- `Knowledge/`：整理后的长期知识文档
+
+这样后面就可以让 Agent 定期学习某个主题，再把结果整理成 Markdown 文档写入 Obsidian vault。CLI 中也可以直接检查：
+
+```bash
+/mcp check obsidian
+```
 
 ### MemPalace 长期记忆接入
 
@@ -240,6 +280,73 @@ mcp:
 
 这意味着现有的本地记忆宫殿不会被替换，而是多了一层更强的长期记忆后端。
 
+### 飞书官方 lark-cli 接入
+
+飞书官方的 `lark-cli` 本身不是 stdio MCP server。它是一个 AI-friendly CLI，本体会去调用飞书云侧的 MCP HTTP 端点。
+
+当前项目已经补了一个本地 `lark-cli` MCP bridge，可以把 MCP tool 调用转成 `lark-cli` 子命令，因此可以无缝挂进现有 MCP Manager。
+
+准备步骤：
+
+```bash
+npm install -g @larksuite/cli
+lark-cli config init --new
+lark-cli auth login --recommend
+npm run build
+```
+
+然后在 `~/.ai-agent-cli/config.yaml` 里加入：
+
+```yaml
+mcp:
+  - name: lark
+    command: node
+    args:
+      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+    env:
+      LARK_CLI_BIN: lark-cli
+```
+
+Windows 上如果提示 `spawn lark-cli ENOENT`，通常是因为全局 npm 可执行文件实际名称为 `lark-cli.cmd`。可以改成：
+
+```yaml
+mcp:
+  - name: lark
+    command: node
+    args:
+      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+    env:
+      LARK_CLI_BIN: lark-cli.cmd
+```
+
+当前 bridge 也会在 Windows 上自动尝试 `lark-cli.cmd`、`lark-cli.exe`、`lark-cli.bat` 以及常见全局 npm bin 路径。
+
+接入后常用 MCP 工具包括：
+
+- `lark_help`
+- `lark_doctor`
+- `lark_auth_status`
+- `lark_schema`
+- `lark_shortcut`
+- `lark_service`
+- `lark_api`
+
+几个典型调用：
+
+```json
+{ "service": "calendar", "command": "+agenda" }
+{ "service": "contact", "command": "+search-user", "flags": { "query": "张三" } }
+{ "service": "docs", "command": "+create", "flags": { "title": "周报", "markdown": "# 本周进展" } }
+{ "service": "calendar", "resource": "calendars", "method": "list" }
+{ "httpMethod": "GET", "path": "/open-apis/calendar/v4/calendars" }
+```
+
+CLI 内也可以直接检查 bridge：
+
+```bash
+/mcp check lark
+```
+
 ### 工具体系
 
 当前工具按八类能力组织：
@@ -252,6 +359,17 @@ mcp:
 - MCP：MCP 工具、资源与认证入口
 - 系统：配置、权限、todo、cron、skill 配置
 - 实验：LSP、sleep 等
+
+### Skill 学习草稿
+
+当前系统支持一种保守版的“自动学习 skill”闭环：
+
+- 对于已确认计划并成功执行的复杂任务，Agent 会从实际步骤和结果中生成候选 skill 草稿
+- 草稿默认保存到 `~/.ai-agent-cli/skill-candidates`
+- 系统不会自动下载安装外部 skill，也不会自动启用草稿
+- 你可以用 `/skill candidates` 查看候选，再用 `/skill adopt <name>` 手动转正
+
+这样可以保留经验沉淀能力，同时避免 Agent 擅自修改技能环境。
 
 ### 智能工具调用示例
 
@@ -1087,6 +1205,12 @@ sandbox:
 
 > Full example: `config/example.yaml`
 
+Tool call control notes:
+- `maxToolCallsPerTurn`: single-response local budget for tool calls. This is enforced by coolAI, not by DeepSeek itself.
+- `autoContinueOnToolLimit`: when enabled, coolAI automatically starts a follow-up round if the current round hits the tool-call budget.
+- `maxContinuationTurns`: maximum number of automatic follow-up rounds after the first round.
+- `artifactOutputDir`: default output directory for relative artifact paths such as txt/md/docx/pdf/xlsx/csv/pptx.
+
 ### Commands
 
 | Command | Description |
@@ -1150,6 +1274,9 @@ You can also use slash commands for Tencent News directly:
 /news search AI 5
 /news morning
 /news evening
+/news save hot 10
+/news save search AI 5
+/news output-dir
 ```
 
 Notes:
@@ -1157,7 +1284,122 @@ Notes:
 - `/news search <keyword> [limit]` searches Tencent News
 - `/news morning` shows the morning briefing
 - `/news evening` shows the evening briefing
+- `/news save ...` always saves into `~/.ai-agent-cli/outputs/tencent-news`
+- `/news push <type> ...` fetches Tencent News and sends it to Lark through the configured `lark` MCP bridge, defaulting to `notifications.lark.morningNews.chatId`
+- `/news output-dir` shows the local output directory
 - `/news help` shows usage help
+
+If you want scheduled delivery to Lark inside the built-in cron system, create a cron job against the built-in `push_news_to_lark` tool through the shortcut command:
+
+```bash
+/cron create-news-lark morning-feishu morning 0 8 * * * --save
+/cron create-news-lark hot-feishu hot 0 9 * * * --limit 5
+/cron create-news-lark ai-search search 0 10 * * * --keyword AI --save
+```
+
+For the most common morning briefing case, you can define the default recipient in config and then use a fixed short command.
+
+Config example:
+
+```yaml
+notifications:
+  lark:
+    morningNews:
+      chatId: oc_xxx
+      # userId: ou_xxx  # optional, only needed for direct-message delivery
+      schedule: '0 8 * * *'
+      timezone: Asia/Shanghai
+      saveOutput: true
+```
+
+If you only want group delivery, `chatId` is enough. `userId` is optional and only used by `/cron create-morning-feishu` for direct messages.
+
+Then inside the CLI you can create the cron job without repeating the target and schedule:
+
+```bash
+/cron create-morning-feishu-group
+/cron create-morning-feishu
+```
+
+You can still override the configured target inline when needed:
+
+```bash
+/cron create-morning-feishu ou_xxx
+/cron create-morning-feishu-group oc_xxx
+```
+
+### Integrating Official lark-cli
+
+The official `lark-cli` is not a stdio MCP server. It is an AI-friendly CLI that itself calls Lark's cloud MCP HTTP endpoint.
+
+This project now includes a local `lark-cli` MCP bridge. The bridge accepts MCP tool calls and translates them into `lark-cli` subcommands, so it plugs into the existing MCP Manager without changing the rest of the system.
+
+Setup:
+
+```bash
+npm install -g @larksuite/cli
+lark-cli config init --new
+lark-cli auth login --recommend
+npm run build
+```
+
+Then add this to `~/.ai-agent-cli/config.yaml`:
+
+```yaml
+mcp:
+  - name: lark
+    command: node
+    args:
+      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+    env:
+      LARK_CLI_BIN: lark-cli
+```
+
+Available MCP tools include:
+
+- `lark_help`
+- `lark_doctor`
+- `lark_auth_status`
+- `lark_schema`
+- `lark_shortcut`
+- `lark_service`
+- `lark_api`
+
+Typical calls:
+
+```json
+{ "service": "calendar", "command": "+agenda" }
+{ "service": "contact", "command": "+search-user", "flags": { "query": "Alice" } }
+{ "service": "docs", "command": "+create", "flags": { "title": "Weekly Report", "markdown": "# Progress" } }
+{ "service": "calendar", "resource": "calendars", "method": "list" }
+{ "httpMethod": "GET", "path": "/open-apis/calendar/v4/calendars" }
+```
+
+You can also inspect the bridge inside the CLI:
+
+```bash
+/mcp check lark
+```
+
+If you want a simple scheduled delivery path without extending the built-in cron orchestration, use the standalone script below. It fetches Tencent News and sends the result through `lark-cli im +messages-send`:
+
+```bash
+npm run push:news:lark -- --type morning --user-id ou_xxx --save
+npm run push:news:lark -- --type hot --limit 8 --chat-id oc_xxx
+npm run push:news:lark -- --type search --keyword AI --chat-id oc_xxx --save
+```
+
+Windows Task Scheduler example:
+
+```powershell
+schtasks /Create /SC DAILY /TN "AI-Agent Morning News to Lark" /TR "powershell -NoProfile -Command \"cd D:\workspace\ai-agent-cli; npm.cmd run push:news:lark -- --type morning --user-id ou_xxx --save\"" /ST 08:00
+```
+
+The script lives at `scripts/news-to-lark.mjs`. It requires:
+
+- `@larksuite/cli` installed and authenticated
+- the app bot already able to message the target user or chat
+- `@tencentnews/cli` available through `npx`
 
 ### Tool System
 

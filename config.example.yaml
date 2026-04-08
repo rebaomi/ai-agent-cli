@@ -137,6 +137,18 @@ mcp:
       ROOT_DIR: .
 ```
 
+也可以直接把 Obsidian vault 挂成一个专用 MCP：
+
+```yaml
+mcp:
+  - name: obsidian
+    command: npx.cmd
+    args:
+      - -y
+      - @modelcontextprotocol/server-filesystem
+      - C:/Users/your-name/Documents/Your-Obsidian-Vault
+```
+
 常用 MCP 服务器：
 - `@modelcontextprotocol/server-filesystem` - 文件系统访问
 - `@modelcontextprotocol/server-brave-search` - 搜索功能
@@ -163,6 +175,39 @@ mcp:
 
 接入后，MemPalace 工具会自动并入统一 Tool Registry，Agent 会在涉及历史事实、长期项目记忆、人物关系和会话归档时优先使用它。
 
+### 飞书官方 lark-cli MCP Bridge 配置
+
+`lark-cli` 本身不是一个 stdio MCP server，它内部是 MCP client，会去调用飞书云侧 MCP 端点。
+
+要接入 coolAI，推荐使用本仓库内置的本地 bridge：bridge 负责接收 MCP tool 调用，再转成 `lark-cli` 子命令。
+
+准备步骤：
+- 全局安装官方 CLI：`npm install -g @larksuite/cli`
+- 初始化应用：`lark-cli config init --new`
+- 登录授权：`lark-cli auth login --recommend`
+- 在本项目里先构建一次：`npm run build`
+
+配置示例：
+
+```yaml
+mcp:
+  - name: lark
+    command: node
+    args:
+      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+    env:
+      LARK_CLI_BIN: lark-cli
+```
+
+接入后会提供这些 MCP 工具：
+- `lark_help`
+- `lark_doctor`
+- `lark_auth_status`
+- `lark_schema`
+- `lark_shortcut`
+- `lark_service`
+- `lark_api`
+
 ## LSP 配置 (可选)
 LSP (Language Server Protocol) 用于代码智能提示。
 
@@ -181,6 +226,17 @@ lsp:
 代码执行的安全限制。
 
 ```yaml
+artifactOutputDir: C:/Users/your-name/.ai-agent-cli/outputs
+# 兼容别名，未设置 artifactOutputDir 时生效
+# documentOutputDir: C:/Users/your-name/Documents/coolAI
+
+# 单轮最多执行多少次工具调用。不是模型供应商限制，是 CLI 本地控制阈值。
+maxToolCallsPerTurn: 10
+# 达到单轮上限后，CLI 是否自动开启下一轮继续执行。
+autoContinueOnToolLimit: true
+# 自动续跑的最大轮数。总工具预算约等于 maxToolCallsPerTurn * (1 + maxContinuationTurns)
+maxContinuationTurns: 3
+
 sandbox:
   enabled: true
   timeout: 30000
@@ -198,6 +254,17 @@ sandbox:
 workspace: .
 maxIterations: 100
 toolTimeout: 60000
+
+notifications:
+  lark:
+    morningNews:
+      # 群推送只需要 chatId。若要私聊某个用户，再额外填写 userId。
+      chatId: oc_xxx
+      # userId: ou_xxx
+      schedule: '0 8 * * *'
+      timezone: Asia/Shanghai
+      saveOutput: true
+      # title: 每日早报
 ```
 
 ## 配置位置
