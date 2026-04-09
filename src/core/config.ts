@@ -4,9 +4,13 @@ import { z } from 'zod';
 import { parse } from 'yaml';
 import type { AgentConfig } from '../types/index.js';
 
-function getDefaultArtifactOutputDir(): string {
+export function getDefaultAppBaseDir(): string {
   const homeDir = process.env.HOME || process.env.USERPROFILE || process.cwd();
-  return join(homeDir, '.ai-agent-cli', 'outputs');
+  return join(homeDir, '.ai-agent-cli');
+}
+
+function getDefaultArtifactOutputDir(): string {
+  return join(getDefaultAppBaseDir(), 'outputs');
 }
 
 const memorySchema = z.object({
@@ -49,6 +53,32 @@ const providerSchema = z.object({
   systemPrompt: z.string().optional(),
 });
 
+const deepseekAutoReasoningSchema = z.object({
+  enabled: z.boolean().default(false),
+  simpleTaskMaxChars: z.number().int().min(1).max(4000).default(120),
+  simpleConversationMaxChars: z.number().int().min(100).max(500000).default(8000),
+  preferReasonerForToolMessages: z.boolean().default(true),
+  preferReasonerForPlanning: z.boolean().default(true),
+  preferReasonerForLongContext: z.boolean().default(true),
+});
+
+const deepseekProviderSchema = providerSchema.extend({
+  reasoningModel: z.string().default('deepseek-reasoner'),
+  autoReasoning: deepseekAutoReasoningSchema.nullish(),
+});
+
+const routedProviderSchema = z.enum(['ollama', 'deepseek', 'kimi', 'glm', 'doubao', 'minimax', 'openai', 'claude', 'gemini']);
+
+const hybridSchema = z.object({
+  enabled: z.boolean().default(true),
+  localProvider: routedProviderSchema.default('ollama'),
+  remoteProvider: routedProviderSchema.default('deepseek'),
+  simpleTaskMaxChars: z.number().int().min(1).max(1000).default(80),
+  simpleConversationMaxChars: z.number().int().min(100).max(200000).default(6000),
+  preferRemoteForToolMessages: z.boolean().default(true),
+  localAvailabilityCacheMs: z.number().int().min(0).max(300000).default(15000),
+});
+
 const larkMorningNewsSchema = z.object({
   userId: z.string().optional(),
   chatId: z.string().optional(),
@@ -58,6 +88,25 @@ const larkMorningNewsSchema = z.object({
   title: z.string().optional(),
 });
 
+const larkWeatherSchema = z.object({
+  chatId: z.string().optional(),
+  city: z.string().optional(),
+  schedule: z.string().default('0 9 * * *'),
+  timezone: z.string().default('Asia/Shanghai'),
+});
+
+const larkRelaySchema = z.object({
+  enabled: z.boolean().default(false),
+  autoSubscribe: z.boolean().default(true),
+  eventTypes: z.array(z.string()).default(['im.message.receive_v1']),
+  compact: z.boolean().default(true),
+  quiet: z.boolean().default(true),
+  allowedChatIds: z.array(z.string()).optional(),
+  allowedSenderIds: z.array(z.string()).optional(),
+  allowCommands: z.boolean().default(false),
+  cliBin: z.string().optional(),
+});
+
 const notificationsSchema = z.object({
   lark: z.object({
     morningNews: larkMorningNewsSchema.default({
@@ -65,13 +114,25 @@ const notificationsSchema = z.object({
       timezone: 'Asia/Shanghai',
       saveOutput: true,
     }),
+    weather: larkWeatherSchema.default({
+      schedule: '0 9 * * *',
+      timezone: 'Asia/Shanghai',
+    }),
+    relay: larkRelaySchema.default({
+      enabled: false,
+      autoSubscribe: true,
+      eventTypes: ['im.message.receive_v1'],
+      compact: true,
+      quiet: true,
+      allowCommands: false,
+    }),
   }).optional(),
 }).optional();
 
 const configSchema = z.object({
   defaultProvider: z.string().default('ollama'),
   ollama: providerSchema.merge(z.object({ baseUrl: z.string().default('http://localhost:11434') })),
-  deepseek: providerSchema.optional(),
+  deepseek: deepseekProviderSchema.optional(),
   kimi: providerSchema.optional(),
   glm: providerSchema.optional(),
   doubao: providerSchema.optional(),
@@ -79,10 +140,12 @@ const configSchema = z.object({
   openai: providerSchema.optional(),
   claude: providerSchema.optional(),
   gemini: providerSchema.optional(),
+  hybrid: hybridSchema.optional(),
   mcp: z.array(mcpServerSchema).optional(),
   lsp: z.array(lspServerSchema).optional(),
   sandbox: sandboxSchema.optional(),
   memory: memorySchema.optional(),
+  appBaseDir: z.string().default(getDefaultAppBaseDir()),
   artifactOutputDir: z.string().default(getDefaultArtifactOutputDir()),
   documentOutputDir: z.string().optional(),
   workspace: z.string().default(process.cwd()),
@@ -105,6 +168,7 @@ const defaultConfig: ConfigSchema = {
     temperature: 0.7,
     maxTokens: 4096,
   },
+  appBaseDir: getDefaultAppBaseDir(),
   artifactOutputDir: getDefaultArtifactOutputDir(),
   workspace: process.cwd(),
   maxIterations: 100,
@@ -112,6 +176,15 @@ const defaultConfig: ConfigSchema = {
   autoContinueOnToolLimit: true,
   maxContinuationTurns: 3,
   toolTimeout: 60000,
+  hybrid: {
+    enabled: true,
+    localProvider: 'ollama',
+    remoteProvider: 'deepseek',
+    simpleTaskMaxChars: 80,
+    simpleConversationMaxChars: 6000,
+    preferRemoteForToolMessages: true,
+    localAvailabilityCacheMs: 15000,
+  },
   notifications: {
     lark: {
       morningNews: {
@@ -119,6 +192,34 @@ const defaultConfig: ConfigSchema = {
         timezone: 'Asia/Shanghai',
         saveOutput: true,
       },
+      weather: {
+        schedule: '0 9 * * *',
+        timezone: 'Asia/Shanghai',
+      },
+      relay: {
+        enabled: false,
+        autoSubscribe: true,
+        eventTypes: ['im.message.receive_v1'],
+        compact: true,
+        quiet: true,
+        allowCommands: false,
+      },
+    },
+  },
+  deepseek: {
+    enabled: false,
+    model: 'deepseek-chat',
+    reasoningModel: 'deepseek-reasoner',
+    baseUrl: 'https://api.deepseek.com',
+    temperature: 0.7,
+    maxTokens: 4096,
+    autoReasoning: {
+      enabled: false,
+      simpleTaskMaxChars: 120,
+      simpleConversationMaxChars: 8000,
+      preferReasonerForToolMessages: true,
+      preferReasonerForPlanning: true,
+      preferReasonerForLongContext: true,
     },
   },
   mcp: [],

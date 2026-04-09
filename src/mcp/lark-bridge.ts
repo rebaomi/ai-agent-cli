@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { join, extname } from 'node:path';
+import { join, extname, dirname, delimiter } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 type JsonObject = Record<string, unknown>;
@@ -31,14 +31,28 @@ interface CommandExecutionResult {
 
 const LARK_CLI_BIN = process.env.LARK_CLI_BIN || 'lark-cli';
 
-function getLarkCliCandidates(): string[] {
-  const baseCandidates = [LARK_CLI_BIN];
-  if (process.platform === 'win32' && extname(LARK_CLI_BIN).length === 0) {
-    baseCandidates.push(`${LARK_CLI_BIN}.cmd`, `${LARK_CLI_BIN}.exe`, `${LARK_CLI_BIN}.bat`);
+export function getBaseLarkCliCandidates(binName = LARK_CLI_BIN, platform = process.platform): string[] {
+  const baseCandidates = [binName];
+  if (platform === 'win32') {
+    const extension = extname(binName).toLowerCase();
+    if (extension.length === 0) {
+      // Prefer the native .exe wrapper on Windows so multi-line --text values do not pass through cmd.exe re-quoting.
+      baseCandidates.push(`${binName}.exe`, `${binName}.cmd`, `${binName}.bat`);
+    } else if (extension === '.cmd' || extension === '.bat') {
+      const baseName = binName.slice(0, -extension.length);
+      // Even if config points to .cmd/.bat, prefer the sibling .exe first to avoid cmd.exe argument re-quoting.
+      baseCandidates.unshift(`${baseName}.exe`, baseName);
+    }
   }
 
+  return Array.from(new Set(baseCandidates));
+}
+
+function getLarkCliCandidates(): string[] {
+  const baseCandidates = getBaseLarkCliCandidates();
+
   if (process.platform !== 'win32') {
-    return Array.from(new Set(baseCandidates));
+    return baseCandidates;
   }
 
   const appData = process.env.APPDATA;
@@ -56,6 +70,56 @@ function getLarkCliCandidates(): string[] {
   }
 
   return Array.from(new Set(expanded));
+}
+
+function splitWindowsPathEntries(envPath = process.env.PATH): string[] {
+  if (typeof envPath !== 'string' || envPath.length === 0) {
+    return [];
+  }
+
+  return envPath
+    .split(delimiter)
+    .map(entry => entry.trim())
+    .filter(entry => entry.length > 0);
+}
+
+function resolveWindowsCommandPath(command: string, envPath = process.env.PATH): string | undefined {
+  if (command.includes('\\') || command.includes('/')) {
+    return existsSync(command) ? command : undefined;
+  }
+
+  const extension = extname(command).toLowerCase();
+  const suffixes = extension.length > 0 ? [''] : ['', '.exe', '.cmd', '.bat', '.ps1'];
+
+  for (const dir of splitWindowsPathEntries(envPath)) {
+    for (const suffix of suffixes) {
+      const candidate = join(dir, `${command}${suffix}`);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function resolveWindowsNodeWrapper(command: string, args: string[], envPath = process.env.PATH): { command: string; args: string[] } | undefined {
+  const resolvedCommand = resolveWindowsCommandPath(command, envPath);
+  if (!resolvedCommand || !/\.(cmd|bat|ps1)$/i.test(resolvedCommand)) {
+    return undefined;
+  }
+
+  const wrapperDir = dirname(resolvedCommand);
+  const scriptPath = join(wrapperDir, 'node_modules', '@larksuite', 'cli', 'scripts', 'run.js');
+  if (!existsSync(scriptPath)) {
+    return undefined;
+  }
+
+  const bundledNode = join(wrapperDir, 'node.exe');
+  return {
+    command: existsSync(bundledNode) ? bundledNode : 'node',
+    args: [scriptPath, ...args],
+  };
 }
 
 const TOOL_DEFINITIONS: MCPToolDefinition[] = [
@@ -213,6 +277,173 @@ function appendFlags(args: string[], flags: Record<string, unknown>): void {
   }
 }
 
+function normalizeShortcutFlags(service: string, command: string, flags: Record<string, unknown>): Record<string, unknown> {
+  if (service === 'calendar' && command === '+create') {
+    const normalized: Record<string, unknown> = { ...flags };
+
+    const summary = firstNonEmptyString(
+      normalized.summary,
+      normalized.title,
+      normalized.subject,
+      normalized.name,
+    );
+    const description = firstNonEmptyString(
+      normalized.description,
+      normalized.desc,
+      normalized.details,
+      normalized.content,
+    );
+    const start = firstNonEmptyString(
+      normalized.start,
+      normalized.startTime,
+      normalized.start_time,
+      normalized['start-time'],
+    );
+    const end = firstNonEmptyString(
+      normalized.end,
+      normalized.endTime,
+      normalized.end_time,
+      normalized['end-time'],
+    );
+    const attendeeIds = firstNonEmptyString(
+      normalized['attendee-ids'],
+      normalized.attendeeIds,
+      normalized.attendees,
+    );
+    const calendarId = firstNonEmptyString(
+      normalized['calendar-id'],
+      normalized.calendarId,
+      normalized.calendar_id,
+    );
+
+    if (summary) {
+      normalized.summary = summary;
+    }
+    if (description) {
+      normalized.description = description;
+    }
+    if (start) {
+      normalized.start = start;
+    }
+    if (end) {
+      normalized.end = end;
+    }
+    if (attendeeIds) {
+      normalized['attendee-ids'] = attendeeIds;
+    }
+    if (calendarId) {
+      normalized['calendar-id'] = calendarId;
+    }
+
+    delete normalized.title;
+    delete normalized.subject;
+    delete normalized.name;
+    delete normalized.desc;
+    delete normalized.details;
+    delete normalized.content;
+    delete normalized.startTime;
+    delete normalized.start_time;
+    delete normalized['start-time'];
+    delete normalized.endTime;
+    delete normalized.end_time;
+    delete normalized['end-time'];
+    delete normalized.attendeeIds;
+    delete normalized.attendees;
+    delete normalized.calendarId;
+    delete normalized.calendar_id;
+
+    return normalized;
+  }
+
+  if (service !== 'im' || command !== '+messages-send') {
+    return flags;
+  }
+
+  const normalized: Record<string, unknown> = { ...flags };
+
+  const chatId = firstNonEmptyString(
+    normalized['chat-id'],
+    normalized.chatId,
+    normalized.chat_id,
+  );
+  const userId = firstNonEmptyString(
+    normalized['user-id'],
+    normalized.userId,
+    normalized.user_id,
+    normalized.open_id,
+  );
+  const receiveId = firstNonEmptyString(
+    normalized.receive_id,
+    normalized.receiveId,
+    normalized['receive-id'],
+  );
+  const receiveIdType = firstNonEmptyString(
+    normalized.receive_id_type,
+    normalized.receiveIdType,
+    normalized['receive-id-type'],
+  )?.toLowerCase();
+
+  if (!chatId && !userId && receiveId && receiveIdType) {
+    if (receiveIdType === 'chat_id' || receiveIdType === 'chatid' || receiveIdType === 'chat') {
+      normalized['chat-id'] = receiveId;
+    }
+    if (receiveIdType === 'open_id' || receiveIdType === 'openid' || receiveIdType === 'user_id' || receiveIdType === 'userid' || receiveIdType === 'user') {
+      normalized['user-id'] = receiveId;
+    }
+  }
+
+  if (!normalized['chat-id'] && chatId) {
+    normalized['chat-id'] = chatId;
+  }
+  if (!normalized['user-id'] && userId) {
+    normalized['user-id'] = userId;
+  }
+
+  const hasExplicitPayload = [
+    normalized.text,
+    normalized.markdown,
+    normalized.file,
+    normalized.image,
+    normalized.video,
+    normalized.audio,
+  ].some(value => value !== undefined && value !== null && !(typeof value === 'string' && value.trim().length === 0));
+
+  const legacyContent = normalized.content;
+  const msgType = firstNonEmptyString(normalized.msg_type, normalized.msgType)?.toLowerCase();
+  if (!hasExplicitPayload && typeof legacyContent === 'string' && legacyContent.trim().length > 0) {
+    if (!msgType || msgType === 'text') {
+      normalized.text = legacyContent;
+      delete normalized.content;
+    }
+  }
+
+  delete normalized.chatId;
+  delete normalized.chat_id;
+  delete normalized.userId;
+  delete normalized.user_id;
+  delete normalized.open_id;
+  delete normalized.receive_id;
+  delete normalized.receiveId;
+  delete normalized['receive-id'];
+  delete normalized.receive_id_type;
+  delete normalized.receiveIdType;
+  delete normalized['receive-id-type'];
+  delete normalized.msg_type;
+  delete normalized.msgType;
+
+  return normalized;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+}
+
 function buildShortcutArgs(input: JsonObject): string[] {
   const service = asOptionalString(input.service);
   const command = asOptionalString(input.command);
@@ -221,15 +452,32 @@ function buildShortcutArgs(input: JsonObject): string[] {
   }
 
   const args = [service, command];
-  appendFlags(args, asFlagRecord(input.flags));
+  const flags = normalizeShortcutFlags(service, command, asFlagRecord(input.flags));
+  appendFlags(args, flags);
 
-  const as = asOptionalString(input.as)
-    || inferDefaultIdentityForShortcut(service, command);
+  if (service === 'im' && command === '+messages-send') {
+    const hasTarget = typeof flags['chat-id'] === 'string' || typeof flags['user-id'] === 'string';
+    if (!hasTarget) {
+      throw new Error('im +messages-send requires chat-id or user-id');
+    }
+
+    const hasPayload = ['text', 'markdown', 'file', 'image', 'video', 'audio', 'content']
+      .some(key => flags[key] !== undefined && flags[key] !== null && !(typeof flags[key] === 'string' && (flags[key] as string).trim().length === 0));
+    if (!hasPayload) {
+      throw new Error('im +messages-send requires one of text, markdown, file, image, video, audio, or content');
+    }
+  }
+
+  const as = service === 'im' && command === '+messages-send'
+    ? 'bot'
+    : asOptionalString(input.as) || inferDefaultIdentityForShortcut(service, command);
   if (as) {
     args.push('--as', as);
   }
 
-  args.push('--format', asOptionalString(input.format) || 'json');
+  if (!(service === 'im' && command === '+messages-send')) {
+    args.push('--format', asOptionalString(input.format) || 'json');
+  }
 
   if (input.dryRun === true) {
     args.push('--dry-run');
@@ -422,9 +670,19 @@ async function executeCommand(args: string[]): Promise<CommandExecutionResult> {
   throw lastError || new Error(`Unable to locate lark-cli executable from ${getLarkCliCandidates().join(', ')}`);
 }
 
-function buildSpawnSpec(command: string, args: string[]): { command: string; args: string[] } {
-  if (process.platform !== 'win32') {
+export function buildSpawnSpec(
+  command: string,
+  args: string[],
+  platform = process.platform,
+  envPath = process.env.PATH,
+): { command: string; args: string[] } {
+  if (platform !== 'win32') {
     return { command, args };
+  }
+
+  const nodeWrapperSpec = resolveWindowsNodeWrapper(command, args, envPath);
+  if (nodeWrapperSpec) {
+    return nodeWrapperSpec;
   }
 
   if (!/\.(cmd|bat)$/i.test(command)) {

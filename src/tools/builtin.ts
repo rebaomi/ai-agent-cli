@@ -1,7 +1,7 @@
-import { promises as fs } from 'fs';
+import { existsSync, promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import type { Tool, ToolResult } from '../types/index.js';
 import { Sandbox } from '../sandbox/executor.js';
@@ -9,6 +9,11 @@ import { LSPManager } from '../lsp/client.js';
 import type { MCPManager } from '../mcp/client.js';
 import type { TaskManager } from '../core/task-manager.js';
 import type { CronManager } from '../core/cron-manager.js';
+import { writeDocxDocument } from '../utils/docx-export.js';
+import { writePdfDocument } from '../utils/pdf-export.js';
+import { writePptxDocument } from '../utils/pptx-export.js';
+import { writeXlsxDocument } from '../utils/xlsx-export.js';
+import { runBrowserAutomation, resolveBrowserExecutable, type BrowserAutomationAction, type BrowserTarget } from '../utils/browser-automation.js';
 import { resolveOutputPath, resolveUserPath } from '../utils/path-resolution.js';
 
 const execAsync = promisify(exec);
@@ -29,6 +34,7 @@ export class BuiltInTools {
   private cronManager?: CronManager;
   private workspace?: string;
   private config?: Record<string, unknown>;
+  private currentCronJobName?: string;
 
   constructor(sandbox: Sandbox, lspManager: LSPManager, options: BuiltInToolsOptions = {}) {
     this.sandbox = sandbox;
@@ -40,20 +46,75 @@ export class BuiltInTools {
     this.config = options.config;
   }
 
-  private resolveInputPath(filePath: string): string {
-    return resolveUserPath(filePath, {
+  async executeToolForCronJob(name: string, args: unknown, jobName: string): Promise<ToolResult> {
+    const previous = this.currentCronJobName;
+    this.currentCronJobName = jobName;
+    try {
+      return await this.executeTool(name, args);
+    } finally {
+      this.currentCronJobName = previous;
+    }
+  }
+
+  private getCronRootDir(): string {
+    return this.cronManager?.getStoreDir()
+      || path.join(os.homedir(), '.ai-agent-cli', 'cron');
+  }
+
+  private sanitizeCronJobName(name: string): string {
+    return name.replace(/[<>:"/\\|?*]+/g, '-').replace(/\s+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'job';
+  }
+
+  private getCurrentCronJobWorkDir(): string | undefined {
+    if (!this.currentCronJobName) {
+      return undefined;
+    }
+
+    return this.cronManager?.getJobWorkDir(this.currentCronJobName)
+      || path.join(this.getCronRootDir(), this.sanitizeCronJobName(this.currentCronJobName));
+  }
+
+  private getPathResolutionOptions(): { workspace?: string; appBaseDir?: string; artifactOutputDir?: string; documentOutputDir?: string } {
+    const cronWorkDir = this.getCurrentCronJobWorkDir();
+    if (cronWorkDir) {
+      return {
+        workspace: cronWorkDir,
+        artifactOutputDir: cronWorkDir,
+        documentOutputDir: cronWorkDir,
+      };
+    }
+
+    return {
       workspace: this.workspace,
+      appBaseDir: typeof this.config?.appBaseDir === 'string' ? this.config.appBaseDir : undefined,
       artifactOutputDir: typeof this.config?.artifactOutputDir === 'string' ? this.config.artifactOutputDir : undefined,
       documentOutputDir: typeof this.config?.documentOutputDir === 'string' ? this.config.documentOutputDir : undefined,
-    });
+    };
+  }
+
+  private resolveInputPath(filePath: string): string {
+    const pathOptions = this.getPathResolutionOptions();
+    const resolvedWorkspacePath = resolveUserPath(filePath, pathOptions);
+
+    if (existsSync(resolvedWorkspacePath)) {
+      return resolvedWorkspacePath;
+    }
+
+    const resolvedArtifactPath = resolveOutputPath(filePath, pathOptions);
+
+    if (existsSync(resolvedArtifactPath)) {
+      return resolvedArtifactPath;
+    }
+
+    return resolvedWorkspacePath;
   }
 
   private resolveOutputFilePath(filePath: string): string {
-    return resolveOutputPath(filePath, {
-      workspace: this.workspace,
-      artifactOutputDir: typeof this.config?.artifactOutputDir === 'string' ? this.config.artifactOutputDir : undefined,
-      documentOutputDir: typeof this.config?.documentOutputDir === 'string' ? this.config.documentOutputDir : undefined,
-    });
+    return resolveOutputPath(filePath, this.getPathResolutionOptions());
+  }
+
+  private isStructuredDocumentExtension(filePath: string): boolean {
+    return /\.(docx|pdf|xlsx|pptx)$/i.test(filePath);
   }
 
   getTools(): Tool[] {
@@ -72,6 +133,10 @@ export class BuiltInTools {
       { ...this.grepTool(), category: 'file_operations' },
       { ...this.globTool(), category: 'file_operations' },
       { ...this.readMultipleFilesTool(), category: 'file_operations' },
+      { ...this.txtToDocxTool(), category: 'file_operations' },
+      { ...this.txtToPdfTool(), category: 'file_operations' },
+      { ...this.txtToPptxTool(), category: 'file_operations' },
+      { ...this.txtToXlsxTool(), category: 'file_operations' },
       
       // Execution
       { ...this.executeCommandTool(), category: 'execution' },
@@ -82,6 +147,8 @@ export class BuiltInTools {
       { ...this.webSearchTool(), category: 'search_fetch' },
       { ...this.fetchUrlTool(), category: 'search_fetch' },
       { ...this.openBrowserTool(), category: 'search_fetch' },
+      { ...this.browserAutomateTool(), category: 'search_fetch' },
+      { ...this.getWeatherTool(), category: 'search_fetch' },
 
       // Agents & Tasks
       { ...this.agentSendMessageTool(), category: 'agents_tasks' },
@@ -114,6 +181,9 @@ export class BuiltInTools {
       { ...this.configTool(), category: 'system' },
       { ...this.cronCreateTool(), category: 'system' },
       { ...this.cronDeleteTool(), category: 'system' },
+      { ...this.cronStartTool(), category: 'system' },
+      { ...this.cronStopTool(), category: 'system' },
+      { ...this.cronRunTool(), category: 'system' },
       { ...this.cronListTool(), category: 'system' },
       
       // Experimental
@@ -125,7 +195,9 @@ export class BuiltInTools {
       { ...this.tencentSearchNewsTool(), category: 'search_fetch' },
       { ...this.tencentMorningNewsTool(), category: 'search_fetch' },
       { ...this.tencentEveningNewsTool(), category: 'search_fetch' },
+      { ...this.sendLarkMessageTool(), category: 'mcp' },
       { ...this.pushNewsToLarkTool(), category: 'mcp' },
+      { ...this.pushWeatherToLarkTool(), category: 'mcp' },
     ];
   }
 
@@ -149,7 +221,7 @@ export class BuiltInTools {
   private writeFileTool(): Tool {
     return {
       name: 'write_file',
-      description: 'Write content to a file, creating it if it does not exist',
+      description: 'Write content to a text file, creating it if it does not exist',
       input_schema: {
         type: 'object',
         properties: {
@@ -163,6 +235,88 @@ export class BuiltInTools {
           },
         },
         required: ['path', 'content'],
+      },
+    };
+  }
+
+  private txtToDocxTool(): Tool {
+    return {
+      name: 'txt_to_docx',
+      description: 'Create a Word document from plain text and save it to the configured output directory unless an explicit path is provided',
+      input_schema: {
+        type: 'object',
+        properties: {
+          output: {
+            type: 'string',
+            description: 'Output .docx path; relative paths are saved under the configured artifact output directory',
+          },
+          text: {
+            type: 'string',
+            description: 'Plain text document body',
+          },
+          title: {
+            type: 'string',
+            description: 'Optional document title shown as the first heading',
+          },
+        },
+        required: ['output', 'text'],
+      },
+    };
+  }
+
+  private txtToXlsxTool(): Tool {
+    return {
+      name: 'txt_to_xlsx',
+      description: 'Create an XLSX spreadsheet from plain text, markdown table, CSV, or TSV content and save it to the configured output directory unless an explicit path is provided',
+      input_schema: {
+        type: 'object',
+        properties: {
+          output: {
+            type: 'string',
+            description: 'Output .xlsx path; relative paths are saved under the configured artifact output directory',
+          },
+          text: {
+            type: 'string',
+            description: 'Spreadsheet body as markdown table, CSV, TSV, or plain lines',
+          },
+          title: {
+            type: 'string',
+            description: 'Optional worksheet title',
+          },
+        },
+        required: ['output', 'text'],
+      },
+    };
+  }
+
+  private txtToPdfTool(): Tool {
+    return {
+      name: 'txt_to_pdf',
+      description: 'Create a PDF document from plain text and save it to the configured output directory unless an explicit path is provided',
+      input_schema: {
+        type: 'object',
+        properties: {
+          out: { type: 'string', description: 'Output .pdf path; relative paths are saved under the configured artifact output directory' },
+          text: { type: 'string', description: 'Plain text document body' },
+          title: { type: 'string', description: 'Optional document title' },
+        },
+        required: ['out', 'text'],
+      },
+    };
+  }
+
+  private txtToPptxTool(): Tool {
+    return {
+      name: 'txt_to_pptx',
+      description: 'Create a PPTX presentation from plain text and save it to the configured output directory unless an explicit path is provided',
+      input_schema: {
+        type: 'object',
+        properties: {
+          output: { type: 'string', description: 'Output .pptx path; relative paths are saved under the configured artifact output directory' },
+          text: { type: 'string', description: 'Slide body text, one line per paragraph or bullet' },
+          title: { type: 'string', description: 'Optional slide title' },
+        },
+        required: ['output', 'text'],
       },
     };
   }
@@ -516,14 +670,57 @@ export class BuiltInTools {
   private openBrowserTool(): Tool {
     return {
       name: 'open_browser',
-      description: 'Open a URL in the default browser',
+      description: 'Open a URL in the requested browser, defaulting to the system browser unless browser is specified',
       input_schema: {
         type: 'object',
         properties: {
           url: { type: 'string', description: 'URL to open' },
+          browser: { type: 'string', description: 'Optional browser target: chrome, edge, chromium, or default' },
           background: { type: 'boolean', description: 'Open in background without focusing (default: false)' },
         },
         required: ['url'],
+      },
+    };
+  }
+
+  private browserAutomateTool(): Tool {
+    return {
+      name: 'browser_automate',
+      description: 'Use Playwright to open a page and perform scripted browser actions such as click, fill, wait, extract text, and screenshot',
+      input_schema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Initial URL to open' },
+          actions: {
+            type: 'array',
+            description: 'Browser action list. Supported types: goto, click, fill, press, wait_for_selector, wait, extract_text, screenshot',
+            items: { type: 'object' },
+          },
+          browser: { type: 'string', description: 'Browser target for automation: chrome, edge, or chromium. Default chrome' },
+          headless: { type: 'boolean', description: 'Run browser headless by default; set false to show the browser window' },
+          timeoutMs: { type: 'number', description: 'Default timeout for actions in milliseconds' },
+        },
+        required: ['url'],
+      },
+    };
+  }
+
+  private getWeatherTool(): Tool {
+    return {
+      name: 'get_weather',
+      description: 'Query current weather and today forecast for a city',
+      input_schema: {
+        type: 'object',
+        properties: {
+          city: {
+            type: 'string',
+            description: 'City name, e.g. 北京 or Shanghai',
+          },
+          timezone: {
+            type: 'string',
+            description: 'Optional IANA timezone, default Asia/Shanghai',
+          },
+        },
       },
     };
   }
@@ -878,6 +1075,46 @@ export class BuiltInTools {
     };
   }
 
+  private cronStartTool(): Tool {
+    return {
+      name: 'cron_start',
+      description: 'Start the cron scheduler or enable a cron job by id or name',
+      input_schema: {
+        type: 'object',
+        properties: {
+          idOrName: { type: 'string', description: 'Optional cron job id or name' },
+        },
+      },
+    };
+  }
+
+  private cronStopTool(): Tool {
+    return {
+      name: 'cron_stop',
+      description: 'Stop the cron scheduler or disable a cron job by id or name',
+      input_schema: {
+        type: 'object',
+        properties: {
+          idOrName: { type: 'string', description: 'Optional cron job id or name' },
+        },
+      },
+    };
+  }
+
+  private cronRunTool(): Tool {
+    return {
+      name: 'cron_run',
+      description: 'Run a cron job immediately once by id or name, regardless of whether it is currently due',
+      input_schema: {
+        type: 'object',
+        properties: {
+          idOrName: { type: 'string', description: 'Cron job id or name' },
+        },
+        required: ['idOrName'],
+      },
+    };
+  }
+
   private cronListTool(): Tool {
     return {
       name: 'cron_list',
@@ -956,21 +1193,56 @@ export class BuiltInTools {
   private pushNewsToLarkTool(): Tool {
     return {
       name: 'push_news_to_lark',
-      description: 'Fetch Tencent News and send it to a Lark user or chat via the configured lark MCP bridge',
+      description: 'Fetch Tencent News and send it to a Lark chat via the configured lark MCP bridge using bot identity',
       input_schema: {
         type: 'object',
         properties: {
           newsType: { type: 'string', description: 'One of morning, evening, hot, search' },
-          userId: { type: 'string', description: 'Optional Lark user open_id (ou_xxx); falls back to notifications.lark.morningNews.userId' },
           chatId: { type: 'string', description: 'Optional Lark chat id (oc_xxx); falls back to notifications.lark.morningNews.chatId' },
           keyword: { type: 'string', description: 'Required for search news type' },
           limit: { type: 'number', description: 'Limit for hot/search news, default 10' },
-          title: { type: 'string', description: 'Optional custom message title' },
+          title: { type: 'string', description: 'Optional news heading title' },
           timezone: { type: 'string', description: 'Optional timezone for the header, default Asia/Shanghai' },
           saveOutput: { type: 'boolean', description: 'Save the generated message to local output directory' },
           dryRun: { type: 'boolean', description: 'Return the outgoing message without sending it to Lark' },
         },
         required: ['newsType'],
+      },
+    };
+  }
+
+  private pushWeatherToLarkTool(): Tool {
+    return {
+      name: 'push_weather_to_lark',
+      description: 'Fetch today weather for a city and send it to a Lark chat via the configured lark MCP bridge using bot identity',
+      input_schema: {
+        type: 'object',
+        properties: {
+          chatId: { type: 'string', description: 'Optional Lark chat id (oc_xxx); falls back to notifications.lark.weather.chatId or notifications.lark.morningNews.chatId' },
+          city: { type: 'string', description: 'City name, default notifications.lark.weather.city or 北京' },
+          timezone: { type: 'string', description: 'Optional timezone, default notifications.lark.weather.timezone or Asia/Shanghai' },
+          dryRun: { type: 'boolean', description: 'Return the outgoing message without sending it to Lark' },
+        },
+      },
+    };
+  }
+
+  private sendLarkMessageTool(): Tool {
+    return {
+      name: 'send_lark_message',
+      description: 'Send a custom message or media to a Lark chat via the configured lark MCP bridge using bot identity',
+      input_schema: {
+        type: 'object',
+        properties: {
+          chatId: { type: 'string', description: 'Optional Lark chat id (oc_xxx); falls back to notifications.lark.morningNews.chatId' },
+          text: { type: 'string', description: 'Plain text message body' },
+          markdown: { type: 'string', description: 'Markdown message body' },
+          file: { type: 'string', description: 'Relative file path to send as an attachment' },
+          image: { type: 'string', description: 'Relative image path to send' },
+          video: { type: 'string', description: 'Relative video path to send' },
+          audio: { type: 'string', description: 'Relative audio path to send' },
+          dryRun: { type: 'boolean', description: 'Return the outgoing request without sending it to Lark' },
+        },
       },
     };
   }
@@ -987,8 +1259,43 @@ export class BuiltInTools {
         case 'write_file': {
           const { path: filePath, content } = args as { path: string; content: string };
           const resolvedPath = this.resolveOutputFilePath(filePath);
+          if (this.isStructuredDocumentExtension(resolvedPath)) {
+            throw new Error(`write_file 不能直接写入 ${path.extname(resolvedPath)} 文件。请改用对应的导出工具生成真实文档。`);
+          }
           await this.sandbox.writeFile(resolvedPath, content);
           result = `File written successfully: ${resolvedPath}`;
+          break;
+        }
+
+        case 'txt_to_docx': {
+          const { output, text, title } = args as { output: string; text: string; title?: string };
+          const resolvedPath = this.resolveOutputFilePath(output);
+          await writeDocxDocument(resolvedPath, String(text || ''), typeof title === 'string' ? title : undefined);
+          result = `Created report document: ${resolvedPath}`;
+          break;
+        }
+
+        case 'txt_to_pdf': {
+          const { out, text, title } = args as { out: string; text: string; title?: string };
+          const resolvedPath = this.resolveOutputFilePath(out);
+          await writePdfDocument(resolvedPath, String(text || ''), typeof title === 'string' ? title : undefined);
+          result = `Created PDF document: ${resolvedPath}`;
+          break;
+        }
+
+        case 'txt_to_pptx': {
+          const { output, text, title } = args as { output: string; text: string; title?: string };
+          const resolvedPath = this.resolveOutputFilePath(output);
+          await writePptxDocument(resolvedPath, String(text || ''), typeof title === 'string' ? title : undefined);
+          result = `Created presentation document: ${resolvedPath}`;
+          break;
+        }
+
+        case 'txt_to_xlsx': {
+          const { output, text, title } = args as { output: string; text: string; title?: string };
+          const resolvedPath = this.resolveOutputFilePath(output);
+          await writeXlsxDocument(resolvedPath, String(text || ''), typeof title === 'string' ? title : undefined);
+          result = `Created spreadsheet document: ${resolvedPath}`;
           break;
         }
 
@@ -1037,7 +1344,12 @@ export class BuiltInTools {
 
         case 'execute_command': {
           const { command, timeout } = args as { command: string; timeout?: number };
-          const execResult = await this.sandbox.execute(command, [], { cwd: process.cwd() });
+          const isWindows = process.platform === 'win32';
+          const cwd = this.getCurrentCronJobWorkDir() || process.cwd();
+          await fs.mkdir(cwd, { recursive: true });
+          const execResult = isWindows
+            ? await this.sandbox.execute('powershell', ['-NoProfile', '-Command', command], { cwd, timeout })
+            : await this.sandbox.execute('bash', ['-lc', command], { cwd, timeout });
           result = `Exit code: ${execResult.exitCode}\n\nStdout:\n${execResult.stdout}\n\nStderr:\n${execResult.stderr}`;
           break;
         }
@@ -1139,8 +1451,26 @@ export class BuiltInTools {
         }
 
         case 'open_browser': {
-          const { url, background } = args as { url: string; background?: boolean };
-          result = await this.openBrowser(url, background ?? false);
+          const { url, background, browser } = args as { url: string; background?: boolean; browser?: BrowserTarget | 'default' };
+          result = await this.openBrowser(url, background ?? false, browser ?? 'default');
+          break;
+        }
+
+        case 'browser_automate': {
+          const { url, actions, headless, timeoutMs, browser } = args as {
+            url: string;
+            actions?: BrowserAutomationAction[];
+            browser?: BrowserTarget;
+            headless?: boolean;
+            timeoutMs?: number;
+          };
+          result = await this.browserAutomate(url, actions ?? [], browser ?? 'chrome', headless ?? true, timeoutMs ?? 15000);
+          break;
+        }
+
+        case 'get_weather': {
+          const { city, timezone } = args as { city?: string; timezone?: string };
+          result = await this.getWeather(city, timezone);
           break;
         }
 
@@ -1285,6 +1615,24 @@ export class BuiltInTools {
           break;
         }
 
+        case 'cron_start': {
+          const { idOrName } = args as { idOrName?: string };
+          result = await this.cronStart(idOrName);
+          break;
+        }
+
+        case 'cron_stop': {
+          const { idOrName } = args as { idOrName?: string };
+          result = await this.cronStop(idOrName);
+          break;
+        }
+
+        case 'cron_run': {
+          const { idOrName } = args as { idOrName: string };
+          result = await this.cronRun(idOrName);
+          break;
+        }
+
         case 'cron_list':
           result = this.cronList();
           break;
@@ -1319,13 +1667,36 @@ export class BuiltInTools {
         case 'push_news_to_lark': {
           result = await this.pushNewsToLark(args as {
             newsType: string;
-            userId?: string;
             chatId?: string;
             keyword?: string;
             limit?: number;
             title?: string;
             timezone?: string;
             saveOutput?: boolean;
+            dryRun?: boolean;
+          });
+          break;
+        }
+
+        case 'push_weather_to_lark': {
+          result = await this.pushWeatherToLark(args as {
+            chatId?: string;
+            city?: string;
+            timezone?: string;
+            dryRun?: boolean;
+          });
+          break;
+        }
+
+        case 'send_lark_message': {
+          result = await this.sendLarkMessage(args as {
+            chatId?: string;
+            text?: string;
+            markdown?: string;
+            file?: string;
+            image?: string;
+            video?: string;
+            audio?: string;
             dryRun?: boolean;
           });
           break;
@@ -1535,59 +1906,219 @@ export class BuiltInTools {
     }
   }
 
+  private getNetworkHeaders(accept = 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8'): Record<string, string> {
+    return {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': accept,
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+    };
+  }
+
+  private async fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 15000): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private decodeHtmlEntities(value: string): string {
+    return value
+      .replace(/&amp;/gi, '&')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&apos;/gi, "'")
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&#x([0-9a-f]+);/gi, (_match, hex) => String.fromCodePoint(parseInt(hex, 16)))
+      .replace(/&#(\d+);/g, (_match, dec) => String.fromCodePoint(parseInt(dec, 10)));
+  }
+
+  private htmlToPlainText(value: string): string {
+    return this.decodeHtmlEntities(value)
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private normalizeWebSearchUrl(rawHref: string, baseUrl = 'https://duckduckgo.com'): string | null {
+    if (!rawHref) return null;
+
+    const decodedHref = this.decodeHtmlEntities(rawHref.trim());
+    const absoluteHref = decodedHref.startsWith('//')
+      ? `https:${decodedHref}`
+      : decodedHref.startsWith('/')
+        ? `${baseUrl}${decodedHref}`
+        : decodedHref;
+
+    try {
+      const parsed = new URL(absoluteHref);
+      if (/duckduckgo\.com$/i.test(parsed.hostname) && parsed.pathname === '/l/') {
+        const target = parsed.searchParams.get('uddg');
+        if (target) {
+          return this.decodeHtmlEntities(target);
+        }
+      }
+
+      if (/^https?:$/i.test(parsed.protocol)) {
+        return parsed.toString();
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
+  }
+
+  private extractBaiduResults(html: string, numResults: number): Array<{ title: string; url: string; snippet?: string }> {
+    const results: Array<{ title: string; url: string; snippet?: string }> = [];
+    const seen = new Set<string>();
+    const titleMatches = Array.from(
+      html.matchAll(/<h3[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<\/h3>/gi),
+    );
+
+    for (let index = 0; index < titleMatches.length && results.length < numResults; index++) {
+      const match = titleMatches[index];
+      if (!match) {
+        continue;
+      }
+
+      const normalizedUrl = this.normalizeWebSearchUrl(match[1] || '', 'https://www.baidu.com');
+      if (!normalizedUrl || seen.has(normalizedUrl)) {
+        continue;
+      }
+
+      const blockStart = match.index ?? 0;
+      const blockEnd = titleMatches[index + 1]?.index ?? Math.min(html.length, blockStart + 2200);
+      const blockHtml = html.slice(blockStart, blockEnd);
+      const snippetMatch = blockHtml.match(
+        /<(?:div|span|p)[^>]+class="[^"]*(?:c-abstract|c-span-last|content-right|summary|desc)[^"]*"[^>]*>([\s\S]*?)<\/(?:div|span|p)>/i,
+      );
+
+      seen.add(normalizedUrl);
+      results.push({
+        title: this.htmlToPlainText(match[2] || '') || 'No title',
+        url: normalizedUrl,
+        snippet: snippetMatch ? this.htmlToPlainText(snippetMatch[1] || '') || undefined : undefined,
+      });
+    }
+
+    return results;
+  }
+
+  private extractDuckDuckGoHtmlResults(html: string, numResults: number): Array<{ title: string; url: string; snippet?: string }> {
+    const results: Array<{ title: string; url: string; snippet?: string }> = [];
+    const seen = new Set<string>();
+    const anchorRegex = /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const snippetRegex = /class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+    const snippets = Array.from(html.matchAll(snippetRegex)).map(match => this.htmlToPlainText(match[1] || ''));
+
+    let index = 0;
+    for (const match of html.matchAll(anchorRegex)) {
+      if (results.length >= numResults) break;
+
+      const normalizedUrl = this.normalizeWebSearchUrl(match[1] || '');
+      if (!normalizedUrl || seen.has(normalizedUrl)) {
+        index++;
+        continue;
+      }
+
+      seen.add(normalizedUrl);
+      results.push({
+        title: this.htmlToPlainText(match[2] || '') || 'No title',
+        url: normalizedUrl,
+        snippet: snippets[index] || undefined,
+      });
+      index++;
+    }
+
+    return results;
+  }
+
+  private extractDuckDuckGoLiteResults(html: string, numResults: number): Array<{ title: string; url: string; snippet?: string }> {
+    const results: Array<{ title: string; url: string; snippet?: string }> = [];
+    const seen = new Set<string>();
+    const anchorRegex = /<a[^>]+href="([^"]+)"[^>]*class="[^"]*result-link[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+
+    for (const match of html.matchAll(anchorRegex)) {
+      if (results.length >= numResults) break;
+
+      const normalizedUrl = this.normalizeWebSearchUrl(match[1] || '');
+      if (!normalizedUrl || seen.has(normalizedUrl)) continue;
+
+      seen.add(normalizedUrl);
+      results.push({
+        title: this.htmlToPlainText(match[2] || '') || 'No title',
+        url: normalizedUrl,
+      });
+    }
+
+    return results;
+  }
+
   private async webSearch(query: string, numResults: number): Promise<string> {
     try {
       const encodedQuery = encodeURIComponent(query);
-      const url = `https://html.duckduckgo.com/html/?q=${encodedQuery}&kl=wt-wt`;
-
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      const endpoints = [
+        {
+          name: 'duckduckgo-html',
+          url: `https://html.duckduckgo.com/html/?q=${encodedQuery}&kl=wt-wt`,
+          parse: (html: string) => this.extractDuckDuckGoHtmlResults(html, numResults),
         },
-      });
+        {
+          name: 'duckduckgo-lite',
+          url: `https://lite.duckduckgo.com/lite/?q=${encodedQuery}&kl=wt-wt`,
+          parse: (html: string) => this.extractDuckDuckGoLiteResults(html, numResults),
+        },
+        {
+          name: 'baidu',
+          url: `https://www.baidu.com/s?wd=${encodedQuery}&rn=${Math.max(1, numResults)}`,
+          parse: (html: string) => this.extractBaiduResults(html, numResults),
+        },
+      ];
 
-      if (!response.ok) {
-        return `Search failed: HTTP ${response.status}`;
-      }
+      const errors: string[] = [];
 
-      const html = await response.text();
+      for (const endpoint of endpoints) {
+        try {
+          const response = await this.fetchWithTimeout(endpoint.url, {
+            headers: this.getNetworkHeaders(),
+          }, 15000);
 
-      const results: string[] = [];
-      const linkRegex = /<a[^>]+href="([^"]+)"[^>]*class="result__a"[^>]*>([\s\S]*?)<\/a>/gi;
-      const snippetRegex = /<a[^>]+class="result__a"[^>]*>[\s\S]*?<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
-
-      let match;
-      let count = 0;
-
-      while ((match = linkRegex.exec(html)) !== null && count < numResults) {
-        const href = match[1] || '';
-        const titleMatch = match[0]?.match(/>([^<]+)<\/a>/);
-        const title = titleMatch?.[1]?.trim() || 'No title';
-
-        if (href.startsWith('http') && !href.includes('duckduckgo')) {
-          results.push(`${count + 1}. ${title}\n   URL: ${href}`);
-          count++;
-        }
-      }
-
-      if (results.length === 0) {
-        const simpleRegex = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
-        while ((match = simpleRegex.exec(html)) !== null && count < numResults) {
-          const href = match[1] || '';
-          const title = (match[2] || '').trim().replace(/<[^>]+>/g, '');
-
-          if (!href.includes('duckduckgo') && !href.includes('html.duckduckgo')) {
-            results.push(`${count + 1}. ${title}\n   URL: ${href}`);
-            count++;
+          if (!response.ok) {
+            errors.push(`${endpoint.name}: HTTP ${response.status}`);
+            continue;
           }
+
+          const html = await response.text();
+          const parsedResults = endpoint.parse(html).slice(0, Math.max(1, numResults));
+          if (parsedResults.length === 0) {
+            errors.push(`${endpoint.name}: parsed 0 results`);
+            continue;
+          }
+
+          const lines = parsedResults.map((item, index) => {
+            const snippetPart = item.snippet ? `\n   Snippet: ${item.snippet}` : '';
+            return `${index + 1}. ${item.title}\n   URL: ${item.url}${snippetPart}`;
+          });
+
+          return `Search results for "${query}":\n\n${lines.join('\n\n')}`;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          errors.push(`${endpoint.name}: ${message}`);
         }
       }
 
-      if (results.length === 0) {
-        return `No results found for: ${query}`;
-      }
-
-      return `Search results for "${query}":\n\n${results.join('\n\n')}`;
+      return `Search failed for "${query}". ${errors.join('; ')}`;
     } catch (error) {
       return `Search error: ${error instanceof Error ? error.message : String(error)}`;
     }
@@ -1595,58 +2126,78 @@ export class BuiltInTools {
 
   private async fetchUrl(url: string, maxLength: number): Promise<string> {
     try {
-      const parsedUrl = new URL(url);
+      const normalizedUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+      const parsedUrl = new URL(normalizedUrl);
 
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,text/plain',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      });
+      const response = await this.fetchWithTimeout(normalizedUrl, {
+        headers: this.getNetworkHeaders('text/html,application/xhtml+xml,text/plain,application/json,application/xml,text/xml;q=0.9,*/*;q=0.8'),
+      }, 15000);
 
       if (!response.ok) {
         return `Failed to fetch: HTTP ${response.status}`;
       }
 
       const contentType = response.headers.get('content-type') || '';
+      const isHtml = /text\/html|application\/xhtml\+xml/i.test(contentType);
+      const isPlainText = /text\/plain|application\/json|application\/xml|text\/xml/i.test(contentType);
 
-      if (!contentType.includes('text/html') && !contentType.includes('text/plain')) {
+      if (!isHtml && !isPlainText) {
         return `Unsupported content type: ${contentType}`;
       }
 
       let text = await response.text();
-
-      text = text
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-        .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
-        .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
-        .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
-        .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+      if (isHtml) {
+        text = text
+          .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, ' ')
+          .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, ' ')
+          .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, ' ')
+          .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, ' ');
+        text = this.htmlToPlainText(text);
+      } else {
+        text = this.decodeHtmlEntities(text).replace(/\s+/g, ' ').trim();
+      }
 
       if (text.length > maxLength) {
         text = text.substring(0, maxLength) + '...[truncated]';
       }
 
-      return `Fetched from: ${parsedUrl.hostname}\n\n${text}`;
+      const finalUrl = response.url || parsedUrl.toString();
+      return `Fetched from: ${new URL(finalUrl).hostname}\nURL: ${finalUrl}\n\n${text}`;
     } catch (error) {
       return `Fetch error: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
 
-  private async openBrowser(url: string, background: boolean): Promise<string> {
+  private async openBrowser(url: string, background: boolean, browser: BrowserTarget | 'default'): Promise<string> {
     try {
       let command: string;
       const isWindows = process.platform === 'win32';
       const isMac = process.platform === 'darwin';
-      const isLinux = process.platform === 'linux';
 
       if (!url.startsWith('http://') && !url.startsWith('https://')) {
         url = 'https://' + url;
+      }
+
+      if (browser !== 'default') {
+        const executablePath = resolveBrowserExecutable(browser);
+        if (!executablePath) {
+          return `Failed to open browser: 未找到可用的 ${browser} 浏览器`;
+        }
+
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn(executablePath, [url], {
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: background,
+          });
+          child.once('error', reject);
+          child.once('spawn', () => {
+            child.unref();
+            resolve();
+          });
+        });
+
+        return `Opened in ${browser}: ${url}`;
       }
 
       if (isWindows) {
@@ -1669,13 +2220,35 @@ export class BuiltInTools {
     }
   }
 
+  private async browserAutomate(url: string, actions: BrowserAutomationAction[], browser: BrowserTarget, headless: boolean, timeoutMs: number): Promise<string> {
+    return runBrowserAutomation({
+      url,
+      actions,
+      browser,
+      headless,
+      timeoutMs,
+      resolveOutputPath: (requestedPath?: string) => this.resolveOutputFilePath(requestedPath || path.join('browser', `screenshot-${Date.now()}.png`)),
+    });
+  }
+
   private evaluateRepl(code: string): string {
-    try {
-      const result = new Function(`return ${code}`)();
-      return String(result);
-    } catch (error) {
-      return `Error: ${error instanceof Error ? error.message : String(error)}`;
+    const candidates = [
+      `return (${code});`,
+      `return ${code};`,
+      code,
+    ];
+
+    let lastError: Error | undefined;
+    for (const candidate of candidates) {
+      try {
+        const result = new Function(candidate)();
+        return String(result);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
     }
+
+    throw lastError || new Error('Invalid REPL code');
   }
 
   private async createWorktree(branch: string, path: string): Promise<string> {
@@ -1849,13 +2422,68 @@ export class BuiltInTools {
     return job ? JSON.stringify(job, null, 2) : `Cron job not found: ${idOrName}`;
   }
 
+  private async cronStart(idOrName?: string): Promise<string> {
+    if (!this.cronManager) {
+      return 'Cron manager not initialized';
+    }
+
+    if (!idOrName) {
+      this.cronManager.start();
+      return 'Cron scheduler started';
+    }
+
+    const job = await this.cronManager.startJob(idOrName);
+    return job ? JSON.stringify(job, null, 2) : `Cron job not found: ${idOrName}`;
+  }
+
+  private async cronStop(idOrName?: string): Promise<string> {
+    if (!this.cronManager) {
+      return 'Cron manager not initialized';
+    }
+
+    if (!idOrName) {
+      this.cronManager.stop();
+      return 'Cron scheduler stopped';
+    }
+
+    const job = await this.cronManager.stopJob(idOrName);
+    return job ? JSON.stringify(job, null, 2) : `Cron job not found: ${idOrName}`;
+  }
+
+  private async cronRun(idOrName: string): Promise<string> {
+    if (!this.cronManager) {
+      throw new Error('Cron manager not initialized');
+    }
+
+    const run = await this.cronManager.runJobNow(idOrName);
+    if (!run) {
+      throw new Error(`Cron job not found: ${idOrName}`);
+    }
+
+    if (run.result.is_error) {
+      throw new Error(`Cron job run failed: ${run.result.output || run.job.toolName}`);
+    }
+
+    return JSON.stringify({
+      job: run.job,
+      workDir: this.cronManager.getJobWorkDir(run.job.name),
+      result: {
+        output: run.result.output,
+        is_error: Boolean(run.result.is_error),
+      },
+    }, null, 2);
+  }
+
   private cronList(): string {
     if (!this.cronManager) {
       return 'Cron manager not initialized';
     }
 
     const jobs = this.cronManager.listJobs();
-    return jobs.length > 0 ? JSON.stringify(jobs, null, 2) : 'No cron jobs found';
+    return JSON.stringify({
+      schedulerRunning: this.cronManager.isRunning(),
+      jobs,
+    }, null, 2);
   }
 
   private async getTencentHotNews(limit: number): Promise<string> {
@@ -1912,7 +2540,6 @@ export class BuiltInTools {
 
   private async pushNewsToLark(input: {
     newsType: string;
-    userId?: string;
     chatId?: string;
     keyword?: string;
     limit?: number;
@@ -1929,18 +2556,19 @@ export class BuiltInTools {
       throw new Error('Lark MCP server not connected');
     }
 
+    const legacyUserId = typeof (input as Record<string, unknown>).userId === 'string'
+      ? ((input as Record<string, unknown>).userId as string).trim()
+      : '';
+    if (legacyUserId) {
+      throw new Error('push_news_to_lark only supports chatId. Please use notifications.lark.morningNews.chatId or pass chatId explicitly.');
+    }
+
     const configuredTarget = this.getConfiguredLarkNewsTarget();
-    const userId = typeof input.userId === 'string' && input.userId.trim().length > 0
-      ? input.userId.trim()
-      : configuredTarget.userId;
     const chatId = typeof input.chatId === 'string' && input.chatId.trim().length > 0
       ? input.chatId.trim()
       : configuredTarget.chatId;
-    if (!userId && !chatId) {
-      throw new Error('push_news_to_lark requires userId or chatId, or notifications.lark.morningNews.chatId/userId in config');
-    }
-    if (userId && chatId) {
-      throw new Error('push_news_to_lark accepts either userId or chatId, not both');
+    if (!chatId) {
+      throw new Error('push_news_to_lark requires chatId, or notifications.lark.morningNews.chatId in config');
     }
 
     const newsType = (input.newsType || '').trim().toLowerCase();
@@ -1992,9 +2620,6 @@ export class BuiltInTools {
     const flags: Record<string, unknown> = {
       text: message,
     };
-    if (userId) {
-      flags['user-id'] = userId;
-    }
     if (chatId) {
       flags['chat-id'] = chatId;
     }
@@ -2008,33 +2633,239 @@ export class BuiltInTools {
     const responseText = this.normalizeMcpTextResult(result);
 
     return [
-      `新闻已发送到飞书${chatId ? ` 群 ${chatId}` : ` 用户 ${userId}`}`,
+      `新闻已发送到飞书群 ${chatId}`,
       savedPath ? `Saved to: ${savedPath}` : undefined,
       responseText || undefined,
     ].filter(Boolean).join('\n');
   }
 
-  private getConfiguredLarkNewsTarget(): { userId?: string; chatId?: string } {
+  private async getWeather(city?: string, timezone?: string): Promise<string> {
+    const configured = this.getConfiguredLarkWeatherTarget();
+    const finalCity = typeof city === 'string' && city.trim().length > 0 ? city.trim() : configured.city || '北京';
+    const finalTimezone = typeof timezone === 'string' && timezone.trim().length > 0 ? timezone.trim() : configured.timezone || 'Asia/Shanghai';
+    return this.buildWeatherSummary(finalCity, finalTimezone);
+  }
+
+  private async pushWeatherToLark(input: {
+    chatId?: string;
+    city?: string;
+    timezone?: string;
+    dryRun?: boolean;
+  }): Promise<string> {
+    if (!this.mcpManager) {
+      throw new Error('MCP manager not initialized');
+    }
+
+    if (!this.mcpManager.getServerNames().includes('lark')) {
+      throw new Error('Lark MCP server not connected');
+    }
+
+    const configured = this.getConfiguredLarkWeatherTarget();
+    const chatId = typeof input.chatId === 'string' && input.chatId.trim().length > 0
+      ? input.chatId.trim()
+      : configured.chatId;
+    if (!chatId) {
+      throw new Error('push_weather_to_lark requires chatId, or notifications.lark.weather.chatId / notifications.lark.morningNews.chatId in config');
+    }
+
+    const city = typeof input.city === 'string' && input.city.trim().length > 0 ? input.city.trim() : configured.city || '北京';
+    const timezone = typeof input.timezone === 'string' && input.timezone.trim().length > 0 ? input.timezone.trim() : configured.timezone || 'Asia/Shanghai';
+    const message = await this.buildWeatherSummary(city, timezone);
+
+    if (input.dryRun) {
+      return ['DRY RUN: 未发送到飞书', '', message].filter(Boolean).join('\n');
+    }
+
+    const result = await this.mcpManager.callTool('lark', 'shortcut', {
+      service: 'im',
+      command: '+messages-send',
+      as: 'bot',
+      flags: {
+        'chat-id': chatId,
+        text: message,
+      },
+    });
+    const responseText = this.normalizeMcpTextResult(result);
+
+    return [
+      `天气已发送到飞书群 ${chatId}`,
+      responseText || undefined,
+    ].filter(Boolean).join('\n');
+  }
+
+  private async sendLarkMessage(input: {
+    chatId?: string;
+    text?: string;
+    markdown?: string;
+    file?: string;
+    image?: string;
+    video?: string;
+    audio?: string;
+    dryRun?: boolean;
+  }): Promise<string> {
+    if (!this.mcpManager) {
+      throw new Error('MCP manager not initialized');
+    }
+
+    if (!this.mcpManager.getServerNames().includes('lark')) {
+      throw new Error('Lark MCP server not connected');
+    }
+
+    const configuredTarget = this.getConfiguredLarkNewsTarget();
+    const chatId = typeof input.chatId === 'string' && input.chatId.trim().length > 0
+      ? input.chatId.trim()
+      : configuredTarget.chatId;
+
+    if (!chatId) {
+      throw new Error('send_lark_message requires chatId, or notifications.lark.morningNews.chatId in config');
+    }
+
+    const flags: Record<string, unknown> = {
+      'chat-id': chatId,
+    };
+
+    const payloadCandidates: Array<[keyof typeof input, string | undefined]> = [
+      ['file', typeof input.file === 'string' && input.file.trim().length > 0 ? input.file.trim() : undefined],
+      ['image', typeof input.image === 'string' && input.image.trim().length > 0 ? input.image.trim() : undefined],
+      ['video', typeof input.video === 'string' && input.video.trim().length > 0 ? input.video.trim() : undefined],
+      ['audio', typeof input.audio === 'string' && input.audio.trim().length > 0 ? input.audio.trim() : undefined],
+      ['markdown', typeof input.markdown === 'string' && input.markdown.trim().length > 0 ? input.markdown : undefined],
+      ['text', typeof input.text === 'string' && input.text.trim().length > 0 ? input.text : undefined],
+    ];
+    const selectedPayload = payloadCandidates.find(([, value]) => typeof value === 'string' && value.length > 0);
+    let cleanupStagedAttachment: (() => Promise<void>) | undefined;
+
+    if (selectedPayload) {
+      const [payloadType, payloadValue] = selectedPayload;
+      if (payloadType === 'file' || payloadType === 'image' || payloadType === 'video' || payloadType === 'audio') {
+        const staged = await this.prepareLarkAttachmentPath(payloadValue!, input.dryRun === true);
+        flags[payloadType] = staged.relativePath;
+        cleanupStagedAttachment = staged.cleanup;
+      } else {
+        flags[payloadType] = payloadValue;
+      }
+    }
+
+    const payloadKeys = ['text', 'markdown', 'file', 'image', 'video', 'audio'].filter(key => flags[key] !== undefined);
+    if (payloadKeys.length === 0) {
+      throw new Error('send_lark_message requires one of text, markdown, file, image, video, or audio');
+    }
+
+    if (input.dryRun) {
+      return JSON.stringify({
+        service: 'im',
+        command: '+messages-send',
+        as: 'bot',
+        flags,
+      }, null, 2);
+    }
+
+    try {
+      const result = await this.mcpManager.callTool('lark', 'shortcut', {
+        service: 'im',
+        command: '+messages-send',
+        as: 'bot',
+        flags,
+      });
+      const responseText = this.normalizeMcpTextResult(result);
+
+      return [
+        `消息已发送到飞书群 ${chatId}`,
+        responseText || undefined,
+      ].filter(Boolean).join('\n');
+    } finally {
+      await cleanupStagedAttachment?.();
+    }
+  }
+
+  private async prepareLarkAttachmentPath(inputPath: string, dryRun: boolean): Promise<{ relativePath: string; cleanup?: () => Promise<void> }> {
+    const resolvedPath = this.resolveInputPath(inputPath);
+    const cwd = process.cwd();
+    const relativeToCwd = path.relative(cwd, resolvedPath);
+    const withinCwd = relativeToCwd.length > 0 && !relativeToCwd.startsWith('..') && !path.isAbsolute(relativeToCwd);
+
+    if (withinCwd) {
+      return {
+        relativePath: this.normalizeLarkRelativePath(relativeToCwd),
+      };
+    }
+
+    const stagedRelativeDir = path.join('ai-agent-cli-lark-attachments');
+    const stagedFileName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(resolvedPath)}`;
+    const stagedAbsoluteDir = path.join(cwd, stagedRelativeDir);
+    const stagedAbsolutePath = path.join(stagedAbsoluteDir, stagedFileName);
+
+    if (!dryRun) {
+      await fs.mkdir(stagedAbsoluteDir, { recursive: true });
+      await fs.copyFile(resolvedPath, stagedAbsolutePath);
+    }
+
+    return {
+      relativePath: this.normalizeLarkRelativePath(path.join(stagedRelativeDir, stagedFileName)),
+      cleanup: async () => {
+        if (dryRun) {
+          return;
+        }
+
+        await fs.rm(stagedAbsolutePath, { force: true }).catch(() => {});
+        await fs.rmdir(stagedAbsoluteDir).catch(() => {});
+      },
+    };
+  }
+
+  private normalizeLarkRelativePath(value: string): string {
+    const normalized = value.replace(/\\/g, '/').replace(/^\.(?!\/)/, './');
+    return normalized.startsWith('./') ? normalized : `./${normalized}`;
+  }
+
+  private getConfiguredLarkNewsTarget(): { chatId?: string } {
     const notifications = this.config?.notifications as {
       lark?: {
         morningNews?: {
-          userId?: string;
           chatId?: string;
         };
       };
     } | undefined;
     const morningNews = notifications?.lark?.morningNews;
     const chatId = typeof morningNews?.chatId === 'string' ? morningNews.chatId.trim() : '';
-    const userId = typeof morningNews?.userId === 'string' ? morningNews.userId.trim() : '';
 
     if (chatId) {
       return { chatId };
     }
-    if (userId) {
-      return { userId };
-    }
 
     return {};
+  }
+
+  private getConfiguredLarkWeatherTarget(): { chatId?: string; city?: string; timezone?: string } {
+    const notifications = this.config?.notifications as {
+      lark?: {
+        morningNews?: {
+          chatId?: string;
+          timezone?: string;
+        };
+        weather?: {
+          chatId?: string;
+          city?: string;
+          timezone?: string;
+        };
+      };
+    } | undefined;
+
+    const weather = notifications?.lark?.weather;
+    const fallback = notifications?.lark?.morningNews;
+    const chatId = typeof weather?.chatId === 'string' && weather.chatId.trim()
+      ? weather.chatId.trim()
+      : (typeof fallback?.chatId === 'string' ? fallback.chatId.trim() : '');
+    const city = typeof weather?.city === 'string' && weather.city.trim() ? weather.city.trim() : '';
+    const timezone = typeof weather?.timezone === 'string' && weather.timezone.trim()
+      ? weather.timezone.trim()
+      : (typeof fallback?.timezone === 'string' && fallback.timezone.trim() ? fallback.timezone.trim() : 'Asia/Shanghai');
+
+    return {
+      chatId: chatId || undefined,
+      city: city || undefined,
+      timezone,
+    };
   }
 
   private buildNewsPushTitle(newsType: string, keyword?: string, limit?: number): string {
@@ -2072,8 +2903,97 @@ export class BuiltInTools {
     return `${title}\n时间: ${timestamp}\n\n${safeContent}`;
   }
 
+  private async buildWeatherSummary(city: string, timezone: string): Promise<string> {
+    const response = await fetch(`https://wttr.in/${encodeURIComponent(city)}?format=j1&lang=zh-cn`, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'ai-agent-cli/1.0',
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch weather: HTTP ${response.status}`);
+    }
+
+    const payload = await response.json() as {
+      current_condition?: Array<Record<string, unknown>>;
+      weather?: Array<Record<string, unknown>>;
+    };
+
+    const current = payload.current_condition?.[0] as Record<string, unknown> | undefined;
+    const today = payload.weather?.[0] as Record<string, unknown> | undefined;
+    if (!current || !today) {
+      throw new Error('Weather service returned an unexpected payload');
+    }
+
+    const description = this.readWeatherText(current.weatherDesc) || '未知';
+    const currentTemp = this.readStringField(current.temp_C);
+    const feelsLike = this.readStringField(current.FeelsLikeC);
+    const humidity = this.readStringField(current.humidity);
+    const windSpeed = this.readStringField(current.windspeedKmph);
+    const windDirection = this.readStringField(current.winddir16Point);
+    const uvIndex = this.readStringField(current.uvIndex);
+    const maxTemp = this.readStringField(today.maxtempC);
+    const minTemp = this.readStringField(today.mintempC);
+    const astronomy = Array.isArray(today.astronomy) ? today.astronomy[0] as Record<string, unknown> : undefined;
+    const sunrise = astronomy ? this.readStringField(astronomy.sunrise) : '';
+    const sunset = astronomy ? this.readStringField(astronomy.sunset) : '';
+    const rainChance = this.extractMaxChanceOfRain(today.hourly);
+    const dateLabel = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      weekday: 'long',
+    }).format(new Date());
+
+    return [
+      `今日天气 ${city}`,
+      `日期: ${dateLabel}`,
+      `天气: ${description}`,
+      `气温: ${currentTemp || '?'}°C，体感 ${feelsLike || '?'}°C`,
+      `最高/最低: ${maxTemp || '?'}°C / ${minTemp || '?'}°C`,
+      humidity ? `湿度: ${humidity}%` : undefined,
+      windSpeed ? `风况: ${windDirection || '未知风向'} ${windSpeed} km/h` : undefined,
+      rainChance ? `降雨概率: ${rainChance}%` : undefined,
+      uvIndex ? `紫外线指数: ${uvIndex}` : undefined,
+      sunrise || sunset ? `日出/日落: ${sunrise || '?'} / ${sunset || '?'}` : undefined,
+    ].filter(Boolean).join('\n');
+  }
+
+  private readWeatherText(value: unknown): string {
+    if (Array.isArray(value)) {
+      const first = value[0] as { value?: unknown } | undefined;
+      return this.readStringField(first?.value);
+    }
+
+    return '';
+  }
+
+  private readStringField(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  private extractMaxChanceOfRain(hourly: unknown): string {
+    if (!Array.isArray(hourly)) {
+      return '';
+    }
+
+    const values = hourly
+      .map(entry => entry as Record<string, unknown>)
+      .map(entry => Number.parseInt(this.readStringField(entry.chanceofrain), 10))
+      .filter(value => Number.isFinite(value));
+
+    if (values.length === 0) {
+      return '';
+    }
+
+    return String(Math.max(...values));
+  }
+
   private async savePushedNewsOutput(newsType: string, content: string, keyword?: string, limit?: number): Promise<string> {
-    const dir = path.join(os.homedir(), '.ai-agent-cli', 'outputs', 'tencent-news');
+    const dir = this.getCurrentCronJobWorkDir() || path.join(os.homedir(), '.ai-agent-cli', 'outputs', 'tencent-news');
     await fs.mkdir(dir, { recursive: true });
 
     const timestamp = new Date().toISOString().replace(/[:]/g, '-').replace(/\..+$/, '');

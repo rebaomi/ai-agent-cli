@@ -2,7 +2,7 @@ import type { Message, Tool } from '../../types/index.js';
 import type { LLMProviderInterface, LLMResponse, LLMStreamChunk } from '../types.js';
 
 export abstract class BaseLLMClient implements LLMProviderInterface {
-  abstract readonly provider: 'ollama' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini';
+  abstract readonly provider: 'ollama' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini' | 'hybrid';
   
   protected model: string;
   protected temperature: number;

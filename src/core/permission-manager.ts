@@ -15,6 +15,7 @@ export type PermissionType =
   | 'process_list'
   | 'network_request'
   | 'browser_open'
+  | 'browser_automation'
   | 'mcp_access'
   | 'tool_execute'
   | 'clipboard_read'
@@ -107,7 +108,7 @@ export class PermissionManager {
         id: 'network',
         name: '网络操作',
         description: '网络请求和浏览器操作',
-        permissions: ['network_request', 'browser_open'],
+        permissions: ['network_request', 'browser_open', 'browser_automation'],
       },
       {
         id: 'system',
@@ -293,6 +294,7 @@ export class PermissionManager {
       'file_delete',
       'file_move',
       'network_request',
+      'browser_automation',
     ];
 
     if (dangerousTypes.includes(type)) {
@@ -422,6 +424,7 @@ export class PermissionManager {
       process_list: `查看进程列表`,
       network_request: `发起网络请求: ${resource || '未指定'}`,
       browser_open: `打开浏览器: ${resource || '未指定'}`,
+      browser_automation: `自动操作浏览器: ${resource || '未指定'}`,
       mcp_access: `访问 MCP 服务: ${resource || '未指定'}`,
       tool_execute: `执行工具: ${resource || '未指定'}`,
       clipboard_read: `读取剪贴板`,

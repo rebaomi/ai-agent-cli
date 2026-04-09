@@ -50,6 +50,30 @@ export interface LLMConfig {
   apiKey?: string;
 }
 
+export interface DeepSeekAutoReasoningConfig {
+  enabled?: boolean;
+  simpleTaskMaxChars?: number;
+  simpleConversationMaxChars?: number;
+  preferReasonerForToolMessages?: boolean;
+  preferReasonerForPlanning?: boolean;
+  preferReasonerForLongContext?: boolean;
+}
+
+export interface DeepSeekLLMConfig extends LLMConfig {
+  reasoningModel?: string;
+  autoReasoning?: DeepSeekAutoReasoningConfig;
+}
+
+export interface HybridLLMConfig {
+  enabled?: boolean;
+  localProvider: 'ollama' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini';
+  remoteProvider: 'ollama' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini';
+  simpleTaskMaxChars?: number;
+  simpleConversationMaxChars?: number;
+  preferRemoteForToolMessages?: boolean;
+  localAvailabilityCacheMs?: number;
+}
+
 export interface MemoryConfig {
   backend?: 'local' | 'mempalace' | 'hybrid';
   recallLimit?: number;
@@ -66,16 +90,29 @@ export interface LarkMorningNewsConfig {
   title?: string;
 }
 
+export interface LarkRelayConfig {
+  enabled?: boolean;
+  autoSubscribe?: boolean;
+  eventTypes?: string[];
+  compact?: boolean;
+  quiet?: boolean;
+  allowedChatIds?: string[];
+  allowedSenderIds?: string[];
+  allowCommands?: boolean;
+  cliBin?: string;
+}
+
 export interface NotificationsConfig {
   lark?: {
     morningNews?: LarkMorningNewsConfig;
+    relay?: LarkRelayConfig;
   };
 }
 
 export interface AgentConfig {
   defaultProvider?: string;
   ollama: LLMConfig;
-  deepseek?: LLMConfig;
+  deepseek?: DeepSeekLLMConfig;
   kimi?: LLMConfig;
   glm?: LLMConfig;
   doubao?: LLMConfig;
@@ -83,10 +120,12 @@ export interface AgentConfig {
   openai?: LLMConfig;
   claude?: LLMConfig;
   gemini?: LLMConfig;
+  hybrid?: HybridLLMConfig;
   mcp?: MCPConfig[];
   lsp?: LSPServerConfig[];
   sandbox?: SandboxConfig;
   memory?: MemoryConfig;
+  appBaseDir?: string;
   artifactOutputDir?: string;
   documentOutputDir?: string;
   workspace?: string;

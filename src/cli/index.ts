@@ -11,6 +11,8 @@ import { createSkillManager } from '../core/skills.js';
 import { OllamaClient } from '../ollama/client.js';
 import { LLMFactory } from '../llm/factory.js';
 import type { LLMProviderInterface } from '../llm/types.js';
+import { HybridClient } from '../llm/providers/hybrid.js';
+import { DeepSeekRouterClient } from '../llm/providers/deepseek-router.js';
 import { MCPManager } from '../mcp/client.js';
 import { LSPManager } from '../lsp/client.js';
 import { Sandbox } from '../sandbox/executor.js';
@@ -32,14 +34,11 @@ import { createMemoryProvider, type MemoryProvider } from '../core/memory-provid
 import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
+import { LarkRelayAgent, type LarkRelayMessage, type LarkRelayStatus } from '../lark/relay-agent.js';
+import { APP_VERSION, buildCliLogo, getFullHelpText, getQuickHelpText, isFullHelpShortcut, isQuickHelpShortcut } from './cli-shell-text.js';
 import * as readline from 'readline';
 
-const logo = `
-╔═══════════════════════════════════════════════════╗
-║           AI Agent CLI v1.3.0                     ║
-║   Your intelligent coding assistant                 ║
-╚═══════════════════════════════════════════════════╝
-`;
+const logo = buildCliLogo();
 
 export class CLI {
   private static readonly SLASH_COMMANDS = [
@@ -48,7 +47,7 @@ export class CLI {
     '/config', '/c', '/model', '/m', '/workspace', '/w',
     '/reset', '/r', '/new', '/sessions', '/load', '/mcp',
     '/lsp', '/skill', '/skills', '/org', '/team', '/cat',
-    '/progress', '/p', '/memory', '/templates', '/profile', '/news',
+    '/progress', '/p', '/memory', '/templates', '/profile', '/news', '/relay', '/browser',
     '/wipe', '/perm', '/permission', '/cron',
   ];
 
@@ -57,9 +56,9 @@ export class CLI {
   private currentProvider = 'ollama';
   private mcpManager: MCPManager;
   private lspManager: LSPManager;
+  private memoryManager!: MemoryManager;
   private sandbox!: Sandbox;
   private skillManager: ReturnType<typeof createSkillManager>;
-  private memoryManager!: MemoryManager;
   private enhancedMemory?: EnhancedMemoryManager;
   private memoryProvider?: MemoryProvider;
   private builtInTools?: BuiltInTools;
@@ -83,16 +82,20 @@ export class CLI {
   private permissionHandlerSetup = false;
   private activePlannedTaskId?: string;
   private activeProgressDisplayTaskId?: string;
+  private appBaseDir: string;
   private inputHistoryPath: string;
   private newsOutputDir: string;
+  private larkRelay?: LarkRelayAgent;
+  private inputQueue: Promise<void> = Promise.resolve();
 
   constructor() {
     this.mcpManager = new MCPManager();
     this.lspManager = new LSPManager();
     this.skillManager = createSkillManager();
     this.workspace = process.cwd();
-    this.inputHistoryPath = path.join(os.homedir(), '.ai-agent-cli', 'input-history.json');
-    this.newsOutputDir = path.join(os.homedir(), '.ai-agent-cli', 'outputs', 'tencent-news');
+    this.appBaseDir = configManager.get('appBaseDir') || path.join(os.homedir(), '.ai-agent-cli');
+    this.inputHistoryPath = path.join(this.appBaseDir, 'input-history.json');
+    this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
   }
 
   async initialize(): Promise<void> {
@@ -100,6 +103,8 @@ export class CLI {
     console.log(chalk.gray('Initializing...\n'));
     
     const config = configManager.getAgentConfig();
+    this.workspace = config.workspace || this.workspace;
+    this.applyGlobalPathsFromConfig(config);
 
     this.memoryManager = createMemoryManager();
     await this.memoryManager.initialize();
@@ -185,7 +190,8 @@ export class CLI {
       documentOutputDir: config.documentOutputDir,
     });
     const desktopPath = getDesktopPath();
-    for (const extraPath of [artifactOutputDir, desktopPath]) {
+    const cronStoreDir = this.cronManager.getStoreDir();
+    for (const extraPath of [artifactOutputDir, desktopPath, cronStoreDir]) {
       if (!sandboxConfig.allowedPaths.includes(extraPath)) {
         sandboxConfig.allowedPaths.push(extraPath);
       }
@@ -216,7 +222,7 @@ export class CLI {
     });
     printSuccess(this.builtInTools.getTools().length + ' built-in tools');
 
-    this.cronManager.setExecutor((toolName, args) => this.builtInTools!.executeTool(toolName, args));
+    this.cronManager.setExecutor((toolName, args, job) => this.builtInTools!.executeToolForCronJob(toolName, args, job.name));
     this.cronManager.setNotifier(async ({ job, result }) => {
       const content = this.getToolResultDisplayText(result) || '(无输出)';
       console.log();
@@ -230,15 +236,6 @@ export class CLI {
       console.log();
     });
     this.cronManager.start();
-
-    this.directActionRouter = createDirectActionRouter({
-      builtInTools: this.builtInTools,
-      skillManager: this.skillManager,
-      permissionManager: this.permissionMgr,
-      workspace: this.workspace,
-      config,
-      getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
-    });
 
     if (config.mcp && config.mcp.length > 0) {
       console.log(chalk.gray('Connecting to MCP servers...'));
@@ -267,6 +264,16 @@ export class CLI {
         content: artifactOutputDir,
       });
     }
+
+    this.directActionRouter = createDirectActionRouter({
+      builtInTools: this.builtInTools,
+      skillManager: this.skillManager,
+      permissionManager: this.permissionMgr!,
+      workspace: this.workspace,
+      config,
+      getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
+      memoryProvider: this.memoryProvider,
+    });
 
     if (config.lsp && config.lsp.length > 0) {
       console.log(chalk.gray('Starting LSP servers...'));
@@ -304,6 +311,8 @@ export class CLI {
     if (this.awaitingOnboardingInput) {
       await this.showWelcomeQuestions();
     }
+
+    await this.restartLarkRelay(config);
 
     console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
   }
@@ -345,36 +354,8 @@ export class CLI {
       try {
         const input = await this.prompt();
         if (!input) continue;
-        
-        if (input.startsWith('/')) {
-          await this.handleCommand(input);
-        } else {
-          if (this.awaitingOnboardingInput) {
-            await this.handleOnboardingInput(input);
-            continue;
-          }
 
-          const confirmationStatus = this.agent?.getConfirmationStatus();
-          if (confirmationStatus?.pending) {
-            const isConfirmed = input.toLowerCase() === '是' || input.toLowerCase() === 'yes' || input.toLowerCase() === 'y';
-            console.log(chalk.cyan(isConfirmed ? '✅ 确认执行计划...' : '❌ 取消执行'));
-            const result = await this.agent?.confirmAction(isConfirmed);
-            if (!isConfirmed) {
-              this.failTrackedTask('用户取消执行计划');
-            }
-            if (this.agent) {
-              this.memoryManager.setMessages(this.agent.getMessages());
-              await this.memoryProvider?.syncSession(this.agent.getMessages());
-            }
-            if (result) {
-              console.log(chalk.green('\nAssistant: '));
-              await this.streamResponse(result);
-              console.log();
-            }
-          } else {
-            await this.handleMessage(input);
-          }
-        }
+        await this.enqueueInput(input, 'cli', undefined, true);
       } catch (error) {
         if (error instanceof Error && error.message === 'Exit') {
           break;
@@ -432,8 +413,11 @@ export class CLI {
       return CLI.SLASH_COMMANDS;
     }
 
-    const providers = ['ollama', 'deepseek', 'kimi', 'glm', 'doubao', 'minimax', 'openai', 'claude', 'gemini'];
+    const providers = ['ollama', 'deepseek', 'kimi', 'glm', 'doubao', 'minimax', 'openai', 'claude', 'gemini', 'hybrid'];
     const staticCandidates: Record<string, string[]> = {
+      '/config': ['/config', '/config update', '/config reload'],
+      '/c': ['/c', '/c update', '/c reload'],
+      '/relay': ['/relay status', '/relay start', '/relay stop', '/relay reconnect'],
       '/model': ['/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
       '/m': ['/m', '/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
       '/mcp': ['/mcp list', '/mcp tools', '/mcp check', '/mcp check mempalace', '/mcp check lark', '/mcp reconnect lark', '/mcp check obsidian'],
@@ -454,8 +438,9 @@ export class CLI {
         '/permission group', '/permission group grant', '/permission group revoke',
         '/permission audit', '/permission trust', '/permission allow', '/permission deny', '/permission auto', '/permission ask',
       ],
-      '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron create-news-lark', '/cron create-morning-feishu', '/cron create-morning-feishu-group', '/cron delete', '/cron run-due'],
-      '/news': ['/news hot', '/news search', '/news morning', '/news evening', '/news save hot', '/news save search', '/news save morning', '/news save evening', '/news push morning --user-id ou_xxx', '/news push hot --chat-id oc_xxx --limit 5', '/news output-dir', '/news help'],
+      '/browser': ['/browser open https://example.com', '/browser run https://example.com', '/browser run https://example.com @actions.json --headed', '/browser run https://example.com @actions.json --browser edge', '/browser help'],
+      '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron create-news-lark', '/cron create-weather-lark', '/cron create-morning-feishu', '/cron create-morning-feishu-group', '/cron start', '/cron stop', '/cron run', '/cron delete', '/cron run-due'],
+      '/news': ['/news hot', '/news search', '/news morning', '/news evening', '/news save hot', '/news save search', '/news save morning', '/news save evening', '/news push morning --chat-id oc_xxx', '/news push hot --chat-id oc_xxx --limit 5', '/news output-dir', '/news help'],
       '/load': ['/load'],
       '/workspace': ['/workspace'],
     };
@@ -501,6 +486,342 @@ export class CLI {
     await fs.writeFile(this.inputHistoryPath, JSON.stringify(this.cmdHistory.slice(-200), null, 2), 'utf-8');
   }
 
+  private async enqueueInput(
+    input: string,
+    source: 'cli' | 'lark',
+    relayMessage?: LarkRelayMessage,
+    allowCommands: boolean = false,
+  ): Promise<void> {
+    const trimmed = input.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const task = this.inputQueue.then(async () => {
+      if (source === 'lark') {
+        const sourceParts = [
+          relayMessage?.chatId ? `chat=${relayMessage.chatId}` : undefined,
+          relayMessage?.senderId ? `sender=${relayMessage.senderId}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(' | ');
+        console.log();
+        printInfo(`[Lark Relay] 收到手机端消息${sourceParts ? ` (${sourceParts})` : ''}`);
+        console.log(chalk.gray(trimmed));
+      }
+
+      if (allowCommands && trimmed.startsWith('/')) {
+        await this.handleCommand(trimmed);
+        return;
+      }
+
+      if (this.awaitingOnboardingInput) {
+        await this.handleOnboardingInput(trimmed);
+        return;
+      }
+
+      const confirmationStatus = this.agent?.getConfirmationStatus();
+      if (confirmationStatus?.pending) {
+        const normalizedInput = trimmed.toLowerCase();
+        const isConfirmed = normalizedInput === '是' || normalizedInput === 'yes' || normalizedInput === 'y';
+        const isRejected = normalizedInput === '否' || normalizedInput === 'no' || normalizedInput === 'n';
+        let result: string | undefined;
+
+        if (confirmationStatus.type === 'plan_execution' && (isConfirmed || isRejected)) {
+          console.log(chalk.cyan(isConfirmed ? '✅ 确认执行计划...' : '❌ 取消执行'));
+          result = await this.agent?.confirmAction(isConfirmed);
+          if (isRejected) {
+            this.failTrackedTask('用户取消执行计划');
+          }
+        } else {
+          console.log(chalk.cyan('\n↪ 继续处理待补充信息...'));
+          result = await this.agent?.respondToPendingInput(trimmed);
+        }
+
+        if (this.agent) {
+          this.memoryManager.setMessages(this.agent.getMessages());
+          await this.memoryProvider?.syncSession(this.agent.getMessages());
+        }
+        if (result) {
+          console.log(chalk.green('\nAssistant: '));
+          await this.streamResponse(result);
+          console.log();
+        }
+        return;
+      }
+
+      await this.handleMessage(trimmed);
+    });
+
+    this.inputQueue = task.catch(() => {});
+    await task;
+  }
+
+  private async restartLarkRelay(config: ReturnType<typeof configManager.getAgentConfig>): Promise<void> {
+    await this.stopLarkRelay();
+
+    const relayConfig = config.notifications?.lark?.relay;
+    if (!relayConfig?.enabled || relayConfig.autoSubscribe === false) {
+      return;
+    }
+
+    this.larkRelay = new LarkRelayAgent(relayConfig);
+    this.larkRelay.on('started', (summary: string) => {
+      printSuccess(`Lark relay subscribed (${summary})`);
+    });
+    this.larkRelay.on('stderr', (message: string) => {
+      if (!relayConfig.quiet) {
+        printInfo(`[Lark Relay] ${message}`);
+      }
+    });
+    this.larkRelay.on('stopped', (detail: string) => {
+      printInfo(`[Lark Relay] stopped (${detail})`);
+    });
+    this.larkRelay.on('error', (error: Error) => {
+      printWarning(`[Lark Relay] ${error.message}`);
+    });
+    this.larkRelay.on('message', (message: LarkRelayMessage) => {
+      const forwardedText = message.content.trim();
+      if (!forwardedText) {
+        return;
+      }
+      void this.enqueueInput(forwardedText, 'lark', message, relayConfig.allowCommands === true);
+    });
+
+    try {
+      await this.larkRelay.start();
+      if (!this.larkRelay.isRunning()) {
+        throw new Error('Lark relay exited shortly after startup');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/another event \+subscribe instance is already running/i.test(message)) {
+        printWarning('[Lark Relay] 检测到已有 event +subscribe 实例占用飞书长连接。请先关闭旧订阅进程，再让当前 CLI 接管手机端消息。');
+      } else if (/exited shortly after startup/i.test(message)) {
+        printWarning('[Lark Relay] 订阅进程启动后立即退出，当前不会自动接管飞书输入。常见原因是已有旧的 event +subscribe 实例仍在运行。');
+      } else {
+        printWarning(`[Lark Relay] subscribe failed: ${message}`);
+      }
+      await this.stopLarkRelay();
+    }
+  }
+
+  private async stopLarkRelay(): Promise<void> {
+    if (!this.larkRelay) {
+      return;
+    }
+
+    const relay = this.larkRelay;
+    this.larkRelay = undefined;
+    relay.removeAllListeners();
+    await relay.stop();
+  }
+
+  private async handleRelayCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase() || 'status';
+
+    switch (subcommand) {
+      case 'status':
+        await this.showRelayStatus();
+        break;
+      case 'start':
+        await this.startLarkRelayFromCommand();
+        break;
+      case 'stop':
+        await this.stopLarkRelayFromCommand();
+        break;
+      case 'reconnect':
+        await this.reconnectLarkRelay();
+        break;
+      default:
+        printInfo('用法: /relay status | /relay start | /relay stop | /relay reconnect');
+        break;
+    }
+  }
+
+  private async showRelayStatus(): Promise<void> {
+    printInfo('[Lark Relay] 正在检测 relay 状态...');
+    const relay = this.getRelayStatusAgent();
+    const status = await relay.getStatus();
+
+    console.log(chalk.bold('\nLark Relay Status:\n'));
+    console.log(`  Enabled: ${status.enabled ? 'yes' : 'no'}`);
+    console.log(`  Auto Subscribe: ${status.autoSubscribe ? 'yes' : 'no'}`);
+    console.log(`  Running: ${status.running ? 'yes' : 'no'}`);
+    console.log(`  Summary: ${status.summary || '(none)'}`);
+    console.log(`  Current PID: ${status.currentPid || '(none)'}`);
+    console.log(`  Managed PID: ${status.managedPid || '(none)'}`);
+    console.log(`  External Occupancy: ${status.externalOccupancy ? 'yes' : 'no'}`);
+    if (status.lastStartupError) {
+      console.log(`  Last Startup Error: ${status.lastStartupError}`);
+    }
+    if (status.lastStopDetail) {
+      console.log(`  Last Stop Detail: ${status.lastStopDetail}`);
+    }
+
+    if (status.subscribeProcesses.length > 0) {
+      console.log(chalk.gray('\n  Subscribe Processes:'));
+      for (const processInfo of status.subscribeProcesses) {
+        console.log(`  - pid=${processInfo.pid} owner=${processInfo.owner} cmd=${processInfo.commandLine}`);
+      }
+    } else {
+      console.log(chalk.gray('\n  Subscribe Processes: none'));
+    }
+
+    if (status.externalOccupancy) {
+      printWarning('[Lark Relay] 检测到外部 event +subscribe 实例占用。当前 CLI 不会强抢长连接。');
+    }
+
+    console.log();
+  }
+
+  private async reconnectLarkRelay(): Promise<void> {
+    const config = configManager.getAgentConfig();
+    const relayConfig = config.notifications?.lark?.relay;
+
+    if (!relayConfig?.enabled) {
+      printWarning('[Lark Relay] 当前配置未启用 relay。');
+      return;
+    }
+
+    if (relayConfig.autoSubscribe === false) {
+      printWarning('[Lark Relay] relay 已启用，但 autoSubscribe=false；当前不会自动订阅。');
+      return;
+    }
+
+    const relay = this.getRelayStatusAgent();
+    const before = await relay.getStatus();
+
+    this.printRelayCommandSummary(before, 'reconnect');
+
+    const confirmed = await this.confirmRelayReconnect(before);
+    if (!confirmed) {
+      printInfo('[Lark Relay] 已取消重连。');
+      return;
+    }
+
+    await this.restartLarkRelay(config);
+
+    const after = await this.getRelayStatusAgent().getStatus();
+    if (after.running) {
+      printSuccess('[Lark Relay] 重连完成，当前 CLI 已接管订阅。');
+      return;
+    }
+
+    if (after.externalOccupancy) {
+      printWarning('[Lark Relay] 重连后仍检测到外部实例占用，当前 CLI 尚未接管订阅。');
+      return;
+    }
+
+    printWarning('[Lark Relay] 重连已执行，但 relay 仍未处于运行状态。可先用 /relay status 查看详情。');
+  }
+
+  private async startLarkRelayFromCommand(): Promise<void> {
+    const config = configManager.getAgentConfig();
+    const relayConfig = config.notifications?.lark?.relay;
+
+    if (!relayConfig?.enabled) {
+      printWarning('[Lark Relay] 当前配置未启用 relay。');
+      return;
+    }
+
+    if (relayConfig.autoSubscribe === false) {
+      printWarning('[Lark Relay] relay 已启用，但 autoSubscribe=false；当前不会自动订阅。');
+      return;
+    }
+
+    const status = await this.getRelayStatusAgent().getStatus();
+    if (status.running) {
+      printInfo('[Lark Relay] 当前 relay 已在运行。');
+      return;
+    }
+
+    this.printRelayCommandSummary(status, 'start');
+    await this.restartLarkRelay(config);
+
+    const after = await this.getRelayStatusAgent().getStatus();
+    if (after.running) {
+      printSuccess('[Lark Relay] 启动完成，当前 CLI 已接管订阅。');
+      return;
+    }
+
+    if (after.externalOccupancy) {
+      printWarning('[Lark Relay] 启动失败，仍检测到外部实例占用。');
+      return;
+    }
+
+    printWarning('[Lark Relay] 启动已执行，但 relay 仍未运行。可先用 /relay status 查看详情。');
+  }
+
+  private async stopLarkRelayFromCommand(): Promise<void> {
+    const status = await this.getRelayStatusAgent().getStatus();
+    if (!status.running) {
+      printInfo('[Lark Relay] 当前 CLI 没有正在运行的 relay。');
+      if (status.externalOccupancy) {
+        printWarning('[Lark Relay] 仍检测到外部 subscribe 实例；/relay stop 不会停止外部进程。');
+      }
+      return;
+    }
+
+    await this.stopLarkRelay();
+    printSuccess('[Lark Relay] 当前 CLI relay 已停止。');
+  }
+
+  private getRelayStatusAgent(): LarkRelayAgent {
+    if (this.larkRelay) {
+      return this.larkRelay;
+    }
+
+    return new LarkRelayAgent(configManager.getAgentConfig().notifications?.lark?.relay);
+  }
+
+  private async confirmRelayReconnect(status: LarkRelayStatus): Promise<boolean> {
+    const warnings: string[] = [];
+    if (status.running) {
+      warnings.push('当前 relay 正在运行，此操作会先断开再重连');
+    }
+    if (status.externalOccupancy) {
+      warnings.push('检测到外部 subscribe 实例，未先关闭时重连大概率失败');
+    }
+
+    for (const warning of warnings) {
+      printWarning(`[Lark Relay] ${warning}`);
+    }
+
+    const answer = await this.promptInline('确认执行 relay 重连？输入 yes 继续: ');
+    return /^(yes|y|是|确认|继续|ok)$/i.test(answer.trim());
+  }
+
+  private printRelayCommandSummary(status: LarkRelayStatus, action: 'start' | 'reconnect'): void {
+    const externalProcesses = status.subscribeProcesses.filter(processInfo => processInfo.owner === 'external');
+    const actionLabel = action === 'start' ? '启动' : '重连';
+
+    if (status.running) {
+      printInfo(`[Lark Relay] 当前 relay 正在运行 (pid=${status.currentPid || 'unknown'})，将执行${actionLabel}。`);
+    }
+
+    if (externalProcesses.length > 0) {
+      printWarning(`[Lark Relay] 检测到 ${externalProcesses.length} 个外部 subscribe 实例:`);
+      for (const processInfo of externalProcesses) {
+        printWarning(`[Lark Relay] external pid=${processInfo.pid} ${processInfo.commandLine}`);
+      }
+    }
+  }
+
+  private promptInline(question: string): Promise<string> {
+    return new Promise((resolve) => {
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+
+      rl.question(chalk.blue(question), (answer) => {
+        rl.close();
+        resolve(answer);
+      });
+    });
+  }
+
   private async handleCommand(input: string): Promise<void> {
     const [command, ...args] = input.slice(1).split(/\s+/);
     if (!command) return;
@@ -536,7 +857,14 @@ export class CLI {
         break;
       case 'config':
       case 'c':
-        this.showConfig();
+        if (args[0] === 'update' || args[0] === 'reload') {
+          await this.reloadRuntimeConfig();
+        } else {
+          this.showConfig();
+        }
+        break;
+      case 'relay':
+        await this.handleRelayCommand(args);
         break;
       case 'model':
       case 'm':
@@ -611,6 +939,9 @@ export class CLI {
         break;
       case 'cron':
         await this.handleCronCommand(args);
+        break;
+      case 'browser':
+        await this.handleBrowserCommand(args);
         break;
       case 'news':
         await this.handleNewsCommand(args);
@@ -764,6 +1095,7 @@ export class CLI {
       this.memoryManager.setMessages(this.agent.getMessages());
       await this.memoryProvider?.syncSession(this.agent.getMessages());
       this.streamingOutput.clear();
+      this.printHybridRouteSummary();
       console.log(chalk.green('\nAssistant: '));
       await this.streamResponse(response);
     } catch (error) {
@@ -776,6 +1108,58 @@ export class CLI {
   private async streamResponse(text: string): Promise<void> {
     const output = createStreamingOutput({ color: 'cyan', speed: 5 });
     await output.stream(text);
+  }
+
+  private printHybridRouteSummary(): void {
+    if (this.llm instanceof HybridClient) {
+      const route = this.llm.getLastRouteSnapshot();
+      if (!route) {
+        return;
+      }
+
+      const parts = [
+        `target=${route.target}`,
+        `provider=${route.providerName}`,
+        `reason=${route.reason}`,
+      ];
+
+      if (route.cacheStatus !== 'bypass') {
+        parts.push(`cache=${route.cacheStatus}`);
+      }
+
+      if (route.fallbackReason) {
+        parts.push(`fallback=${route.fallbackReason}`);
+      }
+
+      printInfo(`[Hybrid] ${parts.join(' | ')}`);
+      return;
+    }
+
+    if (this.llm instanceof DeepSeekRouterClient) {
+      const route = this.llm.getLastRouteSnapshot();
+      if (!route) {
+        return;
+      }
+
+      printInfo(`[DeepSeek] target=${route.target} | model=${route.model} | reason=${this.describeDeepSeekRouteReason(route.reason)}`);
+    }
+  }
+
+  private describeDeepSeekRouteReason(reason: string): string {
+    switch (reason) {
+      case 'workflow_planning':
+        return 'workflow_planning';
+      case 'troubleshooting':
+        return 'troubleshooting';
+      case 'architecture_design':
+        return 'architecture_design';
+      case 'stock_analysis':
+        return 'stock_analysis';
+      case 'long_form_summary':
+        return 'long_form_summary';
+      default:
+        return reason;
+    }
   }
 
   private async showWelcomeQuestions(): Promise<void> {
@@ -842,6 +1226,119 @@ export class CLI {
         .join('\n');
     }
     return '';
+  }
+
+  private formatCronRunResult(toolResult?: { output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }): string {
+    const output = this.getToolResultDisplayText(toolResult);
+    if (!output) return '';
+
+    try {
+      const parsed = JSON.parse(output) as {
+        job?: { id?: string; name?: string; tool?: string };
+        workDir?: string;
+        result?: { output?: string; is_error?: boolean };
+      };
+
+      const lines: string[] = [];
+      if (parsed.job?.name) {
+        lines.push(`job: ${parsed.job.name}`);
+      } else if (parsed.job?.id) {
+        lines.push(`job: ${parsed.job.id}`);
+      }
+
+      if (parsed.job?.tool) {
+        lines.push(`tool: ${parsed.job.tool}`);
+      }
+
+      if (parsed.workDir) {
+        lines.push(`workdir: ${parsed.workDir}`);
+      }
+
+      const runOutput = parsed.result?.output?.trim();
+      if (runOutput) {
+        lines.push('output:');
+        lines.push(runOutput);
+      }
+
+      return lines.length > 0 ? lines.join('\n') : output;
+    } catch {
+      return output;
+    }
+  }
+
+  private formatBrowserAutomationResult(toolResult?: { output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }): string {
+    const output = this.getToolResultDisplayText(toolResult);
+    if (!output) return '';
+
+    try {
+      const parsed = JSON.parse(output) as {
+        browser?: string;
+        title?: string;
+        url?: string;
+        actions?: Array<{ type?: string; selector?: string; text?: string; outputPath?: string }>;
+      };
+
+      const lines: string[] = [];
+      if (parsed.browser) {
+        lines.push(`browser: ${parsed.browser}`);
+      }
+      if (parsed.title) {
+        lines.push(`title: ${parsed.title}`);
+      }
+      if (parsed.url) {
+        lines.push(`url: ${parsed.url}`);
+      }
+
+      for (const action of parsed.actions || []) {
+        if (action.outputPath) {
+          lines.push(`screenshot: ${action.outputPath}`);
+        }
+        if (action.text) {
+          lines.push('text:');
+          lines.push(action.text.slice(0, 2000));
+        }
+      }
+
+      return lines.length > 0 ? lines.join('\n') : output;
+    } catch {
+      return output;
+    }
+  }
+
+  private resolveBrowserActionFile(inputPath: string): string {
+    if (path.isAbsolute(inputPath)) {
+      return inputPath;
+    }
+
+    const normalizedPath = inputPath.replace(/^actions[\\/]/i, '');
+    return path.join(this.getBrowserActionsDir(), normalizedPath);
+  }
+
+  private getBrowserActionsDir(): string {
+    return path.join(this.appBaseDir, 'actions');
+  }
+
+  private applyGlobalPathsFromConfig(config: { appBaseDir?: string }): void {
+    this.appBaseDir = config.appBaseDir || path.join(os.homedir(), '.ai-agent-cli');
+    this.inputHistoryPath = path.join(this.appBaseDir, 'input-history.json');
+    this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
+  }
+
+  private async parseBrowserActions(rawInput?: string): Promise<Record<string, unknown>[]> {
+    if (!rawInput) {
+      return [];
+    }
+
+    const content = rawInput.startsWith('@')
+      ? await fs.readFile(this.resolveBrowserActionFile(rawInput.slice(1)), 'utf-8')
+      : rawInput;
+
+    const parsed = JSON.parse(content);
+    if (!Array.isArray(parsed)) {
+      throw new Error('浏览器动作必须是 JSON 数组');
+    }
+
+    return parsed as Record<string, unknown>[];
   }
 
   private trackPlannedTask(event: AgentEvent): void {
@@ -1166,21 +1663,9 @@ export class CLI {
         }
 
         console.log(chalk.bold(`\n🏛️ ${room.name}\n`));
-        console.log(chalk.gray(room.description));
-        console.log(chalk.gray(`地标: ${room.landmarks.join(', ')}`));
-        console.log(chalk.gray(`出口: ${room.exits.join(', ') || '无'}\n`));
-
-        if (room.memories.length === 0) {
-          console.log(chalk.gray('该房间暂无记忆条目。\n'));
-          return;
-        }
-
-        for (const item of room.memories.slice(-10)) {
-          console.log(chalk.cyan(`  • ${item.title}`));
-          console.log(chalk.gray(`    ${item.content.replace(/\n/g, ' ')}`));
-          if (item.tags.length > 0) {
-            console.log(chalk.gray(`    tags: ${item.tags.join(', ')}`));
-          }
+        for (const item of room.memories) {
+          console.log(chalk.green(`• [${item.zone}] ${item.title}`));
+          console.log(chalk.gray(`  ${item.content.slice(0, 200)}${item.content.length > 200 ? '...' : ''}`));
         }
         console.log();
         break;
@@ -1436,7 +1921,7 @@ ${chalk.cyan('/perm ask')} [on|off] 询问权限
 ${chalk.gray('权限类型:')}
   file_read, file_write, file_delete, file_copy, file_move
   directory_list, directory_create, command_execute
-  network_request, browser_open, mcp_access, tool_execute
+  network_request, browser_open, browser_automation, mcp_access, tool_execute
   env_read, process_list, clipboard_read, clipboard_write
 
 ${chalk.gray('权限组:')}
@@ -1456,7 +1941,7 @@ ${chalk.gray('权限组:')}
 
     const validTypes = ['file_read', 'file_write', 'file_delete', 'file_copy', 'file_move',
       'directory_list', 'directory_create', 'command_execute', 'network_request',
-      'browser_open', 'mcp_access', 'tool_execute', 'env_read', 'process_list'];
+      'browser_open', 'browser_automation', 'mcp_access', 'tool_execute', 'env_read', 'process_list'];
     if (!validTypes.includes(type)) {
       printError('Invalid type. Choose from: ' + validTypes.join(', '));
       return;
@@ -1649,6 +2134,11 @@ ${chalk.gray('权限组:')}
           baseUrl: config.deepseek?.baseUrl || 'https://api.deepseek.com',
           model: config.deepseek?.model || 'deepseek-chat',
           temperature: config.deepseek?.temperature || 0.7,
+          maxTokens: config.deepseek?.maxTokens || 4096,
+          deepseekRouting: config.deepseek?.reasoningModel ? {
+            reasoningModel: config.deepseek.reasoningModel,
+            autoReasoning: config.deepseek.autoReasoning,
+          } : undefined,
         });
         
       case 'kimi':
@@ -1716,6 +2206,22 @@ ${chalk.gray('权限组:')}
           model: config.gemini?.model || 'gemini-2.0-flash',
           temperature: config.gemini?.temperature || 0.7,
         });
+
+      case 'hybrid':
+        return LLMFactory.create({
+          provider: 'hybrid',
+          model: 'hybrid-router',
+          hybrid: {
+            localProvider: config.hybrid?.localProvider || 'ollama',
+            remoteProvider: config.hybrid?.remoteProvider || 'deepseek',
+            localModel: config[config.hybrid?.localProvider || 'ollama']?.model,
+            remoteModel: config[config.hybrid?.remoteProvider || 'deepseek']?.model,
+            simpleTaskMaxChars: config.hybrid?.simpleTaskMaxChars || 80,
+            simpleConversationMaxChars: config.hybrid?.simpleConversationMaxChars || 6000,
+            preferRemoteForToolMessages: config.hybrid?.preferRemoteForToolMessages ?? true,
+            localAvailabilityCacheMs: config.hybrid?.localAvailabilityCacheMs ?? 15000,
+          },
+        });
         
       default:
         printWarning(`Unknown provider ${provider}, using ollama`);
@@ -1728,45 +2234,129 @@ ${chalk.gray('权限组:')}
   }
 
   private showQuickHelp(): void {
-    console.log(`
-${chalk.bold('Quick Commands:')}
-  ${chalk.cyan('/?')}        ${chalk.gray('Show this help')}
-  ${chalk.cyan('/quit')}     ${chalk.gray('Exit')}
-  ${chalk.cyan('/tools')}    ${chalk.gray('List tools')}
-  ${chalk.cyan('/news')}     ${chalk.gray('Tencent news shortcuts')}
-  ${chalk.cyan('/model')}    ${chalk.gray('Show/change model')}
-  ${chalk.cyan('/sessions')} ${chalk.gray('Show sessions')}
-  ${chalk.cyan('/cron')}     ${chalk.gray('Manage cron jobs')}
-  ${chalk.cyan('/reset')}    ${chalk.gray('Clear chat')}
-`);
+    console.log(getQuickHelpText());
   }
 
   private showHelp(): void {
-    console.log(`
-${chalk.bold('Available Commands:')}
+    console.log(getFullHelpText());
+  }
 
-${chalk.cyan('/?, /？')}           Show quick help
-${chalk.cyan('/help, /h')}         Show full help
-${chalk.cyan('/quit, /exit, /bye, /q')}  Exit the application
-${chalk.cyan('/clear, /cls')}      Clear the screen
-${chalk.cyan('/history, /hi')}      Show command history
-${chalk.cyan('/tools, /t')}        List available tools
-${chalk.cyan('/config, /c')}       Show current configuration
-${chalk.cyan('/model, /m')} [name]     Show or change model
-${chalk.cyan('/model switch')} <name> Switch default provider
-${chalk.cyan('/workspace, /w')}    Show or change workspace
-${chalk.cyan('/reset, /r')}        Reset conversation
-${chalk.cyan('/new')}              Create new session (archive old)
-${chalk.cyan('/wipe')}             Reset user data (restart onboarding)
-${chalk.cyan('/sessions')}         List conversation sessions
-${chalk.cyan('/load')} <id>        Load a previous session
-${chalk.cyan('/mcp')}              Manage MCP servers
-${chalk.cyan('/lsp')}              Manage LSP servers
-${chalk.cyan('/skill')}            Manage skills
-${chalk.cyan('/news')}             Tencent news shortcuts (hot/search/morning/evening)
-${chalk.cyan('/cron')}             Manage cron jobs
-${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)
+  private async handleBrowserCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase();
+
+    if (!this.builtInTools) {
+      printError('Built-in tools not initialized');
+      return;
+    }
+
+    switch (subcommand) {
+      case 'open': {
+        const url = args[1];
+        if (!url) {
+          printError('Usage: /browser open <url>');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('open_browser', { url, browser: 'chrome' });
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to open browser');
+        } else {
+          printSuccess(`Chrome opened: ${url}`);
+        }
+        break;
+      }
+      case 'run': {
+        const url = args[1];
+        if (!url) {
+          printError('Usage: /browser run <url> [actionsJson|@actions.json] [--headed] [--timeout <ms>] [--browser <chrome|edge|chromium>]');
+          return;
+        }
+
+        let browser: 'chrome' | 'edge' | 'chromium' = 'chrome';
+        let headless = true;
+        let timeoutMs = 15000;
+        const actionTokens: string[] = [];
+
+        for (let index = 2; index < args.length; index += 1) {
+          const token = args[index];
+          if (!token) continue;
+
+          if (token === '--headed') {
+            headless = false;
+            continue;
+          }
+
+          if (token === '--headless') {
+            headless = true;
+            continue;
+          }
+
+          if (token === '--timeout') {
+            const nextValue = args[index + 1];
+            const parsedTimeout = Number(nextValue);
+            if (!nextValue || !Number.isFinite(parsedTimeout) || parsedTimeout <= 0) {
+              printError('Invalid --timeout value');
+              return;
+            }
+            timeoutMs = parsedTimeout;
+            index += 1;
+            continue;
+          }
+
+          if (token === '--browser') {
+            const nextValue = args[index + 1]?.toLowerCase();
+            if (nextValue !== 'chrome' && nextValue !== 'edge' && nextValue !== 'chromium') {
+              printError('Invalid --browser value, use chrome, edge, or chromium');
+              return;
+            }
+            browser = nextValue;
+            index += 1;
+            continue;
+          }
+
+          actionTokens.push(token);
+        }
+
+        try {
+          const actions = await this.parseBrowserActions(actionTokens.join(' ').trim() || undefined);
+          const result = await this.builtInTools.executeTool('browser_automate', {
+            url,
+            actions,
+            browser,
+            headless,
+            timeoutMs,
+          });
+
+          if (result.is_error) {
+            printError(this.getToolResultDisplayText(result) || 'Failed to automate browser');
+          } else {
+            printSuccess(`Browser automation finished: ${url}`);
+            console.log(this.formatBrowserAutomationResult(result));
+          }
+        } catch (error) {
+          printError(error instanceof Error ? error.message : String(error));
+        }
+        break;
+      }
+      case 'help':
+      default:
+        console.log(`
+${chalk.bold('Browser Commands:')}
+
+${chalk.cyan('/browser open')} <url>
+  用 Chrome 打开网页
+
+${chalk.cyan('/browser run')} <url> [actionsJson|@actions.json] [--headed] [--timeout <ms>] [--browser <chrome|edge|chromium>]
+  默认用 Chrome，通过 Playwright 打开网页并执行动作
+
+${chalk.gray('动作示例:')}
+  [{"type":"click","selector":"text=登录"},{"type":"fill","selector":"input[name=q]","value":"AI Agent CLI"},{"type":"press","selector":"input[name=q]","key":"Enter"},{"type":"wait_for_selector","selector":"#search"},{"type":"extract_text","selector":"body"},{"type":"screenshot","path":"browser/search.png"}]
+
+${chalk.gray('更稳妥的用法:')}
+  /browser run https://example.com @actions.json --headed
 `);
+        break;
+    }
   }
 
   private async handleNewsCommand(args: string[]): Promise<void> {
@@ -1815,7 +2405,7 @@ ${chalk.gray('/news push morning --save')}
       case 'push': {
         const parsed = this.parseNewsPushArgs(args.slice(1));
         if (!parsed) {
-          printError('Usage: /news push <morning|evening|hot|search> [--user-id <ou_xxx>] [--limit <n>] [--keyword <text>] [--title <text>] [--save] [--dry-run] [--timezone <Asia/Shanghai>]\n默认接收目标读取 notifications.lark.morningNews.chatId');
+          printError('Usage: /news push <morning|evening|hot|search> [--chat-id <oc_xxx>] [--limit <n>] [--keyword <text>] [--title <text>] [--save] [--dry-run] [--timezone <Asia/Shanghai>]\n默认接收目标读取 notifications.lark.morningNews.chatId');
           return;
         }
 
@@ -1866,7 +2456,6 @@ ${chalk.gray('/news push morning --save')}
 
   private parseNewsPushArgs(args: string[]): {
     newsType: 'hot' | 'search' | 'morning' | 'evening';
-    userId?: string;
     chatId?: string;
     keyword?: string;
     limit?: number;
@@ -1881,24 +2470,21 @@ ${chalk.gray('/news push morning --save')}
     }
 
     const flags = this.parseCliFlags(args.slice(1));
-    let userId = flags['user-id'];
     let chatId = flags['chat-id'];
-    if (userId && chatId) {
+    if (flags['user-id']) {
       return null;
     }
 
-    if (!userId && !chatId) {
+    if (!chatId) {
       const configuredTarget = this.getDefaultLarkNewsTarget();
-      userId = configuredTarget?.userId;
       chatId = configuredTarget?.chatId;
-      if (!userId && !chatId) {
+      if (!chatId) {
         return null;
       }
     }
 
     const parsed = {
       newsType: newsType as 'hot' | 'search' | 'morning' | 'evening',
-      userId,
       chatId,
       keyword: flags.keyword,
       limit: flags.limit ? Number.parseInt(flags.limit, 10) : undefined,
@@ -2106,13 +2692,18 @@ ${chalk.gray('/news push morning --save')}
       case 'list': {
         const jobs = this.cronManager.listJobs();
         console.log(chalk.bold('\nCron Jobs:\n'));
+        console.log(chalk.gray(`scheduler: ${this.cronManager.isRunning() ? 'running' : 'stopped'}`));
+        console.log();
         if (jobs.length === 0) {
           console.log(chalk.gray('No cron jobs found.'));
         } else {
           for (const job of jobs) {
+            const workDir = this.cronManager.getJobWorkDir(job.name);
             console.log(chalk.cyan(`  • ${job.name}`) + chalk.gray(` (${job.id})`));
+            console.log(`    status: ${job.enabled ? chalk.green('enabled') : chalk.yellow('disabled')}`);
             console.log(`    schedule: ${job.schedule}`);
             console.log(`    tool: ${job.toolName}`);
+            console.log(chalk.gray(`    workdir: ${workDir}`));
             if (job.description) {
               console.log(chalk.gray(`    ${job.description}`));
             }
@@ -2121,6 +2712,46 @@ ${chalk.gray('/news push morning --save')}
             }
             console.log();
           }
+        }
+        break;
+      }
+      case 'start': {
+        const idOrName = args[1];
+        const result = await this.builtInTools.executeTool('cron_start', idOrName ? { idOrName } : {});
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to start cron');
+        } else if (idOrName) {
+          printSuccess(`Cron job enabled: ${idOrName}`);
+        } else {
+          printSuccess('Cron scheduler started');
+        }
+        break;
+      }
+      case 'stop': {
+        const idOrName = args[1];
+        const result = await this.builtInTools.executeTool('cron_stop', idOrName ? { idOrName } : {});
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to stop cron');
+        } else if (idOrName) {
+          printSuccess(`Cron job disabled: ${idOrName}`);
+        } else {
+          printSuccess('Cron scheduler stopped');
+        }
+        break;
+      }
+      case 'run': {
+        const idOrName = args[1];
+        if (!idOrName) {
+          printError('Usage: /cron run <idOrName>');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('cron_run', { idOrName });
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to run cron job');
+        } else {
+          printSuccess(`Cron job executed: ${idOrName}`);
+          console.log(this.formatCronRunResult(result));
         }
         break;
       }
@@ -2207,7 +2838,7 @@ ${chalk.gray('/news push morning --save')}
         const parsed = this.parseCronNewsLarkArgs(args.slice(3));
 
         if (!name || !newsType || !parsed) {
-          printError('Usage: /cron create-news-lark <name> <morning|evening|hot|search> <schedule> [--user-id <ou_xxx>] [--limit <n>] [--keyword <text>] [--title <text>] [--save] [--timezone <Asia/Shanghai>]\n默认接收目标读取 notifications.lark.morningNews.chatId');
+          printError('Usage: /cron create-news-lark <name> <morning|evening|hot|search> <schedule> [--chat-id <oc_xxx>] [--limit <n>] [--keyword <text>] [--title <text>] [--save] [--timezone <Asia/Shanghai>]\n默认接收目标读取 notifications.lark.morningNews.chatId');
           return;
         }
 
@@ -2236,8 +2867,34 @@ ${chalk.gray('/news push morning --save')}
         }
         break;
       }
+      case 'create-weather-lark': {
+        const name = args[1];
+        const parsed = this.parseCronWeatherLarkArgs(args.slice(2));
+
+        if (!name || !parsed) {
+          printError('Usage: /cron create-weather-lark <name> <schedule> [--city <城市>] [--chat-id <oc_xxx>] [--timezone <Asia/Shanghai>]\n默认接收目标读取 notifications.lark.weather.chatId 或 notifications.lark.morningNews.chatId');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('cron_create', {
+          name,
+          schedule: parsed.schedule,
+          tool: 'push_weather_to_lark',
+          args: parsed.toolArgs,
+          description: `Daily weather to Lark${parsed.toolArgs.city ? ` (${String(parsed.toolArgs.city)})` : ''}`,
+          timezone: parsed.timezone,
+        });
+
+        if (result.is_error) {
+          printError(this.getToolResultDisplayText(result) || 'Failed to create Lark weather cron job');
+        } else {
+          printSuccess(`Lark weather cron job created: ${name}`);
+          console.log(this.getToolResultDisplayText(result));
+        }
+        break;
+      }
       case 'create-morning-feishu': {
-        await this.createPresetMorningFeishuCron('user', args[1]);
+        printError('create-morning-feishu 已废弃。push_news_to_lark 仅支持群聊 chatId，请改用 /cron create-morning-feishu-group [oc_xxx]');
         break;
       }
       case 'create-morning-feishu-group': {
@@ -2273,8 +2930,12 @@ ${chalk.cyan('/cron list')}                    列出 cron 任务
 ${chalk.cyan('/cron create')} <name> <schedule> <tool> [jsonArgs]
 ${chalk.cyan('/cron create-news')} <name> <morning|evening|hot> <schedule> [timezone]
 ${chalk.cyan('/cron create-news-lark')} <name> <type> <schedule> [flags]
-${chalk.cyan('/cron create-morning-feishu')} [ou_xxx]
+${chalk.cyan('/cron create-weather-lark')} <name> <schedule> [flags]
+${chalk.cyan('/cron create-morning-feishu')}                已废弃，请改用 group 版本
 ${chalk.cyan('/cron create-morning-feishu-group')} [oc_xxx]
+${chalk.cyan('/cron start')} [idOrName]       启动调度器或启用指定任务
+${chalk.cyan('/cron stop')} [idOrName]        停止调度器或停用指定任务
+${chalk.cyan('/cron run')} <idOrName>         立即强制执行指定任务一次
 ${chalk.cyan('/cron delete')} <idOrName>      删除 cron 任务
 ${chalk.cyan('/cron run-due')}                立即检查当前到期任务
 
@@ -2282,13 +2943,14 @@ ${chalk.gray('示例:')}
 ${chalk.gray('/cron create-news morning-brief morning 0 8 * * * Asia/Shanghai')}
 ${chalk.gray('/cron create hot-news 0 9 * * * tencent_hot_news {"limit":5}')}
 ${chalk.gray('/cron create-news-lark morning-feishu morning 0 8 * * * --save')}
-${chalk.gray('/cron create-morning-feishu')}
+${chalk.gray('/cron create-weather-lark daily-weather 0 9 * * * --city 北京')}
+${chalk.gray('/cron create-morning-feishu-group oc_xxx')}
 ${chalk.gray('/cron create-morning-feishu-group')}
 `);
     }
   }
 
-  private async createPresetMorningFeishuCron(targetType: 'user' | 'group', overrideTarget?: string): Promise<void> {
+  private async createPresetMorningFeishuCron(targetType: 'group', overrideTarget?: string): Promise<void> {
     if (!this.builtInTools) {
       printError('Built-in tools not initialized');
       return;
@@ -2296,8 +2958,7 @@ ${chalk.gray('/cron create-morning-feishu-group')}
 
     const preset = this.getMorningFeishuPreset(targetType, overrideTarget);
     if (!preset) {
-      const requiredKey = targetType === 'user' ? 'notifications.lark.morningNews.userId' : 'notifications.lark.morningNews.chatId';
-      printError(`Missing target. 请传入参数，或在配置文件中设置 ${requiredKey}`);
+      printError('Missing target. 请传入参数，或在配置文件中设置 notifications.lark.morningNews.chatId');
       return;
     }
 
@@ -2319,7 +2980,7 @@ ${chalk.gray('/cron create-morning-feishu-group')}
     console.log(this.getToolResultDisplayText(result));
   }
 
-  private getMorningFeishuPreset(targetType: 'user' | 'group', overrideTarget?: string): {
+  private getMorningFeishuPreset(targetType: 'group', overrideTarget?: string): {
     name: string;
     schedule: string;
     timezone?: string;
@@ -2328,7 +2989,7 @@ ${chalk.gray('/cron create-morning-feishu-group')}
   } | null {
     const config = configManager.getAll();
     const morningNews = config.notifications?.lark?.morningNews;
-    const target = (overrideTarget || (targetType === 'user' ? morningNews?.userId : morningNews?.chatId) || '').trim();
+    const target = (overrideTarget || morningNews?.chatId || '').trim();
     if (!target) {
       return null;
     }
@@ -2342,11 +3003,7 @@ ${chalk.gray('/cron create-morning-feishu-group')}
       timezone,
     };
 
-    if (targetType === 'user') {
-      toolArgs.userId = target;
-    } else {
-      toolArgs.chatId = target;
-    }
+    toolArgs.chatId = target;
 
     if (saveOutput) {
       toolArgs.saveOutput = true;
@@ -2356,10 +3013,10 @@ ${chalk.gray('/cron create-morning-feishu-group')}
     }
 
     return {
-      name: targetType === 'user' ? 'morning-feishu' : 'morning-feishu-group',
+      name: 'morning-feishu-group',
       schedule,
       timezone,
-      description: targetType === 'user' ? 'Tencent morning news to configured Lark user' : 'Tencent morning news to configured Lark group',
+      description: 'Tencent morning news to configured Lark group',
       toolArgs,
     };
   }
@@ -2382,25 +3039,20 @@ ${chalk.gray('/cron create-morning-feishu-group')}
     }
 
     const flags = this.parseCliFlags(rest);
-    let userId = flags['user-id'];
     let chatId = flags['chat-id'];
-    if (userId && chatId) {
+    if (flags['user-id']) {
       return null;
     }
 
-    if (!userId && !chatId) {
+    if (!chatId) {
       const configuredTarget = this.getDefaultLarkNewsTarget();
-      userId = configuredTarget?.userId;
       chatId = configuredTarget?.chatId;
-      if (!userId && !chatId) {
+      if (!chatId) {
         return null;
       }
     }
 
     const toolArgs: Record<string, unknown> = {};
-    if (userId) {
-      toolArgs.userId = userId;
-    }
     if (chatId) {
       toolArgs.chatId = chatId;
     }
@@ -2430,19 +3082,74 @@ ${chalk.gray('/cron create-morning-feishu-group')}
     };
   }
 
-  private getDefaultLarkNewsTarget(): { userId?: string; chatId?: string } | null {
+  private parseCronWeatherLarkArgs(args: string[]): { schedule: string; timezone?: string; toolArgs: Record<string, unknown> } | null {
+    if (args.length === 0) {
+      return null;
+    }
+
+    let schedule = '';
+    let rest: string[] = [];
+    if (args[0]?.startsWith('@')) {
+      schedule = this.normalizeCronToken(args[0]);
+      rest = args.slice(1);
+    } else if (args.length >= 5) {
+      schedule = this.normalizeCronToken(args.slice(0, 5).join(' '));
+      rest = args.slice(5);
+    } else {
+      return null;
+    }
+
+    const flags = this.parseCliFlags(rest);
+    const defaults = this.getDefaultLarkWeatherTarget();
+    const chatId = flags['chat-id'] || defaults?.chatId;
+    if (!chatId) {
+      return null;
+    }
+
+    const toolArgs: Record<string, unknown> = { chatId };
+    if (flags.city) {
+      toolArgs.city = flags.city;
+    } else if (defaults?.city) {
+      toolArgs.city = defaults.city;
+    }
+    if (flags.timezone) {
+      toolArgs.timezone = flags.timezone;
+    } else if (defaults?.timezone) {
+      toolArgs.timezone = defaults.timezone;
+    }
+
+    return {
+      schedule,
+      timezone: typeof toolArgs.timezone === 'string' ? toolArgs.timezone : undefined,
+      toolArgs,
+    };
+  }
+
+  private getDefaultLarkNewsTarget(): { chatId?: string } | null {
     const morningNews = configManager.getAll().notifications?.lark?.morningNews;
     const chatId = morningNews?.chatId?.trim();
-    const userId = morningNews?.userId?.trim();
 
     if (chatId) {
       return { chatId };
     }
-    if (userId) {
-      return { userId };
-    }
 
     return null;
+  }
+
+  private getDefaultLarkWeatherTarget(): { chatId?: string; city?: string; timezone?: string } | null {
+    const lark = configManager.getAll().notifications?.lark;
+    const weather = lark?.weather;
+    const morningNews = lark?.morningNews;
+    const chatId = weather?.chatId?.trim() || morningNews?.chatId?.trim();
+    if (!chatId) {
+      return null;
+    }
+
+    return {
+      chatId,
+      city: weather?.city?.trim(),
+      timezone: weather?.timezone?.trim() || morningNews?.timezone?.trim(),
+    };
   }
 
   async runCronDaemon(runOnce = false): Promise<void> {
@@ -2555,6 +3262,10 @@ ${chalk.gray('/cron create-morning-feishu-group')}
   private showConfig(): void {
     const config = configManager.getAll();
     console.log(chalk.bold('\nCurrent Configuration:\n'));
+    console.log(`  Path: ${configManager.getConfigPath()}`);
+    console.log(`  App Base Dir: ${config.appBaseDir}`);
+    console.log(`  Browser Actions Dir: ${path.join(config.appBaseDir || path.join(os.homedir(), '.ai-agent-cli'), 'actions')}`);
+    console.log(`  Workspace: ${config.workspace}`);
     console.log(chalk.gray('Ollama:'));
     console.log(`  URL: ${config.ollama.baseUrl}`);
     console.log(`  Model: ${config.ollama.model}`);
@@ -2570,7 +3281,169 @@ ${chalk.gray('/cron create-morning-feishu-group')}
     console.log(`  Morning Lark Group: ${config.notifications?.lark?.morningNews?.chatId || '(not set)'}`);
     console.log(`  Morning Schedule: ${config.notifications?.lark?.morningNews?.schedule || '0 8 * * *'}`);
     console.log(`  Morning Timezone: ${config.notifications?.lark?.morningNews?.timezone || 'Asia/Shanghai'}`);
+    console.log(`  Relay Enabled: ${config.notifications?.lark?.relay?.enabled ? 'yes' : 'no'}`);
+    console.log(`  Relay Auto Subscribe: ${config.notifications?.lark?.relay?.autoSubscribe === false ? 'no' : 'yes'}`);
+    console.log(`  Relay Event Types: ${(config.notifications?.lark?.relay?.eventTypes || ['im.message.receive_v1']).join(', ')}`);
+    if (config.hybrid?.enabled) {
+      console.log(chalk.gray('\nHybrid Routing:'));
+      console.log(`  Local Provider: ${config.hybrid.localProvider}`);
+      console.log(`  Remote Provider: ${config.hybrid.remoteProvider}`);
+      console.log(`  Simple Task Max Chars: ${config.hybrid.simpleTaskMaxChars || 80}`);
+      console.log(`  Simple Conversation Max Chars: ${config.hybrid.simpleConversationMaxChars || 6000}`);
+      console.log(`  Local Availability Cache: ${config.hybrid.localAvailabilityCacheMs || 15000}ms`);
+    }
     console.log();
+  }
+
+  private async reloadRuntimeConfig(): Promise<void> {
+    const configPath = configManager.getConfigPath();
+    const previousMessages = this.agent?.getMessages() || this.memoryManager.getMessages();
+
+    try {
+      await configManager.loadFromFile(configPath);
+    } catch (error) {
+      printError(`Config reload failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+
+    const config = configManager.getAgentConfig();
+    this.currentProvider = config.defaultProvider || 'ollama';
+    this.workspace = config.workspace || this.workspace;
+    this.applyGlobalPathsFromConfig(config);
+
+    try {
+      await this.rebuildRuntimeFromConfig(config, previousMessages);
+      const connected = this.llm ? await this.llm.checkConnection().catch(() => false) : false;
+      if (connected) {
+        printSuccess(`Config reloaded from ${configPath}`);
+        printInfo(`当前 provider: ${this.currentProvider} (${this.llm?.getModel() || 'unknown'})`);
+      } else {
+        printWarning(`Config reloaded from ${configPath}，但 ${this.currentProvider} 当前未连接`);
+      }
+    } catch (error) {
+      printError(`Runtime refresh failed after config reload: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async rebuildRuntimeFromConfig(config: any, messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: any[]; tool_call_id?: string; name?: string }>): Promise<void> {
+    const sandboxConfig = config.sandbox || { enabled: true, timeout: 30000 };
+    if (!sandboxConfig.allowedPaths) {
+      sandboxConfig.allowedPaths = [config.workspace || this.workspace || process.cwd()];
+    }
+
+    const artifactOutputDir = getArtifactOutputDir({
+      workspace: this.workspace,
+      appBaseDir: config.appBaseDir,
+      artifactOutputDir: config.artifactOutputDir,
+      documentOutputDir: config.documentOutputDir,
+    });
+    const desktopPath = getDesktopPath();
+    for (const extraPath of [artifactOutputDir, desktopPath]) {
+      if (!sandboxConfig.allowedPaths.includes(extraPath)) {
+        sandboxConfig.allowedPaths.push(extraPath);
+      }
+    }
+    const permConfig = this.permissionMgr?.getConfig();
+    for (const allowedPath of permConfig?.allowedPaths || []) {
+      if (!sandboxConfig.allowedPaths.includes(allowedPath)) {
+        sandboxConfig.allowedPaths.push(allowedPath);
+      }
+    }
+
+    this.sandbox = new Sandbox(sandboxConfig);
+    await this.sandbox.initialize();
+
+    this.llm = this.createLLMClient(config);
+
+    if (this.enhancedMemory) {
+      this.memoryProvider = createMemoryProvider({
+        enhancedMemory: this.enhancedMemory,
+        mcpManager: this.mcpManager,
+        config: config.memory,
+        skillManager: this.skillManager,
+      });
+    }
+
+    this.builtInTools = new BuiltInTools(this.sandbox, this.lspManager, {
+      mcpManager: this.mcpManager,
+      taskManager: this.taskManager,
+      cronManager: this.cronManager,
+      workspace: this.workspace,
+      config: config as unknown as Record<string, unknown>,
+    });
+
+    this.cronManager?.setExecutor((toolName, args) => this.builtInTools!.executeTool(toolName, args));
+    this.cronManager?.setNotifier(async ({ job, result }) => {
+      const content = this.getToolResultDisplayText(result) || '(无输出)';
+      console.log();
+      console.log(chalk.magenta(`[Cron] ${job.name}`));
+      if (result.is_error) {
+        printError(content);
+      } else {
+        console.log(chalk.gray(`schedule: ${job.schedule} -> ${job.toolName}`));
+        console.log(content);
+      }
+      console.log();
+    });
+
+    await this.reloadConfiguredMCPServers(config);
+    await this.reloadConfiguredLSPServers(config);
+
+    this.directActionRouter = createDirectActionRouter({
+      builtInTools: this.builtInTools,
+      skillManager: this.skillManager,
+      permissionManager: this.permissionMgr!,
+      workspace: this.workspace,
+      config,
+      getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
+      memoryProvider: this.memoryProvider,
+    });
+
+    this.agent = createAgent({
+      llm: this.llm!,
+      mcpManager: this.mcpManager,
+      lspManager: this.lspManager,
+      sandbox: this.sandbox,
+      builtInTools: this.builtInTools,
+      skillManager: this.skillManager,
+      maxIterations: config.maxIterations,
+      maxToolCallsPerTurn: config.maxToolCallsPerTurn,
+      planner: createPlanner({ llm: this.llm!, memoryProvider: this.memoryProvider, skillManager: this.skillManager }),
+      memoryProvider: this.memoryProvider,
+      config: config as unknown as Record<string, unknown>,
+    });
+
+    if (messages.length > 0) {
+      this.agent.setMessages(messages);
+      this.memoryManager.setMessages(messages);
+      await this.memoryProvider?.syncSession(messages);
+    }
+
+    await this.restartLarkRelay(config);
+  }
+
+  private async reloadConfiguredMCPServers(config: any): Promise<void> {
+    await this.mcpManager.disconnectAll();
+
+    for (const mcpConfig of config.mcp || []) {
+      try {
+        await this.mcpManager.addServer(mcpConfig);
+      } catch (error) {
+        printWarning(`MCP server ${mcpConfig.name} reload failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  private async reloadConfiguredLSPServers(config: any): Promise<void> {
+    await this.lspManager.disconnectAll();
+
+    for (const lspConfig of config.lsp || []) {
+      try {
+        await this.lspManager.addServer(lspConfig, `file://${this.workspace}`);
+      } catch (error) {
+        printWarning(`LSP server ${lspConfig.name} reload failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   private showModels(): void {
@@ -2587,6 +3460,7 @@ ${chalk.gray('/cron create-morning-feishu-group')}
       { name: 'OpenAI', config: config.openai, enabled: config.openai?.enabled },
       { name: 'Claude', config: config.claude, enabled: config.claude?.enabled },
       { name: 'Gemini', config: config.gemini, enabled: config.gemini?.enabled },
+      { name: 'Hybrid', config: config.hybrid, enabled: config.hybrid?.enabled },
     ];
 
     const defaultProvider = config.defaultProvider;
@@ -2596,9 +3470,19 @@ ${chalk.gray('/cron create-morning-feishu-group')}
         const isDefault = provider.name.toLowerCase() === defaultProvider;
         const marker = isDefault ? chalk.green(' (默认)') : '';
         console.log(`${chalk.cyan(provider.name)}${marker}`);
-        console.log(`  Model: ${provider.config.model}`);
-        if (provider.config.baseUrl) {
-          console.log(`  URL: ${provider.config.baseUrl}`);
+        if ('model' in provider.config) {
+          console.log(`  Model: ${provider.config.model}`);
+          if ('reasoningModel' in provider.config && provider.config.reasoningModel) {
+            console.log(`  Reasoning: ${provider.config.reasoningModel}`);
+          }
+          if (provider.config.baseUrl) {
+            console.log(`  URL: ${provider.config.baseUrl}`);
+          }
+        }
+        if ('localProvider' in provider.config) {
+          console.log(`  Local: ${provider.config.localProvider}`);
+          console.log(`  Remote: ${provider.config.remoteProvider}`);
+          console.log(`  Cache TTL: ${provider.config.localAvailabilityCacheMs || 15000}ms`);
         }
         console.log();
       }
@@ -2626,7 +3510,6 @@ ${chalk.gray('/cron create-morning-feishu-group')}
 
   private async switchProvider(provider: string): Promise<void> {
     const normalizedProvider = provider.toLowerCase();
-    const config = configManager.getAgentConfig();
     const providerConfig = configManager.get(normalizedProvider as any);
 
     if (!providerConfig) {
@@ -3081,6 +3964,7 @@ ${chalk.bold('Organization Roles:')}
 
   async shutdown(): Promise<void> {
     this.cronManager?.stop();
+    await this.stopLarkRelay();
     await this.mcpManager.disconnectAll();
     await this.lspManager.disconnectAll();
     await this.sandbox.cleanup();
@@ -3088,12 +3972,23 @@ ${chalk.bold('Organization Roles:')}
 }
 
 export async function runCLI(): Promise<void> {
+  const startupShortcut = process.argv[2];
+  if (isQuickHelpShortcut(startupShortcut)) {
+    console.log(getQuickHelpText());
+    return;
+  }
+
+  if (isFullHelpShortcut(startupShortcut)) {
+    console.log(getFullHelpText());
+    return;
+  }
+
   const program = new Command();
   
   program
     .name('ai-agent')
     .description('AI Agent CLI with MCP, Ollama, LSP and Skills support')
-    .version('1.2.0')
+    .version(APP_VERSION)
     .option('-c, --config <path>', 'Path to configuration file')
     .option('-m, --model <name>', 'Model to use')
     .option('-w, --workspace <path>', 'Workspace directory')

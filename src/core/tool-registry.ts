@@ -2,6 +2,17 @@ import type { MCPManager } from '../mcp/client.js';
 import type { Tool, ToolResult } from '../types/index.js';
 import type { BuiltInTools } from '../tools/builtin.js';
 import type { SkillManager, SkillContext, SkillToolResult } from './skills.js';
+import {
+  createExecutionPermissionMiddleware,
+  type ToolExecutionPermissionHandler,
+} from './tool-execution-permissions.js';
+import {
+  ToolExecutor,
+  type ToolExecutionAuditHandler,
+  type ToolExecutionAuditOptions,
+  type ToolExecutionEventHandler,
+  type ToolExecutionMiddleware,
+} from './tool-executor.js';
 
 export type ToolSource = 'builtin' | 'skill' | 'mcp';
 
@@ -16,6 +27,11 @@ export interface ToolRegistryOptions {
   mcpManager?: MCPManager;
   skillManager?: SkillManager;
   skillContextFactory?: () => SkillContext;
+  executionMiddlewares?: ToolExecutionMiddleware[];
+  onExecutionEvent?: ToolExecutionEventHandler;
+  onAuditRecord?: ToolExecutionAuditHandler;
+  auditOptions?: ToolExecutionAuditOptions;
+  onPermissionCheck?: ToolExecutionPermissionHandler;
 }
 
 export class ToolRegistry {
@@ -24,12 +40,27 @@ export class ToolRegistry {
   private skillManager?: SkillManager;
   private skillContextFactory?: () => SkillContext;
   private tools = new Map<string, RegisteredTool>();
+  private executor: ToolExecutor;
 
   constructor(options: ToolRegistryOptions) {
     this.builtInTools = options.builtInTools;
     this.mcpManager = options.mcpManager;
     this.skillManager = options.skillManager;
     this.skillContextFactory = options.skillContextFactory;
+    this.executor = new ToolExecutor({
+      builtInTools: this.builtInTools,
+      mcpManager: this.mcpManager,
+      skillManager: this.skillManager,
+      skillContextFactory: this.skillContextFactory,
+      getTool: (name) => this.getTool(name),
+      middlewares: [
+        ...(options.onPermissionCheck ? [createExecutionPermissionMiddleware(options.onPermissionCheck)] : []),
+        ...(options.executionMiddlewares ?? []),
+      ],
+      onExecutionEvent: options.onExecutionEvent,
+      onAuditRecord: options.onAuditRecord,
+      auditOptions: options.auditOptions,
+    });
   }
 
   async refresh(): Promise<void> {
@@ -44,6 +75,9 @@ export class ToolRegistry {
 
     if (this.skillManager) {
       for (const tool of this.skillManager.getTools()) {
+        if (this.tools.has(tool.name)) {
+          continue;
+        }
         this.tools.set(tool.name, {
           name: tool.name,
           description: `[skill:${tool.skill}] ${tool.description}`,
@@ -84,126 +118,11 @@ export class ToolRegistry {
   }
 
   async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
-    const tool = this.getTool(name);
-    if (!tool) {
-      return {
-        tool_call_id: '',
-        output: `Unknown tool: ${name}`,
-        is_error: true,
-      };
-    }
-
-    if (tool.source === 'builtin') {
-      return this.builtInTools.executeTool(name, args);
-    }
-
-    if (tool.source === 'skill') {
-      if (!this.skillManager || !this.skillContextFactory) {
-        return {
-          tool_call_id: '',
-          output: `Skill tool unavailable: ${name}`,
-          is_error: true,
-        };
-      }
-
-      try {
-        const result = await this.skillManager.executeTool(name, args, this.skillContextFactory());
-        return this.normalizeSkillToolResult(result);
-      } catch (error) {
-        return {
-          tool_call_id: '',
-          output: this.normalizeSkillExecutionError(name, error),
-          is_error: true,
-        };
-      }
-    }
-
-    if (tool.source === 'mcp') {
-      if (!this.mcpManager || !tool.serverName) {
-        return {
-          tool_call_id: '',
-          output: `MCP tool unavailable: ${name}`,
-          is_error: true,
-        };
-      }
-
-      try {
-        const toolName = name.slice(tool.serverName.length + 1);
-        const result = await this.mcpManager.callTool(tool.serverName, toolName, args);
-        return {
-          tool_call_id: '',
-          output: this.normalizeTextBlocks(result.content),
-          content: result.content,
-          is_error: result.isError,
-        };
-      } catch (error) {
-        return {
-          tool_call_id: '',
-          output: `MCP tool error: ${error instanceof Error ? error.message : String(error)}`,
-          is_error: true,
-        };
-      }
-    }
-
-    return {
-      tool_call_id: '',
-      output: `Unsupported tool source: ${tool.source}`,
-      is_error: true,
-    };
+    return this.executor.execute(name, args);
   }
 
-  private normalizeSkillToolResult(result: SkillToolResult): ToolResult {
-    return {
-      tool_call_id: '',
-      output: this.normalizeTextBlocks(result.content),
-      content: result.content,
-      is_error: result.isError,
-    };
-  }
-
-  private normalizeTextBlocks(content: Array<{ type: 'text' | 'image' | 'resource'; text?: string }>): string {
-    return content
-      .filter(item => item.type === 'text' && typeof item.text === 'string')
-      .map(item => item.text || '')
-      .join('\n');
-  }
-
-  private normalizeSkillExecutionError(name: string, error: unknown): string {
-    const message = error instanceof Error ? error.message : String(error);
-
-    if (this.isUnavailableDocxSkill(name, message)) {
-      return [
-        '无可用 docx skill。',
-        '当前安装的 minimax-docx 不可用，原因是缺少可运行的 .NET SDK。',
-        '可改用 PDF、Markdown 或 TXT 导出，或在安装 .NET SDK 后再试 DOCX。',
-      ].join('\n');
-    }
-
-    if (this.isUnavailablePdfSkill(name, message)) {
-      return [
-        '无可用 pdf skill。',
-        '当前安装的 minimax-pdf 不可用，原因是缺少 Playwright/Chromium 运行环境。',
-        '可先执行 npm install -g playwright，并运行 npx playwright install chromium；或者先导出为 Markdown、TXT、DOCX。',
-      ].join('\n');
-    }
-
-    return `Skill tool error: ${message}`;
-  }
-
-  private isUnavailableDocxSkill(name: string, message: string): boolean {
-    if (!/docx/i.test(name)) {
-      return false;
-    }
-
-    return /minimax-docx 当前不可用|缺少 .*\.net sdk|No \.NET SDKs were found|application 'run' does not exist|dotnet run/i.test(message);
-  }
-
-  private isUnavailablePdfSkill(name: string, message: string): boolean {
-    if (!/pdf/i.test(name)) {
-      return false;
-    }
-
-    return /playwright not found|npx playwright install chromium|chromium/i.test(message);
+  useExecutionMiddleware(middleware: ToolExecutionMiddleware): void {
+    this.executor.use(middleware);
   }
 }
 

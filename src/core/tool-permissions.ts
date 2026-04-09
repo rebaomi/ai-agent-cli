@@ -77,6 +77,11 @@ const toolPermissionMappings: ToolPermissionMapping[] = [
     resourceExtractor: (args) => args.url as string | undefined,
   },
   {
+    toolPattern: /^browser_automate$/,
+    permissionType: 'browser_automation',
+    resourceExtractor: (args) => args.url as string | undefined,
+  },
+  {
     toolPattern: /^get_current_time$/,
     permissionType: 'tool_execute',
   },
@@ -90,7 +95,7 @@ const toolPermissionMappings: ToolPermissionMapping[] = [
     resourceExtractor: (args) => args.path as string | undefined,
   },
   {
-    toolPattern: /^(agent_send_message|task_create|task_get_list|task_update|task_stop|task_output|team_create|team_delete|list_peers|todo_write|cron_create|cron_delete|cron_list|config|skill_config)$/,
+    toolPattern: /^(agent_send_message|task_create|task_get_list|task_update|task_stop|task_output|team_create|team_delete|list_peers|todo_write|cron_create|cron_delete|cron_start|cron_stop|cron_run|cron_list|config|skill_config)$/,
     permissionType: 'tool_execute',
   },
   {

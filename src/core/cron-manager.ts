@@ -20,7 +20,7 @@ export interface CronJobDefinition {
   nextRunAt?: number;
 }
 
-type CronExecutor = (toolName: string, args: Record<string, unknown>) => Promise<ToolResult>;
+type CronExecutor = (toolName: string, args: Record<string, unknown>, job: CronJobDefinition) => Promise<ToolResult>;
 type CronNotifier = (payload: { job: CronJobDefinition; result: ToolResult }) => Promise<void> | void;
 
 export class CronManager {
@@ -41,12 +41,24 @@ export class CronManager {
     await this.load();
   }
 
+  getStoreDir(): string {
+    return this.storeDir;
+  }
+
+  getJobWorkDir(jobName: string): string {
+    return path.join(this.storeDir, this.sanitizeJobName(jobName));
+  }
+
   setExecutor(executor: CronExecutor): void {
     this.executor = executor;
   }
 
   setNotifier(notifier: CronNotifier): void {
     this.notifier = notifier;
+  }
+
+  isRunning(): boolean {
+    return Boolean(this.timer);
   }
 
   start(): void {
@@ -101,6 +113,53 @@ export class CronManager {
     return [...this.jobs].sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
+  async startJob(idOrName: string): Promise<CronJobDefinition | null> {
+    const job = this.jobs.find(item => item.id === idOrName || item.name === idOrName);
+    if (!job) {
+      return null;
+    }
+
+    job.enabled = true;
+    job.updatedAt = Date.now();
+    job.nextRunAt = this.computeNextRunAt(job.schedule, new Date(), job.timezone);
+    await this.save();
+    return { ...job };
+  }
+
+  async stopJob(idOrName: string): Promise<CronJobDefinition | null> {
+    const job = this.jobs.find(item => item.id === idOrName || item.name === idOrName);
+    if (!job) {
+      return null;
+    }
+
+    job.enabled = false;
+    job.updatedAt = Date.now();
+    await this.save();
+    return { ...job };
+  }
+
+  async runJobNow(idOrName: string, now = new Date()): Promise<{ job: CronJobDefinition; result: ToolResult } | null> {
+    if (!this.executor) {
+      throw new Error('Cron executor not configured');
+    }
+
+    const job = this.jobs.find(item => item.id === idOrName || item.name === idOrName);
+    if (!job) {
+      return null;
+    }
+
+    const result = await this.executor(job.toolName, job.args, job);
+    job.lastRunAt = now.getTime();
+    job.updatedAt = Date.now();
+    job.nextRunAt = this.computeNextRunAt(job.schedule, now, job.timezone);
+    await this.save();
+
+    return {
+      job: { ...job },
+      result,
+    };
+  }
+
   async deleteJob(idOrName: string): Promise<CronJobDefinition | null> {
     const index = this.jobs.findIndex(job => job.id === idOrName || job.name === idOrName);
     if (index === -1) {
@@ -131,7 +190,7 @@ export class CronManager {
         continue;
       }
 
-      const result = await this.executor(job.toolName, job.args);
+      const result = await this.executor(job.toolName, job.args, job);
       job.lastRunAt = now.getTime();
       job.lastRunKey = runKey;
       job.updatedAt = Date.now();
@@ -158,6 +217,10 @@ export class CronManager {
   private async save(): Promise<void> {
     await fs.mkdir(this.storeDir, { recursive: true });
     await fs.writeFile(this.storeFile, JSON.stringify(this.jobs, null, 2), 'utf-8');
+  }
+
+  private sanitizeJobName(name: string): string {
+    return name.replace(/[<>:"/\\|?*]+/g, '-').replace(/\s+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'job';
   }
 
   private validateSchedule(schedule: string): void {

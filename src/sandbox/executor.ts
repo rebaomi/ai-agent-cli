@@ -134,10 +134,11 @@ export class Sandbox {
   async execute(
     command: string,
     args: string[] = [],
-    options: { cwd?: string; env?: Record<string, string> } = {}
+    options: { cwd?: string; env?: Record<string, string>; timeout?: number } = {}
   ): Promise<ExecuteResult> {
     const startTime = Date.now();
     const cwd = options.cwd ?? process.cwd();
+    const timeoutMs = options.timeout === undefined ? this.timeout : options.timeout;
 
     return new Promise((resolve) => {
       const child = spawn(command, args, {
@@ -150,10 +151,10 @@ export class Sandbox {
       let stderr = '';
       let timedOut = false;
 
-      const timer = setTimeout(() => {
+      const timer = timeoutMs > 0 ? setTimeout(() => {
         timedOut = true;
         child.kill('SIGKILL');
-      }, this.timeout);
+      }, timeoutMs) : null;
 
       child.stdout?.on('data', (data) => {
         stdout += data.toString();
@@ -164,7 +165,7 @@ export class Sandbox {
       });
 
       child.on('close', (code) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         resolve({
           command,
           args,
@@ -177,7 +178,7 @@ export class Sandbox {
       });
 
       child.on('error', (error) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         resolve({
           command,
           args,

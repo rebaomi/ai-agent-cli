@@ -3,6 +3,11 @@ import { join, resolve } from 'path';
 import { pathToFileURL } from 'url';
 import { z } from 'zod';
 import chalk from 'chalk';
+import { resolveOutputPath } from '../utils/path-resolution.js';
+import { writeDocxDocument } from '../utils/docx-export.js';
+import { writePdfDocument } from '../utils/pdf-export.js';
+import { writePptxDocument } from '../utils/pptx-export.js';
+import { writeXlsxDocument } from '../utils/xlsx-export.js';
 
 export interface Skill {
   name: string;
@@ -107,6 +112,8 @@ export interface SkillLearningTodoSearchResult extends SkillLearningTodo {
   score: number;
 }
 
+type OfficialDocumentSkillName = 'docx' | 'pdf' | 'xlsx' | 'pptx';
+
 const skillManifestSchema = z.object({
   name: z.string(),
   version: z.string(),
@@ -131,6 +138,12 @@ export class SkillManager {
   private learningTodoFile: string;
   private enabledSkills: Set<string> = new Set();
   private readonly manifestFiles = ['skill.json', 'SKILL.md', 'package.json'];
+  private readonly legacySkillOverrides: Record<string, string> = {
+    'minimax-docx': 'docx',
+    'minimax-pdf': 'pdf',
+    'minimax-xlsx': 'xlsx',
+    'pptx-generator': 'pptx',
+  };
 
   private get shouldLogDiscovery(): boolean {
     return process.env.AI_AGENT_CLI_QUIET_SKILL_LOGS !== '1';
@@ -180,28 +193,55 @@ export class SkillManager {
     } catch {}
 
     const discovered = new Set<string>();
-    
+    const candidates: Array<{ name: string; path: string }> = [];
+
     for (const path of searchPaths) {
       try {
-        const candidates = await this.findSkillDirectories(path, 2);
-        for (const candidate of candidates) {
-          if (discovered.has(candidate.name)) {
-            continue;
-          }
-          discovered.add(candidate.name);
-          try {
-            await this.loadSkill(candidate.name, candidate.path);
-            if (this.shouldLogDiscovery) {
-              console.log(chalk.cyan(`[Skill] Loaded: ${candidate.name}`));
-            }
-          } catch {
-            if (this.shouldLogDiscovery) {
-              console.log(chalk.gray(`[Skill] Skipped: ${candidate.name}`));
-            }
-          }
-        }
+        candidates.push(...await this.findSkillDirectories(path, 2));
       } catch {}
     }
+
+    const suppressedLegacySkills = this.getSuppressedLegacySkills(candidates.map(candidate => candidate.name));
+
+    for (const candidate of candidates) {
+      if (discovered.has(candidate.name)) {
+        continue;
+      }
+
+      if (suppressedLegacySkills.has(candidate.name)) {
+        if (this.shouldLogDiscovery) {
+          const replacement = this.legacySkillOverrides[candidate.name];
+          console.log(chalk.gray(`[Skill] Suppressed legacy skill: ${candidate.name}${replacement ? ` -> ${replacement}` : ''}`));
+        }
+        discovered.add(candidate.name);
+        continue;
+      }
+
+      discovered.add(candidate.name);
+      try {
+        await this.loadSkill(candidate.name, candidate.path);
+        if (this.shouldLogDiscovery) {
+          console.log(chalk.cyan(`[Skill] Loaded: ${candidate.name}`));
+        }
+      } catch {
+        if (this.shouldLogDiscovery) {
+          console.log(chalk.gray(`[Skill] Skipped: ${candidate.name}`));
+        }
+      }
+    }
+  }
+
+  private getSuppressedLegacySkills(candidateNames: string[]): Set<string> {
+    const available = new Set(candidateNames);
+    const suppressed = new Set<string>();
+
+    for (const [legacyName, preferredName] of Object.entries(this.legacySkillOverrides)) {
+      if (available.has(legacyName) && available.has(preferredName)) {
+        suppressed.add(legacyName);
+      }
+    }
+
+    return suppressed;
   }
 
   private async findSkillDirectories(rootPath: string, maxDepth: number): Promise<Array<{ name: string; path: string }>> {
@@ -508,13 +548,92 @@ export class SkillManager {
     }
     
     if (!loadedEntry) {
+      skill.tools = this.createOfficialDocumentBridgeTools(skill.name);
       if (this.shouldLogDiscovery) {
-        console.log(chalk.gray(`[Skill] ${name}: no entry file, using SKILL.md content`));
+        console.log(chalk.gray(`[Skill] ${name}: no entry file, using SKILL.md content${skill.tools?.length ? ' + bridge tools' : ''}`));
       }
     }
     
     this.skills.set(name, skill);
     this.enabledSkills.add(name);
+  }
+
+  private createOfficialDocumentBridgeTools(skillName: string): SkillTool[] {
+    if (!this.isOfficialDocumentSkillName(skillName)) {
+      return [];
+    }
+
+    switch (skillName) {
+      case 'docx':
+        return [this.createDocumentExportBridgeTool('docx', 'docx_create_from_text', 'Create a DOCX file using the installed docx skill bridge')];
+      case 'pdf':
+        return [this.createDocumentExportBridgeTool('pdf', 'pdf_create_from_text', 'Create a PDF file using the installed pdf skill bridge')];
+      case 'xlsx':
+        return [this.createDocumentExportBridgeTool('xlsx', 'xlsx_create_from_text', 'Create an XLSX file using the installed xlsx skill bridge')];
+      case 'pptx':
+        return [this.createDocumentExportBridgeTool('pptx', 'pptx_create_from_text', 'Create a PPTX file using the installed pptx skill bridge')];
+      default:
+        return [];
+    }
+  }
+
+  private isOfficialDocumentSkillName(value: string): value is OfficialDocumentSkillName {
+    return value === 'docx' || value === 'pdf' || value === 'xlsx' || value === 'pptx';
+  }
+
+  private createDocumentExportBridgeTool(
+    skillName: OfficialDocumentSkillName,
+    toolName: string,
+    description: string,
+  ): SkillTool {
+    const outputProperty = skillName === 'pdf' ? 'out' : 'output';
+
+    return {
+      name: toolName,
+      description,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          [outputProperty]: { type: 'string', description: `Output .${skillName} path` },
+          text: { type: 'string', description: 'Plain text document body' },
+          title: { type: 'string', description: 'Optional document title' },
+        },
+        required: [outputProperty, 'text'],
+      },
+      handler: async (args, ctx) => {
+        const outputArg = skillName === 'pdf' ? args.out : args.output;
+        if (typeof outputArg !== 'string' || !outputArg.trim()) {
+          throw new Error(`Missing ${outputProperty} for ${toolName}`);
+        }
+
+        const resolvedPath = resolveOutputPath(outputArg, {
+          workspace: ctx.workspace,
+          artifactOutputDir: typeof ctx.config.artifactOutputDir === 'string' ? ctx.config.artifactOutputDir : undefined,
+          documentOutputDir: typeof ctx.config.documentOutputDir === 'string' ? ctx.config.documentOutputDir : undefined,
+        });
+
+        const text = typeof args.text === 'string' ? args.text : '';
+        const title = typeof args.title === 'string' ? args.title : undefined;
+
+        if (skillName === 'docx') {
+          await writeDocxDocument(resolvedPath, text, title);
+          return { content: [{ type: 'text', text: `Created report document: ${resolvedPath}` }] };
+        }
+
+        if (skillName === 'pdf') {
+          await writePdfDocument(resolvedPath, text, title);
+          return { content: [{ type: 'text', text: `Created PDF document: ${resolvedPath}` }] };
+        }
+
+        if (skillName === 'xlsx') {
+          await writeXlsxDocument(resolvedPath, text, title);
+          return { content: [{ type: 'text', text: `Created spreadsheet document: ${resolvedPath}` }] };
+        }
+
+        await writePptxDocument(resolvedPath, text, title);
+        return { content: [{ type: 'text', text: `Created presentation document: ${resolvedPath}` }] };
+      },
+    };
   }
   
   private parseFrontmatter(content: string): Record<string, any> {

@@ -261,6 +261,10 @@ class LocalMemoryProvider implements MemoryProvider {
       ['最近一次输出文件', 'last_output_file'],
       ['最近一次 Word 输出', 'last_docx_output_file'],
       ['最近一次 PDF 输出', 'last_pdf_output_file'],
+      ['最近一次表格输出', 'last_xlsx_output_file'],
+      ['最近一次 CSV 输出', 'last_csv_output_file'],
+      ['最近一次 TSV 输出', 'last_tsv_output_file'],
+      ['最近一次演示文稿输出', 'last_pptx_output_file'],
       ['最近一次文本输出', 'last_txt_output_file'],
       ['最近一次 Markdown 输出', 'last_md_output_file'],
     ] as const) {

@@ -1,7 +1,7 @@
 import type { ToolCall } from '../types/index.js';
 import { detectRequestedExportFormat, type ExportFormat } from './export-intent.js';
 
-export type IntentActionKind = 'document_export' | 'file_read' | 'file_search' | 'file_write' | 'command_execute' | 'generic';
+export type IntentActionKind = 'document_export' | 'file_read' | 'file_search' | 'file_write' | 'command_execute' | 'message_send' | 'generic';
 
 export interface IntentContract {
   action: IntentActionKind;
@@ -16,7 +16,7 @@ export const TOOL_INTENT_CONTRACT_PROMPT = [
   '你的任务是根据用户请求和 assistant 准备调用的工具，提炼一个极简结构化 action contract。',
   '只返回 JSON，不要返回解释。',
   '{',
-  '  "action": "document_export|file_read|file_search|file_write|command_execute|generic",',
+  '  "action": "document_export|file_read|file_search|file_write|command_execute|message_send|generic",',
   '  "summary": "一句话概括真实意图",',
   '  "targetFormat": "pdf|docx|pptx|md|txt|xlsx，可选",',
   '  "sourceHint": "源文件或来源提示，可选",',
@@ -28,6 +28,7 @@ export const TOOL_INTENT_CONTRACT_PROMPT = [
   '- 如果用户是在搜索文件或内容，action=file_search。',
   '- 如果用户是在写入/编辑/保存普通文本文件，action=file_write。',
   '- 如果用户明确要求运行命令，action=command_execute。',
+  '- 如果用户要求发送飞书/Lark/IM/聊天消息，action=message_send。',
   '- 不确定时返回 generic。',
 ].join('\n');
 
@@ -56,6 +57,15 @@ export function parseIntentContractResponse(response: string): IntentContract | 
 export function buildFallbackIntentContract(userInput: string, toolCalls: ToolCall[]): IntentContract {
   const toolKinds = classifyPlannedToolKinds(toolCalls);
 
+  if (isCompositeLarkDeliveryTask(userInput)) {
+    return {
+      action: 'generic',
+      summary: 'Resolve requested content first, then send it to chat',
+      sourceHint: extractSourceHint(userInput),
+      confidence: 0.78,
+    };
+  }
+
   if (/(?:转成|转换成|保存成|导出为|导出成|输出为|输出成|存成|写成|改成|变成).*(?:pptx|ppt|powerpoint|幻灯片|演示文稿)/i.test(userInput)) {
     return {
       action: 'document_export',
@@ -81,8 +91,26 @@ export function buildFallbackIntentContract(userInput: string, toolCalls: ToolCa
     return { action: 'file_read', summary: 'Read file content', sourceHint: extractSourceHint(userInput), confidence: 0.68 };
   }
 
+  if (/(分析|整理|总结|归纳|提炼|确定).*(搜索结果|查找结果)|(搜索结果|查找结果).*(分析|整理|总结|归纳|提炼|确定|保存|写入)/i.test(userInput)) {
+    return {
+      action: 'file_write',
+      summary: 'Write analyzed search results',
+      sourceHint: extractSourceHint(userInput),
+      confidence: 0.66,
+    };
+  }
+
   if (/(搜索|查找)|\b(grep|find)\b/i.test(userInput)) {
     return { action: 'file_search', summary: 'Search files or content', sourceHint: extractSourceHint(userInput), confidence: 0.68 };
+  }
+
+  if (/((飞书|lark|im|群聊|chat).*(消息|通知|文本|markdown|附件|文件))|((飞书|lark|im|群聊|chat).*(发送|发|推送))|((发送|发|推送).*(飞书|lark|群聊|chat).*(消息|通知|文本|markdown|附件|文件)?)/i.test(userInput)) {
+    return {
+      action: 'message_send',
+      summary: 'Send a chat message',
+      sourceHint: extractSourceHint(userInput),
+      confidence: 0.72,
+    };
   }
 
   if (/(保存|写入|编辑|修改)|\b(save|write|edit)\b/i.test(userInput)) {
@@ -141,7 +169,7 @@ function classifyPlannedToolKinds(toolCalls: ToolCall[]): Set<'read' | 'search' 
       continue;
     }
 
-    if (/txt_to_docx|minimax_docx_create_from_text|txt_to_pdf|minimax_pdf_text_to_pdf/i.test(name)) {
+    if (/docx_create_from_text|pdf_create_from_text|xlsx_create_from_text|pptx_create_from_text|txt_to_docx|minimax_docx_create_from_text|txt_to_pdf|minimax_pdf_text_to_pdf|txt_to_xlsx|txt_to_pptx/i.test(name)) {
       kinds.add('export');
       continue;
     }
@@ -150,4 +178,20 @@ function classifyPlannedToolKinds(toolCalls: ToolCall[]): Set<'read' | 'search' 
   }
 
   return kinds;
+}
+
+function isCompositeLarkDeliveryTask(userInput: string): boolean {
+  if (!/(飞书|lark)/i.test(userInput) || !/(发送|发(?:到|给|我)?|推送|send)/i.test(userInput)) {
+    return false;
+  }
+
+  if (/(?:内容是|内容为|正文是|正文为|文本是|文本为|markdown是|markdown为)\s*[：:]/i.test(userInput)) {
+    return false;
+  }
+
+  if (/(新闻|热点|热榜|早报|晚报|小红书|redbook|xiaohongshu)/i.test(userInput)) {
+    return false;
+  }
+
+  return /(?:内容|全文|原文|诗|诗词|文章|歌词|台词|简介|介绍|定义|意思|含义).{0,24}(?:是(?:什么|啥)|是什么)|(?:什么是|谁是).{0,24}(?:诗|诗词|文章|歌词|台词|简介|介绍|定义|意思|含义)|这首(?:诗|词|歌).{0,12}(?:内容|全文|原文).{0,8}(?:是(?:什么|啥)|是什么)/i.test(userInput);
 }

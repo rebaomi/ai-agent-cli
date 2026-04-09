@@ -175,24 +175,54 @@ export class ContextManager {
   }
 
   private removeOrphanToolMessages(messages: Message[]): Message[] {
-    const validToolCallIds = new Set<string>();
     const normalized: Message[] = [];
 
-    for (const message of messages) {
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      if (!message) {
+        continue;
+      }
+
       if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-        for (const toolCall of message.tool_calls) {
-          if (toolCall?.id) {
-            validToolCallIds.add(toolCall.id);
+        const requiredIds = new Set(
+          message.tool_calls
+            .map(toolCall => toolCall?.id)
+            .filter((id): id is string => typeof id === 'string' && id.length > 0),
+        );
+
+        const matchedTools: Message[] = [];
+        let cursor = index + 1;
+        while (cursor < messages.length && messages[cursor]?.role === 'tool') {
+          const candidate = messages[cursor];
+          if (!candidate) {
+            cursor += 1;
+            continue;
           }
+
+          if (candidate.tool_call_id && requiredIds.has(candidate.tool_call_id)) {
+            matchedTools.push(candidate);
+          }
+          cursor += 1;
         }
-        normalized.push(message);
+
+        const matchedIds = new Set(
+          matchedTools
+            .map(toolMessage => toolMessage.tool_call_id)
+            .filter((id): id is string => typeof id === 'string' && id.length > 0),
+        );
+
+        const allMatched = requiredIds.size > 0 && Array.from(requiredIds).every(id => matchedIds.has(id));
+        const pendingAtTail = requiredIds.size > 0 && cursor === messages.length;
+
+        if (allMatched || pendingAtTail) {
+          normalized.push(message, ...matchedTools);
+        }
+
+        index = cursor - 1;
         continue;
       }
 
       if (message.role === 'tool') {
-        if (message.tool_call_id && validToolCallIds.has(message.tool_call_id)) {
-          normalized.push(message);
-        }
         continue;
       }
 

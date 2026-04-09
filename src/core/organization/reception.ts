@@ -13,6 +13,7 @@ export class ReceptionAgent {
   private conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
   private currentStage: 'greeting' | 'collecting' | 'understanding' | 'confirmed' = 'greeting';
   private collectedInfo: Map<string, any> = new Map();
+  private pendingQuestions: string[] = [];
 
   constructor(config: ReceptionConfig) {
     this.config = config;
@@ -29,6 +30,7 @@ export class ReceptionAgent {
 
   processInput(input: string): { response: string; isComplete: boolean; context: any } {
     this.conversationHistory.push({ role: 'user', content: input });
+    this.captureDetails(input);
     
     const lowerInput = input.toLowerCase();
     
@@ -44,8 +46,8 @@ export class ReceptionAgent {
 
     if (this.currentStage === 'collecting') {
       this.collectedInfo.set('userInput', input);
-      
-      const clarification = this.analyzeAndClarify(input);
+
+      const clarification = this.analyzeAndClarify();
       if (clarification.needMore) {
         this.currentStage = 'understanding';
         const response = clarification.question;
@@ -60,7 +62,13 @@ export class ReceptionAgent {
     }
 
     if (this.currentStage === 'understanding') {
-      this.collectedInfo.set('clarification', input);
+      this.collectedInfo.set(`clarification_${Date.now()}`, input);
+      const clarification = this.analyzeAndClarify();
+      if (clarification.needMore) {
+        const response = clarification.question;
+        this.conversationHistory.push({ role: 'assistant', content: response });
+        return { response, isComplete: false, context: null };
+      }
       this.currentStage = 'confirmed';
       const finalResponse = this.confirmUnderstanding(this.collectedInfo.get('userInput') as string);
       this.conversationHistory.push({ role: 'assistant', content: finalResponse });
@@ -92,28 +100,20 @@ export class ReceptionAgent {
     return this.config.welcomeMessage + questions[Math.floor(Math.random() * questions.length)];
   }
 
-  private analyzeAndClarify(input: string): { needMore: boolean; question: string } {
-    if (input.length < 20) {
-      return {
-        needMore: true,
-        question: '请提供更多细节，比如具体的场景、目标或要求，这样我能更准确地理解您的需求。'
-      };
+  private analyzeAndClarify(): { needMore: boolean; question: string } {
+    if (this.pendingQuestions.length === 0) {
+      this.pendingQuestions = this.buildFollowUpQuestions();
     }
 
-    const hasMultipleTasks = /[,，、和然后首先其次最后同时并且及]/g.test(input);
-    if (hasMultipleTasks) {
+    const nextQuestion = this.pendingQuestions.shift();
+    if (!nextQuestion) {
       return { needMore: false, question: '' };
     }
 
-    const hasVagueWords = input.includes('一些') || input.includes('某些') || input.includes('大概');
-    if (hasVagueWords) {
-      return {
-        needMore: true,
-        question: '您提到的"一些/某些"具体是指什么呢？能举个例子吗？'
-      };
-    }
-
-    return { needMore: false, question: '' };
+    return {
+      needMore: true,
+      question: nextQuestion,
+    };
   }
 
   private confirmUnderstanding(input: string): string {
@@ -149,9 +149,53 @@ export class ReceptionAgent {
       originalInput: this.collectedInfo.get('userInput'),
       summary: this.collectedInfo.get('summary'),
       extractedTasks: this.extractTasks(this.collectedInfo.get('userInput') || ''),
+      deliverable: this.collectedInfo.get('deliverable'),
+      constraints: this.collectedInfo.get('constraints'),
+      deadline: this.collectedInfo.get('deadline'),
       conversationHistory: [...this.conversationHistory],
       timestamp: Date.now(),
     };
+  }
+
+  private captureDetails(input: string): void {
+    if (!this.collectedInfo.get('goal') && input.trim().length >= 10) {
+      this.collectedInfo.set('goal', input.trim());
+    }
+
+    if (/(docx|word|pdf|ppt|excel|表格|文档|报告|文件|输出|导出|保存)/i.test(input)) {
+      this.collectedInfo.set('deliverable', input.trim());
+    }
+
+    if (/(不要|不能|只要|优先|限制|约束|保留|兼容|权限)/.test(input)) {
+      this.collectedInfo.set('constraints', input.trim());
+    }
+
+    if (/(今天|明天|本周|月底|尽快|截止|deadline|before)/i.test(input)) {
+      this.collectedInfo.set('deadline', input.trim());
+    }
+  }
+
+  private buildFollowUpQuestions(): string[] {
+    const questions: string[] = [];
+    const originalInput = String(this.collectedInfo.get('userInput') || '');
+
+    if (originalInput.trim().length < 20 || !this.collectedInfo.get('goal')) {
+      questions.push('我先确认目标：你最终希望我交付什么结果，或者帮你把哪件事推进到什么状态？');
+    }
+
+    if (/导出|生成|保存|写入|输出/i.test(originalInput) && !this.collectedInfo.get('deliverable')) {
+      questions.push('这个结果要输出成什么格式、放到什么位置？如果有文件名要求，也一起说。');
+    }
+
+    if (!this.collectedInfo.get('constraints')) {
+      questions.push('有没有不能碰的范围、权限限制、风格要求，或者你特别在意的验收标准？');
+    }
+
+    if (!this.collectedInfo.get('deadline')) {
+      questions.push('这个需求有时间要求吗？比如现在先出最小可用结果，还是要一次做到完整。');
+    }
+
+    return questions.slice(0, 3);
   }
 
   getConversationHistory(): Array<{ role: 'user' | 'assistant'; content: string }> {
@@ -166,6 +210,7 @@ export class ReceptionAgent {
     this.conversationHistory = [];
     this.currentStage = 'greeting';
     this.collectedInfo.clear();
+    this.pendingQuestions = [];
   }
 
   getStatus(): { stage: string; messageCount: number; infoCount: number } {

@@ -1,6 +1,6 @@
 import type { Message, Tool, ToolCall } from '../types/index.js';
 
-export type LLMProvider = 'ollama' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini';
+export type LLMProvider = 'ollama' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini' | 'hybrid';
 
 export interface LLMConfig {
   provider: LLMProvider;
@@ -61,6 +61,7 @@ export const KNOWN_MODELS: ModelInfo[] = [
   { id: 'llama3.2', name: 'Llama 3.2', provider: 'ollama', description: 'Meta 开源模型', contextLength: 128000, supportsTools: true, isLocal: true },
   
   { id: 'deepseek-chat', name: 'DeepSeek Chat', provider: 'deepseek', description: '深度求索', contextLength: 64000, supportsTools: true, isLocal: false, pricing: { input: 0.001, output: 0.002 } },
+  { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', provider: 'deepseek', description: '深度求索思考模式', contextLength: 64000, supportsTools: true, isLocal: false },
   { id: 'deepseek-coder', name: 'DeepSeek Coder', provider: 'deepseek', description: '代码专用', contextLength: 160000, supportsTools: true, isLocal: false },
   
   { id: 'moonshot-v1-8k', name: 'Moonshot V1 8K', provider: 'kimi', description: '月之暗面 Kimi', contextLength: 8000, supportsTools: true, isLocal: false, pricing: { input: 0.003, output: 0.006 } },

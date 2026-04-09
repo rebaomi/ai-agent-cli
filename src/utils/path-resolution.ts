@@ -5,9 +5,11 @@ import * as path from 'path';
 const ARTIFACT_EXTENSIONS = new Set([
   '.txt', '.md', '.rtf', '.doc', '.docx', '.pdf', '.xlsx', '.xlsm', '.csv', '.tsv', '.ppt', '.pptx',
 ]);
+const ARTIFACT_DIRECTORY_ALIASES = new Set(['artifacts', 'outputs']);
 
 export interface PathResolutionOptions {
   workspace?: string;
+  appBaseDir?: string;
   artifactOutputDir?: string;
   documentOutputDir?: string;
   homeDir?: string;
@@ -15,6 +17,10 @@ export interface PathResolutionOptions {
 
 function getHomeDir(options?: PathResolutionOptions): string {
   return options?.homeDir || process.env.HOME || process.env.USERPROFILE || os.homedir() || process.cwd();
+}
+
+function getAppBaseDir(options?: PathResolutionOptions): string {
+  return options?.appBaseDir || path.join(getHomeDir(options), '.ai-agent-cli');
 }
 
 export function stripWrappingQuotes(value: string): string {
@@ -87,7 +93,7 @@ export function getArtifactOutputDir(options?: PathResolutionOptions): string {
     return resolveUserPath(configured, options);
   }
 
-  return path.join(getHomeDir(options), '.ai-agent-cli', 'outputs');
+  return path.join(getAppBaseDir(options), 'outputs');
 }
 
 function shouldRouteRelativePathToArtifacts(inputPath: string): boolean {
@@ -99,6 +105,31 @@ function shouldRouteRelativePathToArtifacts(inputPath: string): boolean {
   return ARTIFACT_EXTENSIONS.has(extension);
 }
 
+function normalizeRelativeOutputPath(inputPath: string): string {
+  return inputPath
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .trim();
+}
+
+function isArtifactDirectoryAliasPath(inputPath: string): boolean {
+  const normalized = normalizeRelativeOutputPath(inputPath);
+  if (!normalized || normalized.startsWith('../')) {
+    return false;
+  }
+
+  const [firstSegment] = normalized.split('/');
+  return typeof firstSegment === 'string' && ARTIFACT_DIRECTORY_ALIASES.has(firstSegment.toLowerCase());
+}
+
+function resolveArtifactDirectoryAliasPath(inputPath: string, options?: PathResolutionOptions): string {
+  const normalized = normalizeRelativeOutputPath(inputPath);
+  const suffix = normalized.replace(/^(artifacts|outputs)\/?/i, '');
+  return suffix
+    ? path.resolve(getArtifactOutputDir(options), suffix)
+    : getArtifactOutputDir(options);
+}
+
 export function resolveOutputPath(inputPath: string, options?: PathResolutionOptions): string {
   const normalized = stripWrappingQuotes(inputPath);
   if (!normalized) {
@@ -107,6 +138,10 @@ export function resolveOutputPath(inputPath: string, options?: PathResolutionOpt
 
   if (isDesktopAlias(normalized) || normalized === '~' || normalized.startsWith('~/') || normalized.startsWith('~\\') || isAbsoluteLike(normalized)) {
     return resolveUserPath(normalized, options);
+  }
+
+  if (isArtifactDirectoryAliasPath(normalized)) {
+    return resolveArtifactDirectoryAliasPath(normalized, options);
   }
 
   if (shouldRouteRelativePathToArtifacts(normalized)) {

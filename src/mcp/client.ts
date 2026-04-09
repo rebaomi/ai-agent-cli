@@ -342,11 +342,16 @@ export class MCPClient extends EventEmitter {
 export class MCPManager {
   private clients: Map<string, MCPClient> = new Map();
 
-  async addServer(config: MCPConfig): Promise<MCPClient> {
+  async addServer(config: MCPConfig, timeoutMs = 15000): Promise<MCPClient> {
     const client = new MCPClient(config);
-    
-    await client.connect();
-    await client.initialize();
+
+    try {
+      await withTimeout(client.connect(), timeoutMs, `MCP server ${config.name} connect timed out after ${timeoutMs}ms`);
+      await withTimeout(client.initialize(), timeoutMs, `MCP server ${config.name} initialize timed out after ${timeoutMs}ms`);
+    } catch (error) {
+      client.disconnect();
+      throw error;
+    }
 
     this.clients.set(config.name, client);
     return client;
@@ -422,6 +427,25 @@ export class MCPManager {
     }
     this.clients.clear();
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(message));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 export function createMCPManager(): MCPManager {

@@ -83,18 +83,30 @@ export function detectRequestedExportFormat(input: string, supportedFormats?: Ex
 }
 
 export function isDocxExportTool(name: string): boolean {
-  return /txt_to_docx|minimax_docx_create_from_text/i.test(name);
+  return /docx_create_from_text|txt_to_docx|minimax_docx_create_from_text/i.test(name);
 }
 
 export function isPdfExportTool(name: string): boolean {
-  return /txt_to_pdf|minimax_pdf_text_to_pdf/i.test(name);
+  return /pdf_create_from_text|txt_to_pdf|minimax_pdf_text_to_pdf/i.test(name);
 }
 
-export function selectPreferredExportTool(format: 'docx' | 'pdf', availableTools: Iterable<string>): string | null {
+export function isXlsxExportTool(name: string): boolean {
+  return /xlsx_create_from_text|txt_to_xlsx/i.test(name);
+}
+
+export function isPptxExportTool(name: string): boolean {
+  return /pptx_create_from_text|txt_to_pptx/i.test(name);
+}
+
+export function selectPreferredExportTool(format: 'docx' | 'pdf' | 'xlsx' | 'pptx', availableTools: Iterable<string>): string | null {
   const available = new Set(availableTools);
   const candidates = format === 'docx'
-    ? ['txt_to_docx', 'minimax_docx_create_from_text']
-    : ['txt_to_pdf', 'minimax_pdf_text_to_pdf'];
+    ? ['docx_create_from_text', 'txt_to_docx', 'minimax_docx_create_from_text']
+    : format === 'pdf'
+      ? ['pdf_create_from_text', 'txt_to_pdf', 'minimax_pdf_text_to_pdf']
+      : format === 'xlsx'
+        ? ['xlsx_create_from_text', 'txt_to_xlsx']
+        : ['pptx_create_from_text', 'txt_to_pptx'];
 
   return candidates.find(name => available.has(name)) || null;
 }
