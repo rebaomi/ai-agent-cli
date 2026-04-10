@@ -19,8 +19,17 @@ deepseek:
   enabled: false
   apiKey: sk-your-deepseek-api-key
   model: deepseek-chat
+  reasoningModel: deepseek-reasoner
   baseUrl: https://api.deepseek.com
   temperature: 0.7
+  maxTokens: 4096
+  autoReasoning:
+    enabled: false
+    simpleTaskMaxChars: 120
+    simpleConversationMaxChars: 8000
+    preferReasonerForToolMessages: true
+    preferReasonerForPlanning: true
+    preferReasonerForLongContext: true
 
 # Kimi（月之暗面）
 kimi:
@@ -88,6 +97,35 @@ maxToolCallsPerTurn: 10
 autoContinueOnToolLimit: true
 maxContinuationTurns: 3
 toolTimeout: 60000
+
+# ===========================================
+# 通知与飞书 Relay
+# ===========================================
+
+notifications:
+  lark:
+    morningNews:
+      chatId: oc_xxx
+      schedule: '0 8 * * *'
+      timezone: Asia/Shanghai
+      saveOutput: true
+    weather:
+      chatId: oc_xxx
+      city: 北京
+      timezone: Asia/Shanghai
+    relay:
+      enabled: false
+      autoSubscribe: true
+      eventTypes:
+        - im.message.receive_v1
+      compact: true
+      quiet: true
+      allowCommands: false
+      # allowedChatIds:
+      #   - oc_xxx
+      # allowedSenderIds:
+      #   - ou_xxx
+      # cliBin: lark-cli.cmd
 
 # 全局产物输出目录（docx/pdf/xlsx/txt/md 等相对输出默认落这里）
 # 支持使用“桌面”或“Desktop”别名，例如：artifactOutputDir: 桌面/coolAI

@@ -1,4 +1,5 @@
 import type { DirectActionResult } from '../direct-action-router.js';
+import type { MemoryWriteEntry } from '../memory-provider.js';
 
 export type ConvertibleFormat = 'md' | 'txt' | 'docx' | 'pdf' | 'xlsx' | 'pptx';
 type SourceFormat = ConvertibleFormat | 'csv' | 'tsv';
@@ -10,6 +11,10 @@ export interface LarkWorkflowRuntime {
 export interface ExternalSearchRuntime {
   executeBuiltInTool: (name: string, args: Record<string, unknown>, title: string) => Promise<DirectActionResult>;
   resolveOutputArtifactPath: (outputPath: string) => string;
+}
+
+export interface BrowserActionRuntime {
+  executeBuiltInTool: (name: string, args: Record<string, unknown>, title: string) => Promise<DirectActionResult>;
 }
 
 export interface FileActionRuntime {
@@ -41,4 +46,8 @@ export interface DocumentActionRuntime {
   isUnavailableDocxSkillResult: (format: ConvertibleFormat, output: string) => boolean;
   buildKnownGapResult: (input: string, detail: string, fallbacks: string[]) => Promise<DirectActionResult>;
   verifyDocumentExportResult: (result: DirectActionResult, outputPath: string, format: 'docx' | 'pdf' | 'xlsx' | 'pptx', expectedText?: string, expectedTitle?: string) => Promise<DirectActionResult>;
+}
+
+export interface MemoryActionRuntime {
+  storeMemory: (entry: MemoryWriteEntry) => Promise<void>;
 }

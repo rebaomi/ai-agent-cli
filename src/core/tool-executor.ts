@@ -5,6 +5,7 @@ import type { SkillManager, SkillContext } from './skills.js';
 import type { RegisteredTool } from './tool-registry.js';
 import { normalizeSkillExecutionError } from './skill-execution-error.js';
 import { executeSkillToolWithContext } from './skill-tool-execution.js';
+import { sanitizeForUtf8 } from '../utils/unicode.js';
 
 export interface ToolExecutionContext {
   name: string;
@@ -156,7 +157,7 @@ export class ToolExecutor {
 
       try {
         const toolName = name.slice(tool.serverName.length + 1);
-        const result = await this.mcpManager.callTool(tool.serverName, toolName, args);
+        const result = await this.mcpManager.callTool(tool.serverName, toolName, sanitizeForUtf8(args));
         return {
           tool_call_id: '',
           output: this.normalizeTextBlocks(result.content),

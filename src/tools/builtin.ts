@@ -698,6 +698,7 @@ export class BuiltInTools {
           },
           browser: { type: 'string', description: 'Browser target for automation: chrome, edge, or chromium. Default chrome' },
           headless: { type: 'boolean', description: 'Run browser headless by default; set false to show the browser window' },
+          keepOpen: { type: 'boolean', description: 'Keep the browser window open after automation completes' },
           timeoutMs: { type: 'number', description: 'Default timeout for actions in milliseconds' },
         },
         required: ['url'],
@@ -1457,14 +1458,15 @@ export class BuiltInTools {
         }
 
         case 'browser_automate': {
-          const { url, actions, headless, timeoutMs, browser } = args as {
+          const { url, actions, headless, keepOpen, timeoutMs, browser } = args as {
             url: string;
             actions?: BrowserAutomationAction[];
             browser?: BrowserTarget;
             headless?: boolean;
+            keepOpen?: boolean;
             timeoutMs?: number;
           };
-          result = await this.browserAutomate(url, actions ?? [], browser ?? 'chrome', headless ?? true, timeoutMs ?? 15000);
+          result = await this.browserAutomate(url, actions ?? [], browser ?? 'chrome', headless ?? true, keepOpen ?? false, timeoutMs ?? 15000);
           break;
         }
 
@@ -2220,12 +2222,13 @@ export class BuiltInTools {
     }
   }
 
-  private async browserAutomate(url: string, actions: BrowserAutomationAction[], browser: BrowserTarget, headless: boolean, timeoutMs: number): Promise<string> {
+  private async browserAutomate(url: string, actions: BrowserAutomationAction[], browser: BrowserTarget, headless: boolean, keepOpen: boolean, timeoutMs: number): Promise<string> {
     return runBrowserAutomation({
       url,
       actions,
       browser,
       headless,
+      keepOpen,
       timeoutMs,
       resolveOutputPath: (requestedPath?: string) => this.resolveOutputFilePath(requestedPath || path.join('browser', `screenshot-${Date.now()}.png`)),
     });

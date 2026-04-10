@@ -12,6 +12,7 @@ coolAI 支持多种大模型提供商：
 - **OpenAI** (GPT)
 - **Claude** (Anthropic)
 - **Gemini** (Google)
+- **Hybrid** (简单任务本地 + 复杂任务云端)
 
 ## 配置示例
 
@@ -121,6 +122,34 @@ llm:
       baseUrl: https://generativelanguage.googleapis.com/v1beta
       model: gemini-2.0-flash
       temperature: 0.7
+```
+
+### Hybrid 配置
+```yaml
+defaultProvider: hybrid
+
+appBaseDir: C:/Users/your-name/.ai-agent-cli
+artifactOutputDir: C:/Users/your-name/.ai-agent-cli/outputs
+workspace: D:/workspace/your-project
+
+hybrid:
+  enabled: true
+  localProvider: ollama
+  remoteProvider: deepseek
+  simpleTaskMaxChars: 80
+  simpleConversationMaxChars: 6000
+  preferRemoteForToolMessages: true
+
+ollama:
+  enabled: true
+  baseUrl: http://localhost:11434
+  model: qwen3.5:9b
+
+deepseek:
+  enabled: true
+  apiKey: your-deepseek-api-key
+  baseUrl: https://api.deepseek.com
+  model: deepseek-chat
 ```
 
 ## MCP 配置 (可选)

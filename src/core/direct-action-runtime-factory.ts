@@ -6,11 +6,13 @@ import type { PermissionManager } from './permission-manager.js';
 import type { DirectActionResult } from './direct-action-router.js';
 import { LarkDeliveryWorkflow, type DirectActionWorkflowRuntime } from './workflows/lark-delivery.js';
 import type { DirectActionHandler } from './direct-actions/request-handler.js';
-import type { DocumentActionRuntime, ExternalSearchRuntime, FileActionRuntime, LarkWorkflowRuntime } from './direct-actions/runtime-context.js';
+import type { BrowserActionRuntime, DocumentActionRuntime, ExternalSearchRuntime, FileActionRuntime, LarkWorkflowRuntime, MemoryActionRuntime } from './direct-actions/runtime-context.js';
 import { LarkWorkflowHandler } from './direct-actions/handlers/lark-workflow-handler.js';
+import { BrowserActionHandler } from './direct-actions/handlers/browser-action-handler.js';
 import { ExternalSearchHandler } from './direct-actions/handlers/external-search-handler.js';
 import { FileActionHandler } from './direct-actions/handlers/file-action-handler.js';
 import { DocumentActionHandler } from './direct-actions/handlers/document-action-handler.js';
+import { MemoryActionHandler } from './direct-actions/handlers/memory-action-handler.js';
 import { DirectActionArtifactSupport } from './direct-actions/artifact-support.js';
 import { DirectActionExportSupport } from './direct-actions/export-support.js';
 import { DirectActionKnownGapSupport } from './direct-actions/known-gap-support.js';
@@ -55,16 +57,20 @@ interface DirectActionSupportBundle {
 interface DirectActionHandlerRuntimeBundle {
   larkDeliveryWorkflow: LarkDeliveryWorkflow;
   larkWorkflowRuntime: LarkWorkflowRuntime;
+  browserActionRuntime: BrowserActionRuntime;
   externalSearchRuntime: ExternalSearchRuntime;
   fileActionRuntime: FileActionRuntime;
   documentActionRuntime: DocumentActionRuntime;
+  memoryActionRuntime: MemoryActionRuntime;
 }
 
 export function createDirectActionRuntimeComponents(options: DirectActionRuntimeFactoryOptions): DirectActionRuntimeComponents {
   const supportBundle = createDirectActionSupportBundle(options);
   const runtimeBundle = createDirectActionHandlerRuntimeBundle(options, supportBundle);
   const handlers: DirectActionHandler[] = [
+    new MemoryActionHandler(runtimeBundle.memoryActionRuntime),
     new LarkWorkflowHandler(runtimeBundle.larkWorkflowRuntime),
+    new BrowserActionHandler(runtimeBundle.browserActionRuntime),
     new ExternalSearchHandler(runtimeBundle.externalSearchRuntime),
     new FileActionHandler(runtimeBundle.fileActionRuntime),
     new DocumentActionHandler(runtimeBundle.documentActionRuntime),
@@ -125,6 +131,7 @@ function createDirectActionHandlerRuntimeBundle(
   return {
     larkDeliveryWorkflow: new LarkDeliveryWorkflow(workflowRuntime),
     larkWorkflowRuntime: createLarkWorkflowRuntime(options),
+    browserActionRuntime: createBrowserActionRuntime(sharedToolRuntime),
     externalSearchRuntime: createExternalSearchRuntime({
       executeBuiltInTool: sharedToolRuntime.executeBuiltInTool,
       artifactSupport: supportBundle.artifactSupport,
@@ -143,6 +150,7 @@ function createDirectActionHandlerRuntimeBundle(
       knownGapSupport: supportBundle.knownGapSupport,
       documentExportVerifier: supportBundle.documentExportVerifier,
     }),
+    memoryActionRuntime: createMemoryActionRuntime(options),
   };
 }
 
@@ -235,5 +243,19 @@ function createDocumentActionRuntime(input: {
     isUnavailableDocxSkillResult: (format, output) => isUnavailableDocxSkillResult(format, output),
     buildKnownGapResult: (sourceInput, detail, fallbacks) => input.knownGapSupport.buildKnownGapResult(sourceInput, detail, fallbacks),
     verifyDocumentExportResult: (result, outputPath, format, expectedText, expectedTitle) => input.documentExportVerifier.verifyDocumentExportResult(result, outputPath, format, expectedText, expectedTitle),
+  };
+}
+
+function createMemoryActionRuntime(options: DirectActionRuntimeFactoryOptions): MemoryActionRuntime {
+  return {
+    storeMemory: async (entry) => {
+      await options.memoryProvider?.store(entry);
+    },
+  };
+}
+
+function createBrowserActionRuntime(input: SharedToolExecutionRuntime): BrowserActionRuntime {
+  return {
+    executeBuiltInTool: input.executeBuiltInTool,
   };
 }

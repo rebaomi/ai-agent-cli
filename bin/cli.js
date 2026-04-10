@@ -3,7 +3,7 @@
 import { spawn } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -22,11 +22,20 @@ function showBanner() {
 function findScriptPath() {
   const distPath = join(__dirname, '..', 'dist', 'cli', 'index.js');
   const srcPath = join(__dirname, '..', 'src', 'cli', 'index.ts');
-  
+
+  if (existsSync(distPath) && existsSync(srcPath)) {
+    const distStat = statSync(distPath);
+    const srcStat = statSync(srcPath);
+    if (srcStat.mtimeMs > distStat.mtimeMs) {
+      return { path: srcPath, isTs: true };
+    }
+    return { path: distPath, isTs: false };
+  }
+
   if (existsSync(distPath)) {
     return { path: distPath, isTs: false };
   }
-  
+
   if (existsSync(srcPath)) {
     return { path: srcPath, isTs: true };
   }
@@ -85,7 +94,8 @@ Usage:
 Commands in CLI:
   /?          Show this help
   /help       Show all commands
-  /quit       Exit
+  /q          Exit current shell, keep background daemon running
+  /exit       Stop background daemon and exit completely
   /tools      List available tools
   /model      Show/change model
   /config     Show configuration

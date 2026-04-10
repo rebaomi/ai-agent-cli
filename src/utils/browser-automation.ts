@@ -21,6 +21,7 @@ export interface BrowserAutomationOptions {
   actions?: BrowserAutomationAction[];
   browser?: BrowserTarget;
   headless?: boolean;
+  keepOpen?: boolean;
   timeoutMs?: number;
   resolveOutputPath: (requestedPath?: string) => string;
 }
@@ -252,9 +253,12 @@ export async function runBrowserAutomation(options: BrowserAutomationOptions): P
       browser: browserTarget,
       url: page.url(),
       title: await page.title(),
+      keptOpen: options.keepOpen === true,
       actions: actionLogs,
     }, null, 2);
   } finally {
-    await browser.close();
+    if (options.keepOpen !== true) {
+      await browser.close();
+    }
   }
 }

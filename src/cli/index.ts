@@ -10,7 +10,7 @@ import { createEnhancedMemoryManager, EnhancedMemoryManager } from '../core/memo
 import { createSkillManager } from '../core/skills.js';
 import { OllamaClient } from '../ollama/client.js';
 import { LLMFactory } from '../llm/factory.js';
-import type { LLMProviderInterface } from '../llm/types.js';
+import type { LLMProvider, LLMProviderInterface } from '../llm/types.js';
 import { HybridClient } from '../llm/providers/hybrid.js';
 import { DeepSeekRouterClient } from '../llm/providers/deepseek-router.js';
 import { MCPManager } from '../mcp/client.js';
@@ -35,10 +35,20 @@ import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
 import { LarkRelayAgent, type LarkRelayMessage, type LarkRelayStatus } from '../lark/relay-agent.js';
+import type { LarkRelayConfig } from '../types/index.js';
+import { BackgroundDaemonManager, type BackgroundDaemonStatus } from '../core/background-daemon.js';
 import { APP_VERSION, buildCliLogo, getFullHelpText, getQuickHelpText, isFullHelpShortcut, isQuickHelpShortcut } from './cli-shell-text.js';
+import { TerminalConfigEditor } from './config-editor.js';
+import { SplitScreenRenderer } from './split-screen.js';
+import { runBackgroundDaemonService } from './daemon-service.js';
 import * as readline from 'readline';
 
 const logo = buildCliLogo();
+
+interface CLIOptions {
+  ensureBackgroundDaemon?: boolean;
+  runLocalCronScheduler?: boolean;
+}
 
 export class CLI {
   private static readonly SLASH_COMMANDS = [
@@ -47,8 +57,8 @@ export class CLI {
     '/config', '/c', '/model', '/m', '/workspace', '/w',
     '/reset', '/r', '/new', '/sessions', '/load', '/mcp',
     '/lsp', '/skill', '/skills', '/org', '/team', '/cat',
-    '/progress', '/p', '/memory', '/templates', '/profile', '/news', '/relay', '/browser',
-    '/wipe', '/perm', '/permission', '/cron',
+    '/progress', '/p', '/memory', '/templates', '/profile', '/news', '/relay', '/browser', '/mode', '/split',
+    '/wipe', '/perm', '/permission', '/cron', '/daemon',
   ];
 
   private agent?: Agent;
@@ -87,8 +97,17 @@ export class CLI {
   private newsOutputDir: string;
   private larkRelay?: LarkRelayAgent;
   private inputQueue: Promise<void> = Promise.resolve();
+  private readonly options: Required<CLIOptions>;
+  private backgroundDaemon?: BackgroundDaemonManager;
+  private stopBackgroundDaemonOnExit = false;
+  private currentInputMode: 'cli' | 'feishu' = 'cli';
+  private splitScreen?: SplitScreenRenderer;
 
-  constructor() {
+  constructor(options: CLIOptions = {}) {
+    this.options = {
+      ensureBackgroundDaemon: options.ensureBackgroundDaemon ?? false,
+      runLocalCronScheduler: options.runLocalCronScheduler ?? false,
+    };
     this.mcpManager = new MCPManager();
     this.lspManager = new LSPManager();
     this.skillManager = createSkillManager();
@@ -96,6 +115,7 @@ export class CLI {
     this.appBaseDir = configManager.get('appBaseDir') || path.join(os.homedir(), '.ai-agent-cli');
     this.inputHistoryPath = path.join(this.appBaseDir, 'input-history.json');
     this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
+    this.backgroundDaemon = new BackgroundDaemonManager(this.appBaseDir);
   }
 
   async initialize(): Promise<void> {
@@ -142,6 +162,10 @@ export class CLI {
     this.cronManager = createCronManager();
     await this.cronManager.initialize();
     printSuccess('Cron manager ready');
+
+    if (this.options.ensureBackgroundDaemon && !this.options.runLocalCronScheduler) {
+      await this.ensureBackgroundCronDaemon(true);
+    }
 
     this.currentProvider = config.defaultProvider || 'ollama';
     
@@ -221,21 +245,7 @@ export class CLI {
       config: config as unknown as Record<string, unknown>,
     });
     printSuccess(this.builtInTools.getTools().length + ' built-in tools');
-
-    this.cronManager.setExecutor((toolName, args, job) => this.builtInTools!.executeToolForCronJob(toolName, args, job.name));
-    this.cronManager.setNotifier(async ({ job, result }) => {
-      const content = this.getToolResultDisplayText(result) || '(无输出)';
-      console.log();
-      console.log(chalk.magenta(`[Cron] ${job.name}`));
-      if (result.is_error) {
-        printError(content);
-      } else {
-        console.log(chalk.gray(`schedule: ${job.schedule} -> ${job.toolName}`));
-        console.log(content);
-      }
-      console.log();
-    });
-    this.cronManager.start();
+    this.configureCronRuntime();
 
     if (config.mcp && config.mcp.length > 0) {
       console.log(chalk.gray('Connecting to MCP servers...'));
@@ -323,29 +333,19 @@ export class CLI {
 
     this.permissionMgr.onPermissionRequest(async (request) => {
       console.log(this.permissionMgr!.showPermissionRequest(request));
-      
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-      });
-      
-      return new Promise((resolve) => {
-        rl.question(chalk.blue('> '), (answer) => {
-          rl.close();
-          
-          const result = this.permissionMgr!.parsePermissionAnswer(answer);
-          
-          if (result.granted) {
-            if (result.permanent) {
-              this.permissionMgr!.grantPermission(request.type, request.resource);
-            } else if (result.expiresInMs) {
-              this.permissionMgr!.grantPermission(request.type, request.resource, result.expiresInMs);
-            }
-          }
-          
-          resolve(result.granted);
-        });
-      });
+
+      const answer = await this.promptInline('> ');
+      const result = this.permissionMgr!.parsePermissionAnswer(answer);
+
+      if (result.granted) {
+        if (result.permanent) {
+          this.permissionMgr!.grantPermission(request.type, request.resource);
+        } else if (result.expiresInMs) {
+          this.permissionMgr!.grantPermission(request.type, request.resource, result.expiresInMs);
+        }
+      }
+
+      return result.granted;
     });
   }
 
@@ -366,6 +366,16 @@ export class CLI {
   }
 
   private prompt(): Promise<string> {
+    if (this.splitScreen?.isActive()) {
+      return this.splitScreen.prompt('> ').then((answer) => {
+        const trimmed = answer.trim();
+        if (trimmed.length > 0) {
+          this.recordHistory(trimmed);
+        }
+        return trimmed;
+      });
+    }
+
     return new Promise((resolve) => {
       const rl = readline.createInterface({
         input: process.stdin,
@@ -415,8 +425,10 @@ export class CLI {
 
     const providers = ['ollama', 'deepseek', 'kimi', 'glm', 'doubao', 'minimax', 'openai', 'claude', 'gemini', 'hybrid'];
     const staticCandidates: Record<string, string[]> = {
-      '/config': ['/config', '/config update', '/config reload'],
-      '/c': ['/c', '/c update', '/c reload'],
+      '/config': ['/config', '/config edit', '/config update', '/config reload'],
+      '/c': ['/c', '/c edit', '/c update', '/c reload'],
+      '/mode': ['/mode', '/mode status', '/mode switch cli', '/mode switch feishu'],
+      '/split': ['/split', '/split on', '/split off', '/split of', '/split status'],
       '/relay': ['/relay status', '/relay start', '/relay stop', '/relay reconnect'],
       '/model': ['/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
       '/m': ['/m', '/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
@@ -440,6 +452,7 @@ export class CLI {
       ],
       '/browser': ['/browser open https://example.com', '/browser run https://example.com', '/browser run https://example.com @actions.json --headed', '/browser run https://example.com @actions.json --browser edge', '/browser help'],
       '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron create-news-lark', '/cron create-weather-lark', '/cron create-morning-feishu', '/cron create-morning-feishu-group', '/cron start', '/cron stop', '/cron run', '/cron delete', '/cron run-due'],
+      '/daemon': ['/daemon status', '/daemon start', '/daemon stop', '/daemon restart'],
       '/news': ['/news hot', '/news search', '/news morning', '/news evening', '/news save hot', '/news save search', '/news save morning', '/news save evening', '/news push morning --chat-id oc_xxx', '/news push hot --chat-id oc_xxx --limit 5', '/news output-dir', '/news help'],
       '/load': ['/load'],
       '/workspace': ['/workspace'],
@@ -508,10 +521,20 @@ export class CLI {
         console.log();
         printInfo(`[Lark Relay] 收到手机端消息${sourceParts ? ` (${sourceParts})` : ''}`);
         console.log(chalk.gray(trimmed));
+
+        if (this.currentInputMode !== 'feishu') {
+          printInfo('[Mode] 当前为 cli 模式，已忽略这条飞书消息。');
+          return;
+        }
       }
 
       if (allowCommands && trimmed.startsWith('/')) {
         await this.handleCommand(trimmed);
+        return;
+      }
+
+      if (source === 'cli' && this.currentInputMode === 'feishu') {
+        printInfo('当前为 feishu 模式，命令行仅接收 / 命令。输入 /mode switch cli 可切回命令行交互。');
         return;
       }
 
@@ -522,6 +545,13 @@ export class CLI {
 
       const confirmationStatus = this.agent?.getConfirmationStatus();
       if (confirmationStatus?.pending) {
+        if (this.agent?.shouldTreatPendingInputAsNewRequest(trimmed)) {
+          this.agent.clearPendingInteraction();
+          printInfo('检测到这是一个新的独立请求，已跳过上一条待补充状态。');
+          await this.handleMessage(trimmed);
+          return;
+        }
+
         const normalizedInput = trimmed.toLowerCase();
         const isConfirmed = normalizedInput === '是' || normalizedInput === 'yes' || normalizedInput === 'y';
         const isRejected = normalizedInput === '否' || normalizedInput === 'no' || normalizedInput === 'n';
@@ -557,12 +587,18 @@ export class CLI {
     await task;
   }
 
-  private async restartLarkRelay(config: ReturnType<typeof configManager.getAgentConfig>): Promise<void> {
+  private async restartLarkRelay(config: ReturnType<typeof configManager.getAgentConfig>, forceStart = false): Promise<boolean> {
     await this.stopLarkRelay();
 
-    const relayConfig = config.notifications?.lark?.relay;
+    if (!forceStart && this.currentInputMode !== 'feishu') {
+      return false;
+    }
+
+    const relayConfig = forceStart
+      ? this.buildModeRelayConfig(config)
+      : config.notifications?.lark?.relay;
     if (!relayConfig?.enabled || relayConfig.autoSubscribe === false) {
-      return;
+      return false;
     }
 
     this.larkRelay = new LarkRelayAgent(relayConfig);
@@ -593,6 +629,7 @@ export class CLI {
       if (!this.larkRelay.isRunning()) {
         throw new Error('Lark relay exited shortly after startup');
       }
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (/another event \+subscribe instance is already running/i.test(message)) {
@@ -603,6 +640,7 @@ export class CLI {
         printWarning(`[Lark Relay] subscribe failed: ${message}`);
       }
       await this.stopLarkRelay();
+      return false;
     }
   }
 
@@ -615,6 +653,139 @@ export class CLI {
     this.larkRelay = undefined;
     relay.removeAllListeners();
     await relay.stop();
+  }
+
+  private async handleModeCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase() || 'status';
+
+    switch (subcommand) {
+      case 'status':
+        await this.showInputModeStatus();
+        break;
+      case 'switch': {
+        const target = args[1]?.toLowerCase();
+        if (target !== 'cli' && target !== 'feishu') {
+          printInfo('用法: /mode status | /mode switch <cli|feishu>');
+          return;
+        }
+        await this.switchInputMode(target);
+        break;
+      }
+      default:
+        printInfo('用法: /mode status | /mode switch <cli|feishu>');
+        break;
+    }
+  }
+
+  private async handleSplitCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase() || 'status';
+
+    switch (subcommand) {
+      case 'status':
+        printInfo(`当前 split 状态: ${this.splitScreen?.isActive() ? 'on' : 'off'}`);
+        break;
+      case 'on':
+        this.enableSplitMode();
+        break;
+      case 'off':
+      case 'of':
+        this.disableSplitMode();
+        break;
+      default:
+        printInfo('用法: /split status | /split on | /split off');
+        break;
+    }
+  }
+
+  private enableSplitMode(): void {
+    if (this.splitScreen?.isActive()) {
+      printInfo('split 已开启。');
+      return;
+    }
+
+    const renderer = new SplitScreenRenderer();
+    renderer.open();
+    this.splitScreen = renderer;
+    console.log(chalk.cyan(logo));
+    printSuccess('Split view enabled: 左侧显示输入与结果，右侧显示 Agent 处理过程。');
+  }
+
+  private disableSplitMode(): void {
+    if (!this.splitScreen?.isActive()) {
+      printInfo('split 当前未开启。');
+      return;
+    }
+
+    this.splitScreen.close();
+    this.splitScreen = undefined;
+    console.clear();
+    console.log(chalk.cyan(logo));
+    printSuccess('Split view disabled');
+  }
+
+  private writeProcessLog(message: string): void {
+    if (this.splitScreen?.isActive()) {
+      this.splitScreen.appendRight(message);
+      return;
+    }
+
+    console.log(message);
+  }
+
+  private async showInputModeStatus(): Promise<void> {
+    console.log(chalk.bold('\nInput Mode\n'));
+    console.log(`Current: ${this.currentInputMode}`);
+    console.log(`CLI Input: ${this.currentInputMode === 'cli' ? 'enabled' : 'commands only'}`);
+    console.log(`Feishu Input: ${this.currentInputMode === 'feishu' ? 'enabled' : 'disabled'}`);
+
+    const relayStatus = await this.getRelayStatusAgent().getStatus();
+    console.log(`Relay Running: ${relayStatus.running ? 'yes' : 'no'}`);
+    if (relayStatus.externalOccupancy) {
+      printWarning('[Mode] 检测到外部 event +subscribe 实例占用当前飞书长连接。');
+    }
+    console.log();
+  }
+
+  private async switchInputMode(target: 'cli' | 'feishu'): Promise<void> {
+    if (target === this.currentInputMode) {
+      printInfo(`当前已经是 ${target} 模式。`);
+      return;
+    }
+
+    if (target === 'cli') {
+      await this.stopLarkRelay();
+      this.currentInputMode = 'cli';
+      printSuccess('已切换到 cli 模式：命令行恢复接收普通需求，飞书输入已断开。');
+      return;
+    }
+
+    const previousMode = this.currentInputMode;
+    this.currentInputMode = 'feishu';
+
+    const config = configManager.getAgentConfig();
+    const started = await this.restartLarkRelay(config, true);
+    if (!started) {
+      this.currentInputMode = previousMode;
+      printWarning('切换到 feishu 模式失败：当前未成功接管飞书订阅，仍保持 cli 模式。');
+      return;
+    }
+
+    printSuccess('已切换到 feishu 模式：Agent 现在接收手机端飞书消息，命令行仅接收 / 命令。');
+  }
+
+  private buildModeRelayConfig(config: ReturnType<typeof configManager.getAgentConfig>): LarkRelayConfig {
+    const relayConfig = config.notifications?.lark?.relay;
+    return {
+      ...relayConfig,
+      enabled: true,
+      autoSubscribe: relayConfig?.autoSubscribe ?? true,
+      eventTypes: relayConfig?.eventTypes && relayConfig.eventTypes.length > 0
+        ? relayConfig.eventTypes
+        : ['im.message.receive_v1'],
+      compact: relayConfig?.compact ?? true,
+      quiet: relayConfig?.quiet ?? true,
+      allowCommands: relayConfig?.allowCommands ?? false,
+    };
   }
 
   private async handleRelayCommand(args: string[]): Promise<void> {
@@ -676,8 +847,13 @@ export class CLI {
   }
 
   private async reconnectLarkRelay(): Promise<void> {
+    if (this.currentInputMode !== 'feishu') {
+      printInfo('[Lark Relay] 当前为 cli 模式。若要让 Agent 接管飞书输入，请使用 /mode switch feishu。');
+      return;
+    }
+
     const config = configManager.getAgentConfig();
-    const relayConfig = config.notifications?.lark?.relay;
+    const relayConfig = this.buildModeRelayConfig(config);
 
     if (!relayConfig?.enabled) {
       printWarning('[Lark Relay] 当前配置未启用 relay。');
@@ -717,8 +893,13 @@ export class CLI {
   }
 
   private async startLarkRelayFromCommand(): Promise<void> {
+    if (this.currentInputMode !== 'feishu') {
+      printInfo('[Lark Relay] 当前为 cli 模式。若要让 Agent 接管飞书输入，请使用 /mode switch feishu。');
+      return;
+    }
+
     const config = configManager.getAgentConfig();
-    const relayConfig = config.notifications?.lark?.relay;
+    const relayConfig = this.buildModeRelayConfig(config);
 
     if (!relayConfig?.enabled) {
       printWarning('[Lark Relay] 当前配置未启用 relay。');
@@ -809,6 +990,10 @@ export class CLI {
   }
 
   private promptInline(question: string): Promise<string> {
+    if (this.splitScreen?.isActive()) {
+      return this.splitScreen.prompt(question);
+    }
+
     return new Promise((resolve) => {
       const rl = readline.createInterface({
         input: process.stdin,
@@ -859,9 +1044,17 @@ export class CLI {
       case 'c':
         if (args[0] === 'update' || args[0] === 'reload') {
           await this.reloadRuntimeConfig();
+        } else if (args[0] === 'edit') {
+          await this.editConfigFile();
         } else {
           this.showConfig();
         }
+        break;
+      case 'mode':
+        await this.handleModeCommand(args);
+        break;
+      case 'split':
+        await this.handleSplitCommand(args);
         break;
       case 'relay':
         await this.handleRelayCommand(args);
@@ -940,6 +1133,9 @@ export class CLI {
       case 'cron':
         await this.handleCronCommand(args);
         break;
+      case 'daemon':
+        await this.handleDaemonCommand(args);
+        break;
       case 'browser':
         await this.handleBrowserCommand(args);
         break;
@@ -979,6 +1175,8 @@ export class CLI {
         await this.memoryProvider?.syncSession(this.agent.getMessages());
       }
 
+      await this.archiveDirectActionResult(input, directResult);
+
       console.log();
       if (directResult.title) {
         console.log(chalk.cyan(directResult.title));
@@ -1014,23 +1212,23 @@ export class CLI {
     this.agent.setEventHandler((event: AgentEvent) => {
       switch (event.type) {
         case 'thinking':
-          process.stdout.write(chalk.gray('Thinking... '));
+          this.writeProcessLog('Thinking...');
           break;
         case 'tool_call':
-          console.log(chalk.cyan('\n🔧 ' + event.content));
+          this.writeProcessLog(`🔧 ${event.content}`);
           break;
         case 'tool_result':
-          console.log(chalk.cyan('\n[工具结果]'));
+          this.writeProcessLog('[工具结果]');
           if (event.toolResult?.is_error) {
-            printError(this.getToolResultDisplayText(event.toolResult) || 'Tool execution failed');
+            this.writeProcessLog(`✗ ${this.getToolResultDisplayText(event.toolResult) || 'Tool execution failed'}`);
           } else {
             const output = this.getToolResultDisplayText(event.toolResult);
             if (output.length > 0) {
-              console.log(chalk.green('--- 工具输出 START ---'));
-              console.log(output);
-              console.log(chalk.green('--- 工具输出 END ---'));
+              this.writeProcessLog('--- 工具输出 START ---');
+              this.writeProcessLog(output);
+              this.writeProcessLog('--- 工具输出 END ---');
             } else {
-              console.log(chalk.gray('(无输出)'));
+              this.writeProcessLog('(无输出)');
             }
           }
           break;
@@ -1045,23 +1243,23 @@ export class CLI {
           break;
         case 'memory_sync':
           if (event.memorySync?.status === 'archived') {
-            console.log(chalk.gray(`\n[MemPalace] ${event.content}`));
+            this.writeProcessLog(`[MemPalace] ${event.content}`);
           } else if (event.memorySync?.status === 'failed') {
-            printWarning(`[MemPalace] ${event.content}`);
+            this.writeProcessLog(`⚠ [MemPalace] ${event.content}`);
           }
           break;
         case 'skill_learning':
-          printInfo(`${event.content}。可用 /skill candidates 查看，/skill adopt ${event.skillLearning?.candidateName || '<name>'} 转正启用。`);
+          this.writeProcessLog(`${event.content}。可用 /skill candidates 查看，/skill adopt ${event.skillLearning?.candidateName || '<name>'} 转正启用。`);
           if (event.skillLearning?.candidatePath) {
-            console.log(chalk.gray(`候选草稿: ${event.skillLearning.candidatePath}`));
+            this.writeProcessLog(`候选草稿: ${event.skillLearning.candidatePath}`);
           }
           break;
         case 'skill_learning_todo':
-          printInfo(`${event.content}。可用 /skill todos 查看待学习清单。`);
+          this.writeProcessLog(`${event.content}。可用 /skill todos 查看待学习清单。`);
           break;
         case 'error':
           this.failTrackedTask(event.content);
-          printError(event.content);
+          this.writeProcessLog(`✗ ${event.content}`);
           break;
       }
     });
@@ -1106,6 +1304,11 @@ export class CLI {
   }
 
   private async streamResponse(text: string): Promise<void> {
+    if (this.splitScreen?.isActive()) {
+      this.splitScreen.appendLeft(text);
+      return;
+    }
+
     const output = createStreamingOutput({ color: 'cyan', speed: 5 });
     await output.stream(text);
   }
@@ -1131,7 +1334,11 @@ export class CLI {
         parts.push(`fallback=${route.fallbackReason}`);
       }
 
-      printInfo(`[Hybrid] ${parts.join(' | ')}`);
+      if (this.splitScreen?.isActive()) {
+        this.writeProcessLog(`[Hybrid] ${parts.join(' | ')}`);
+      } else {
+        printInfo(`[Hybrid] ${parts.join(' | ')}`);
+      }
       return;
     }
 
@@ -1141,7 +1348,11 @@ export class CLI {
         return;
       }
 
-      printInfo(`[DeepSeek] target=${route.target} | model=${route.model} | reason=${this.describeDeepSeekRouteReason(route.reason)}`);
+      if (this.splitScreen?.isActive()) {
+        this.writeProcessLog(`[DeepSeek] target=${route.target} | model=${route.model} | reason=${this.describeDeepSeekRouteReason(route.reason)}`);
+      } else {
+        printInfo(`[DeepSeek] target=${route.target} | model=${route.model} | reason=${this.describeDeepSeekRouteReason(route.reason)}`);
+      }
     }
   }
 
@@ -1322,6 +1533,78 @@ export class CLI {
     this.appBaseDir = config.appBaseDir || path.join(os.homedir(), '.ai-agent-cli');
     this.inputHistoryPath = path.join(this.appBaseDir, 'input-history.json');
     this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
+    this.backgroundDaemon = new BackgroundDaemonManager(this.appBaseDir);
+  }
+
+  private configureCronRuntime(): void {
+    if (!this.cronManager) {
+      return;
+    }
+
+    this.cronManager.setExecutor((toolName, args, job) => this.builtInTools!.executeToolForCronJob(toolName, args, job.name));
+    this.cronManager.setNotifier(async ({ job, result }) => {
+      const content = this.getToolResultDisplayText(result) || '(无输出)';
+      console.log();
+      console.log(chalk.magenta(`[Cron] ${job.name}`));
+      if (result.is_error) {
+        printError(content);
+      } else {
+        console.log(chalk.gray(`schedule: ${job.schedule} -> ${job.toolName}`));
+        console.log(content);
+      }
+      console.log();
+    });
+
+    if (this.options.runLocalCronScheduler) {
+      this.cronManager.start();
+    }
+  }
+
+  private async ensureBackgroundCronDaemon(silent = false): Promise<BackgroundDaemonStatus | null> {
+    if (this.options.runLocalCronScheduler || !this.backgroundDaemon) {
+      return null;
+    }
+
+    const status = await this.backgroundDaemon.ensureRunning({
+      configPath: configManager.getConfigPath(),
+      workspace: this.workspace,
+    });
+
+    if (!silent) {
+      printSuccess(`Background daemon ready${status.pid > 0 ? ` (pid=${status.pid})` : ''}`);
+    }
+
+    return status;
+  }
+
+  private async getCronSchedulerStatus(): Promise<{ running: boolean; mode: 'local' | 'daemon'; pid?: number }> {
+    if (this.options.runLocalCronScheduler) {
+      return {
+        running: this.cronManager?.isRunning() ?? false,
+        mode: 'local',
+      };
+    }
+
+    const status = await this.backgroundDaemon?.getStatus();
+    const schedulerRunning = status?.cronSchedulerRunning ?? status?.running ?? false;
+    return {
+      running: schedulerRunning,
+      mode: 'daemon',
+      pid: schedulerRunning ? status?.pid : undefined,
+    };
+  }
+
+  async stopBackgroundDaemonIfRequested(): Promise<void> {
+    if (!this.stopBackgroundDaemonOnExit) {
+      return;
+    }
+
+    const stopped = await this.backgroundDaemon?.stop();
+    if (stopped) {
+      printSuccess('Background daemon stopped');
+    } else {
+      printInfo('Background daemon was not running');
+    }
   }
 
   private async parseBrowserActions(rawInput?: string): Promise<Record<string, unknown>[]> {
@@ -1498,12 +1781,16 @@ export class CLI {
         break;
       case 'walk':
         this.agentCat.acknowledge('walk');
-        break;
       case 'meal':
         this.agentCat.acknowledge('meal');
-        break;
+        console.log(chalk.gray('CLI 已退出，后台 daemon 保持运行。'));
       case 'interact':
         console.log(chalk.cyan(this.agentCat.interact()));
+      case 'exit':
+        console.log(chalk.gray('正在永久退出，后台 daemon 将一并停止。'));
+        this.stopBackgroundDaemonOnExit = true;
+        this.running = false;
+        break;
         break;
       case 'stop':
         this.agentCat.stop();
@@ -1616,6 +1903,26 @@ export class CLI {
       console.log(chalk.cyan('\n知识库:'));
       memory.knowledgeBase.forEach(k => console.log(`  • ${k}`));
     }
+
+    const projectEntries = Object.entries(memory.projectContext);
+    if (projectEntries.length > 0) {
+      console.log(chalk.cyan('\n项目上下文:'));
+      for (const [key, value] of projectEntries.slice(-10)) {
+        const rendered = typeof value === 'string' ? value : JSON.stringify(value);
+        console.log(`  ${key}: ${rendered}`);
+      }
+    }
+
+    if (memory.taskHistory.length > 0) {
+      console.log(chalk.cyan('\n最近任务:'));
+      for (const task of memory.taskHistory.slice(-10).reverse()) {
+        const detail = task.result || task.error || task.currentStep || '';
+        console.log(`  • ${task.description} ${chalk.gray(`[${task.status}]`)}`);
+        if (detail) {
+          console.log(chalk.gray(`    ${detail}`));
+        }
+      }
+    }
     
     if (Object.keys(memory.organizationMemory).length > 0) {
       console.log(chalk.cyan('\n组织记忆:'));
@@ -1632,6 +1939,52 @@ export class CLI {
     console.log(`  记忆条目: ${palace.totalMemoryCount}`);
     
     console.log();
+  }
+
+  private async archiveDirectActionResult(input: string, directResult: { title?: string; output?: string; isError?: boolean }): Promise<void> {
+    if (!this.memoryProvider || !this.shouldPersistDirectAction(input, directResult.title)) {
+      return;
+    }
+
+    const normalizedInput = input.trim();
+    const normalizedOutput = (directResult.output || '').trim();
+    const status = directResult.isError ? 'failed' : 'completed';
+    const summary = [
+      `direct-action: ${directResult.title || 'direct action'}`,
+      `request: ${normalizedInput}`,
+      normalizedOutput ? `${directResult.isError ? 'error' : 'result'}: ${this.summarizeForLongTermMemory(normalizedOutput, 600)}` : undefined,
+    ].filter(Boolean).join('\n');
+
+    await this.memoryProvider.store({
+      kind: 'task',
+      title: normalizedInput,
+      content: summary,
+      metadata: {
+        source: 'direct_action',
+        status,
+        result: directResult.isError ? undefined : this.summarizeForLongTermMemory(normalizedOutput, 600),
+        error: directResult.isError ? this.summarizeForLongTermMemory(normalizedOutput, 600) : undefined,
+        currentStep: directResult.title || 'direct action',
+      },
+    });
+  }
+
+  private shouldPersistDirectAction(input: string, title?: string): boolean {
+    const normalized = `${title || ''}\n${input}`.toLowerCase();
+    if (!normalized.trim()) {
+      return false;
+    }
+
+    return !/(read_file|read_multiple_files|list_directory|search_files|glob|查看文件|读取文件|打开文件|列出目录|列出文件|搜索|查找|grep|find|source read)/i.test(normalized);
+  }
+
+  private summarizeForLongTermMemory(value: string, maxLength: number): string {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maxLength) {
+      return normalized;
+    }
+
+    return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
   }
 
   private handleMemoryPalaceCommand(args: string[]): void {
@@ -2691,8 +3044,9 @@ ${chalk.gray('/news push morning --save')}
       case undefined:
       case 'list': {
         const jobs = this.cronManager.listJobs();
+        const schedulerStatus = await this.getCronSchedulerStatus();
         console.log(chalk.bold('\nCron Jobs:\n'));
-        console.log(chalk.gray(`scheduler: ${this.cronManager.isRunning() ? 'running' : 'stopped'}`));
+        console.log(chalk.gray(`scheduler: ${schedulerStatus.running ? 'running' : 'stopped'}${schedulerStatus.mode === 'daemon' ? ` (background${schedulerStatus.pid ? ` pid=${schedulerStatus.pid}` : ''})` : ' (local)'}`));
         console.log();
         if (jobs.length === 0) {
           console.log(chalk.gray('No cron jobs found.'));
@@ -2717,11 +3071,20 @@ ${chalk.gray('/news push morning --save')}
       }
       case 'start': {
         const idOrName = args[1];
+        if (!idOrName && !this.options.runLocalCronScheduler) {
+          const status = await this.ensureBackgroundCronDaemon();
+          printSuccess(`Background cron daemon started${status?.pid ? ` (pid=${status.pid})` : ''}`);
+          break;
+        }
+
         const result = await this.builtInTools.executeTool('cron_start', idOrName ? { idOrName } : {});
         if (result.is_error) {
           printError(this.getToolResultDisplayText(result) || 'Failed to start cron');
         } else if (idOrName) {
           printSuccess(`Cron job enabled: ${idOrName}`);
+          if (!this.options.runLocalCronScheduler) {
+            await this.ensureBackgroundCronDaemon(true);
+          }
         } else {
           printSuccess('Cron scheduler started');
         }
@@ -2729,6 +3092,16 @@ ${chalk.gray('/news push morning --save')}
       }
       case 'stop': {
         const idOrName = args[1];
+        if (!idOrName && !this.options.runLocalCronScheduler) {
+          const stopped = await this.backgroundDaemon?.stop();
+          if (stopped) {
+            printSuccess('Background cron daemon stopped');
+          } else {
+            printInfo('Background cron daemon was not running');
+          }
+          break;
+        }
+
         const result = await this.builtInTools.executeTool('cron_stop', idOrName ? { idOrName } : {});
         if (result.is_error) {
           printError(this.getToolResultDisplayText(result) || 'Failed to stop cron');
@@ -2788,6 +3161,9 @@ ${chalk.gray('/news push morning --save')}
         } else {
           printSuccess(`Cron job created: ${name}`);
           console.log(this.getToolResultDisplayText(result));
+          if (!this.options.runLocalCronScheduler) {
+            await this.ensureBackgroundCronDaemon(true);
+          }
         }
         break;
       }
@@ -2933,8 +3309,8 @@ ${chalk.cyan('/cron create-news-lark')} <name> <type> <schedule> [flags]
 ${chalk.cyan('/cron create-weather-lark')} <name> <schedule> [flags]
 ${chalk.cyan('/cron create-morning-feishu')}                已废弃，请改用 group 版本
 ${chalk.cyan('/cron create-morning-feishu-group')} [oc_xxx]
-${chalk.cyan('/cron start')} [idOrName]       启动调度器或启用指定任务
-${chalk.cyan('/cron stop')} [idOrName]        停止调度器或停用指定任务
+${chalk.cyan('/cron start')} [idOrName]       启动后台调度器或启用指定任务
+${chalk.cyan('/cron stop')} [idOrName]        停止后台调度器或停用指定任务
 ${chalk.cyan('/cron run')} <idOrName>         立即强制执行指定任务一次
 ${chalk.cyan('/cron delete')} <idOrName>      删除 cron 任务
 ${chalk.cyan('/cron run-due')}                立即检查当前到期任务
@@ -2946,6 +3322,93 @@ ${chalk.gray('/cron create-news-lark morning-feishu morning 0 8 * * * --save')}
 ${chalk.gray('/cron create-weather-lark daily-weather 0 9 * * * --city 北京')}
 ${chalk.gray('/cron create-morning-feishu-group oc_xxx')}
 ${chalk.gray('/cron create-morning-feishu-group')}
+`);
+    }
+  }
+
+  private async handleDaemonCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase() || 'status';
+
+    if (this.options.runLocalCronScheduler) {
+      if (subcommand === 'status' || subcommand === 'help') {
+        console.log(chalk.bold('\nBackground Daemon:\n'));
+        console.log(chalk.gray('当前 CLI 运行在本地 cron 模式，未使用后台 daemon。'));
+        console.log(chalk.gray('可用 /cron list 查看当前调度器状态。'));
+        console.log();
+        return;
+      }
+
+      printInfo('当前启用了本地 cron 调度模式，/daemon start|stop|restart 不适用。');
+      return;
+    }
+
+    switch (subcommand) {
+      case 'status': {
+        const status = await this.backgroundDaemon?.getStatus();
+        if (!status) {
+          printError('Background daemon manager not initialized');
+          return;
+        }
+
+        console.log(chalk.bold('\nBackground Daemon:\n'));
+        console.log(`  Running: ${status.running ? chalk.green('yes') : chalk.yellow('no')}`);
+        console.log(`  PID: ${status.running ? status.pid : '(none)'}`);
+        console.log(`  Started: ${status.startedAt ? new Date(status.startedAt).toLocaleString() : '(unknown)'}`);
+        const schedulerKnown = typeof status.cronSchedulerRunning === 'boolean';
+        const schedulerRunning = status.cronSchedulerRunning ?? status.running;
+        console.log(`  Scheduler: ${schedulerRunning ? chalk.green('running') : chalk.yellow('stopped')}${schedulerKnown ? '' : chalk.gray(' (legacy state, inferred)')}`);
+        console.log(`  Config: ${status.configPath || '(none)'}`);
+        console.log(`  Workspace: ${status.workspace || '(none)'}`);
+        console.log(`  Log: ${status.logFile}`);
+
+        if ((status.mcpServers?.length || 0) > 0) {
+          console.log(chalk.cyan('  MCP:'));
+          for (const server of status.mcpServers || []) {
+            const statusText = server.status === 'connected' ? chalk.green('connected') : chalk.red('failed');
+            console.log(`    - ${server.name}: ${statusText}${server.detail ? ` (${server.detail})` : ''}`);
+          }
+        }
+
+        if ((status.lspServers?.length || 0) > 0) {
+          console.log(chalk.cyan('  LSP:'));
+          for (const server of status.lspServers || []) {
+            const statusText = server.status === 'connected' ? chalk.green('connected') : chalk.red('failed');
+            console.log(`    - ${server.name}: ${statusText}${server.detail ? ` (${server.detail})` : ''}`);
+          }
+        }
+
+        console.log();
+        break;
+      }
+      case 'start': {
+        const status = await this.ensureBackgroundCronDaemon();
+        printSuccess(`Background daemon started${status?.pid ? ` (pid=${status.pid})` : ''}`);
+        break;
+      }
+      case 'stop': {
+        const stopped = await this.backgroundDaemon?.stop();
+        if (stopped) {
+          printSuccess('Background daemon stopped');
+        } else {
+          printInfo('Background daemon was not running');
+        }
+        break;
+      }
+      case 'restart': {
+        await this.backgroundDaemon?.stop();
+        const status = await this.ensureBackgroundCronDaemon();
+        printSuccess(`Background daemon restarted${status?.pid ? ` (pid=${status.pid})` : ''}`);
+        break;
+      }
+      case 'help':
+      default:
+        console.log(`
+${chalk.bold('Daemon Commands:')}
+${chalk.cyan('/daemon')}                         查看后台 daemon 状态
+${chalk.cyan('/daemon status')}                  显示后台 daemon 状态、PID、日志路径
+${chalk.cyan('/daemon start')}                   启动后台 daemon
+${chalk.cyan('/daemon stop')}                    停止后台 daemon
+${chalk.cyan('/daemon restart')}                 重启后台 daemon
 `);
     }
   }
@@ -3295,6 +3758,30 @@ ${chalk.gray('/cron create-morning-feishu-group')}
     console.log();
   }
 
+  private async editConfigFile(): Promise<void> {
+    const editor = new TerminalConfigEditor({
+      filePath: configManager.getConfigPath(),
+      title: 'AI Agent CLI Config Editor',
+    });
+
+    try {
+      const result = await editor.edit();
+      console.clear();
+      console.log(chalk.cyan(logo));
+
+      if (result.saved) {
+        printSuccess(`Config saved: ${configManager.getConfigPath()}`);
+        await this.reloadRuntimeConfig();
+      } else {
+        printInfo('Config editor closed without saving.');
+      }
+    } catch (error) {
+      console.clear();
+      console.log(chalk.cyan(logo));
+      printError(`Config editor failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private async reloadRuntimeConfig(): Promise<void> {
     const configPath = configManager.getConfigPath();
     const previousMessages = this.agent?.getMessages() || this.memoryManager.getMessages();
@@ -3323,6 +3810,22 @@ ${chalk.gray('/cron create-morning-feishu-group')}
     } catch (error) {
       printError(`Runtime refresh failed after config reload: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private async saveAndReloadRuntimeConfig(): Promise<boolean> {
+    const configPath = configManager.getConfigPath();
+    const previousMessages = this.agent?.getMessages() || this.memoryManager.getMessages();
+
+    await configManager.saveToFile(configPath);
+    await configManager.loadFromFile(configPath);
+
+    const config = configManager.getAgentConfig();
+    this.currentProvider = config.defaultProvider || 'ollama';
+    this.workspace = config.workspace || this.workspace;
+    this.applyGlobalPathsFromConfig(config);
+    await this.rebuildRuntimeFromConfig(config, previousMessages);
+
+    return this.llm ? await this.llm.checkConnection().catch(() => false) : false;
   }
 
   private async rebuildRuntimeFromConfig(config: any, messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: any[]; tool_call_id?: string; name?: string }>): Promise<void> {
@@ -3385,6 +3888,10 @@ ${chalk.gray('/cron create-morning-feishu-group')}
       }
       console.log();
     });
+
+    if (this.options.ensureBackgroundDaemon && !this.options.runLocalCronScheduler) {
+      await this.ensureBackgroundCronDaemon(true);
+    }
 
     await this.reloadConfiguredMCPServers(config);
     await this.reloadConfiguredLSPServers(config);
@@ -3510,33 +4017,64 @@ ${chalk.gray('/cron create-morning-feishu-group')}
 
   private async switchProvider(provider: string): Promise<void> {
     const normalizedProvider = provider.toLowerCase();
-    const providerConfig = configManager.get(normalizedProvider as any);
+    const currentConfig = configManager.getAgentConfig();
+    const supportedProviders: LLMProvider[] = ['ollama', 'deepseek', 'kimi', 'glm', 'doubao', 'minimax', 'openai', 'claude', 'gemini', 'hybrid'];
+
+    if (!supportedProviders.includes(normalizedProvider as LLMProvider)) {
+      printError(`Provider not found: ${provider}. Use /model to see available providers.`);
+      return;
+    }
+
+    const providerKey = normalizedProvider as LLMProvider;
+    const providerConfig = currentConfig[providerKey];
 
     if (!providerConfig) {
       printError(`Provider not found: ${provider}. Use /model to see available providers.`);
       return;
     }
 
-    if (!providerConfig.enabled) {
-      printError(`Provider "${provider}" is disabled. Please enable it in config first.`);
-      return;
-    }
-
     try {
-      configManager.set('defaultProvider', normalizedProvider);
-      const configPath = configManager.getConfigPath();
-      if (configPath) {
-        await configManager.saveToFile(configPath);
+      if (normalizedProvider === 'deepseek') {
+        const existingDeepSeek = currentConfig.deepseek;
+        configManager.set('deepseek', {
+          enabled: true,
+          baseUrl: existingDeepSeek?.baseUrl || 'https://api.deepseek.com',
+          apiKey: existingDeepSeek?.apiKey,
+          model: existingDeepSeek?.model || 'deepseek-chat',
+          reasoningModel: existingDeepSeek?.reasoningModel || 'deepseek-reasoner',
+          temperature: existingDeepSeek?.temperature ?? 0.7,
+          maxTokens: existingDeepSeek?.maxTokens ?? 4096,
+          systemPrompt: existingDeepSeek?.systemPrompt,
+          autoReasoning: {
+            enabled: true,
+            simpleTaskMaxChars: existingDeepSeek?.autoReasoning?.simpleTaskMaxChars ?? 120,
+            simpleConversationMaxChars: existingDeepSeek?.autoReasoning?.simpleConversationMaxChars ?? 8000,
+            preferReasonerForToolMessages: existingDeepSeek?.autoReasoning?.preferReasonerForToolMessages ?? true,
+            preferReasonerForPlanning: existingDeepSeek?.autoReasoning?.preferReasonerForPlanning ?? true,
+            preferReasonerForLongContext: existingDeepSeek?.autoReasoning?.preferReasonerForLongContext ?? true,
+          },
+        });
+      } else if (!providerConfig.enabled) {
+        printError(`Provider "${provider}" is disabled. Please enable it in config first.`);
+        return;
       }
 
-      this.currentProvider = normalizedProvider;
-      this.llm = this.createLLMClient(configManager.getAgentConfig());
-      const connected = await this.llm.checkConnection();
+      configManager.set('defaultProvider', normalizedProvider);
+      const connected = await this.saveAndReloadRuntimeConfig();
 
       if (connected) {
-        printSuccess(`Switched to provider: ${normalizedProvider} (${this.llm.getModel()})`);
+        if (normalizedProvider === 'deepseek') {
+          printSuccess(`Switched to provider: ${normalizedProvider} (${this.llm?.getModel() || 'unknown'})`);
+          printInfo('DeepSeek auto reasoning 已启用：将同时使用 deepseek-chat 和 deepseek-reasoner，并根据复杂度自动切换。');
+        } else {
+          printSuccess(`Switched to provider: ${normalizedProvider} (${this.llm?.getModel() || 'unknown'})`);
+        }
       } else {
-        printWarning(`Switched to ${normalizedProvider}, but connection failed.`);
+        if (normalizedProvider === 'deepseek') {
+          printWarning(`Switched to ${normalizedProvider} and enabled auto reasoning, but connection failed.`);
+        } else {
+          printWarning(`Switched to ${normalizedProvider}, but connection failed.`);
+        }
       }
     } catch (error) {
       printError('Error: ' + (error instanceof Error ? error.message : String(error)));
@@ -3968,6 +4506,8 @@ ${chalk.bold('Organization Roles:')}
     await this.mcpManager.disconnectAll();
     await this.lspManager.disconnectAll();
     await this.sandbox.cleanup();
+    this.splitScreen?.close();
+    this.splitScreen = undefined;
   }
 }
 
@@ -3992,6 +4532,7 @@ export async function runCLI(): Promise<void> {
     .option('-c, --config <path>', 'Path to configuration file')
     .option('-m, --model <name>', 'Model to use')
     .option('-w, --workspace <path>', 'Workspace directory')
+    .option('--daemon-service', 'Run internal background daemon service')
     .option('--cron-daemon', 'Run only the cron scheduler in the foreground')
     .option('--cron-once', 'Run a single due-jobs check and exit')
     .parse(process.argv);
@@ -4010,7 +4551,15 @@ export async function runCLI(): Promise<void> {
     configManager.set('workspace', options.workspace);
   }
 
-  const cli = new CLI();
+  if (options.daemonService) {
+    await runBackgroundDaemonService();
+    return;
+  }
+
+  const cli = new CLI({
+    ensureBackgroundDaemon: !options.cronDaemon && !options.cronOnce,
+    runLocalCronScheduler: Boolean(options.cronDaemon || options.cronOnce),
+  });
   
   process.on('SIGINT', async () => {
     console.log(chalk.gray('\nShutting down...'));
@@ -4031,6 +4580,8 @@ export async function runCLI(): Promise<void> {
   }
 
   await cli.run();
+  await cli.stopBackgroundDaemonIfRequested();
+  await cli.shutdown();
 }
 
 const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url);

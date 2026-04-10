@@ -31,12 +31,14 @@ export class MemoryManager {
   private currentSessionId: string;
   private maxMessagesPerSession: number;
   private currentMessages: Message[] = [];
+  private sessionStateFile: string;
 
   constructor(historyDir?: string, maxMessagesPerSession = 100) {
     const homeDir = process.env.HOME || process.env.USERPROFILE || process.cwd();
     this.historyDir = historyDir || join(homeDir, '.ai-agent-cli', 'history');
     this.currentSessionId = this.generateSessionId();
     this.maxMessagesPerSession = maxMessagesPerSession;
+    this.sessionStateFile = join(dirname(this.historyDir), 'runtime', 'current-session.json');
   }
 
   private generateSessionId(): string {
@@ -46,11 +48,26 @@ export class MemoryManager {
 
   async initialize(): Promise<void> {
     await fs.mkdir(this.historyDir, { recursive: true });
+    await fs.mkdir(dirname(this.sessionStateFile), { recursive: true });
+
+    const pinnedSessionId = await this.loadPinnedSessionId();
+    if (pinnedSessionId) {
+      this.currentSessionId = pinnedSessionId;
+      const loaded = await this.loadSessionById(pinnedSessionId);
+      if (!loaded) {
+        this.currentMessages = [];
+        await this.saveSessionState();
+      }
+      return;
+    }
+
     await this.loadCurrentSession();
 
     if (this.currentMessages.length === 0) {
       await this.loadLatestSession();
     }
+
+    await this.saveSessionState();
   }
 
   private getHistoryFilePath(): string {
@@ -122,6 +139,7 @@ export class MemoryManager {
     }
     
     this.saveHistory().catch(console.error);
+    this.saveSessionState().catch(console.error);
   }
 
   getMessages(): Message[] {
@@ -131,11 +149,13 @@ export class MemoryManager {
   setMessages(messages: Message[]): void {
     this.currentMessages = messages;
     this.saveHistory().catch(console.error);
+    this.saveSessionState().catch(console.error);
   }
 
   clearHistory(): void {
     this.currentMessages = [];
     this.saveHistory().catch(console.error);
+    this.saveSessionState().catch(console.error);
   }
 
   async listSessions(): Promise<Array<{ id: string; messageCount: number; lastUpdated: number }>> {
@@ -166,6 +186,30 @@ export class MemoryManager {
   }
 
   async loadSession(sessionId: string): Promise<boolean> {
+    const loaded = await this.loadSessionById(sessionId);
+    if (loaded) {
+      await this.saveSessionState();
+    }
+    return loaded;
+  }
+
+  newSession(): void {
+    this.currentSessionId = this.generateSessionId();
+    this.currentMessages = [];
+    this.saveSessionState().catch(console.error);
+  }
+
+  getCurrentSessionId(): string {
+    return this.currentSessionId;
+  }
+
+  getContextSummary(maxLength = 500): string {
+    const recent = this.currentMessages.slice(-10);
+    const summary = recent.map(m => `${m.role}: ${m.content.slice(0, 100)}`).join('\n');
+    return summary.length > maxLength ? summary.slice(0, maxLength) + '...' : summary;
+  }
+
+  private async loadSessionById(sessionId: string): Promise<boolean> {
     try {
       const files = await fs.readdir(this.historyDir);
       for (const file of files) {
@@ -186,19 +230,27 @@ export class MemoryManager {
     return false;
   }
 
-  newSession(): void {
-    this.currentSessionId = this.generateSessionId();
-    this.currentMessages = [];
+  private async loadPinnedSessionId(): Promise<string | null> {
+    try {
+      const raw = await fs.readFile(this.sessionStateFile, 'utf-8');
+      const parsed = JSON.parse(raw) as { currentSessionId?: string };
+      return typeof parsed.currentSessionId === 'string' && parsed.currentSessionId.trim().length > 0
+        ? parsed.currentSessionId.trim()
+        : null;
+    } catch {
+      return null;
+    }
   }
 
-  getCurrentSessionId(): string {
-    return this.currentSessionId;
-  }
-
-  getContextSummary(maxLength = 500): string {
-    const recent = this.currentMessages.slice(-10);
-    const summary = recent.map(m => `${m.role}: ${m.content.slice(0, 100)}`).join('\n');
-    return summary.length > maxLength ? summary.slice(0, maxLength) + '...' : summary;
+  private async saveSessionState(): Promise<void> {
+    try {
+      await fs.writeFile(this.sessionStateFile, JSON.stringify({
+        currentSessionId: this.currentSessionId,
+        updatedAt: Date.now(),
+      }, null, 2), 'utf-8');
+    } catch (error) {
+      console.error('Failed to save current session state:', error);
+    }
   }
 }
 

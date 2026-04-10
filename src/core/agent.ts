@@ -213,6 +213,14 @@ export class Agent {
     return this.interactionService.getConfirmationStatus();
   }
 
+  clearPendingInteraction(): void {
+    this.interactionService.clearPendingInteraction();
+  }
+
+  shouldTreatPendingInputAsNewRequest(input: string): boolean {
+    return this.interactionService.shouldTreatPendingInputAsNewRequest(input);
+  }
+
   async confirmAction(confirmed: boolean, params?: any): Promise<string | undefined> {
     return this.interactionService.confirmAction(confirmed, params);
   }

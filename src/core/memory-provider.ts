@@ -2,6 +2,7 @@ import type { MCPManager, ToolResult as MCPToolResult } from '../mcp/client.js';
 import type { Message, MemoryConfig } from '../types/index.js';
 import type { EnhancedMemoryManager } from './memory-enhanced.js';
 import type { SkillManager } from './skills.js';
+import { sanitizeForUtf8 } from '../utils/unicode.js';
 
 export type MemoryLayer = 'session' | 'facts' | 'procedural';
 
@@ -230,9 +231,15 @@ class LocalMemoryProvider implements MemoryProvider {
         this.enhancedMemory.addToKnowledgeBase(entry.content);
         break;
       case 'task':
-        this.enhancedMemory.setProjectContext(`task:${entry.title}`, {
-          summary: entry.content,
-          ...entry.metadata,
+        this.enhancedMemory.recordTaskResult({
+          description: entry.title,
+          status: typeof entry.metadata?.status === 'string' && ['completed', 'failed', 'partial'].includes(String(entry.metadata.status))
+            ? entry.metadata.status as 'completed' | 'failed' | 'partial'
+            : 'completed',
+          result: typeof entry.metadata?.result === 'string' ? entry.metadata.result : entry.content,
+          error: typeof entry.metadata?.error === 'string' ? entry.metadata.error : undefined,
+          currentStep: typeof entry.metadata?.currentStep === 'string' ? entry.metadata.currentStep : undefined,
+          metadata: entry.metadata,
         });
         break;
       case 'procedural':
@@ -395,7 +402,7 @@ class MemPalaceMemoryProvider implements MemoryProvider {
   private async tryToolCalls(toolName: string, candidates: Array<Record<string, unknown>>): Promise<MCPToolResult | undefined> {
     for (const candidate of candidates) {
       try {
-        return await this.mcpManager.callTool('mempalace', toolName, candidate);
+        return await this.mcpManager.callTool('mempalace', toolName, sanitizeForUtf8(candidate));
       } catch {
         continue;
       }

@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import { join, dirname } from 'path';
 import type { Message } from '../types/index.js';
+import { safeJsonStringify } from '../utils/unicode.js';
 
 export interface AgentMemory {
   agentId: string;
@@ -231,7 +232,7 @@ export class EnhancedMemoryManager {
 
   private async saveLongTermMemory(): Promise<void> {
     try {
-      await fs.writeFile(this.longTermFile, JSON.stringify(this.longTermMemory, null, 2), 'utf-8');
+      await fs.writeFile(this.longTermFile, safeJsonStringify(this.longTermMemory, 2), 'utf-8');
     } catch (error) {
       console.error('Failed to save long-term memory:', error);
     }
@@ -250,7 +251,7 @@ export class EnhancedMemoryManager {
   private async saveCurrentSession(): Promise<void> {
     try {
       const sessionFile = join(this.shortTermDir, `${this.currentSessionId}.json`);
-      await fs.writeFile(sessionFile, JSON.stringify(this.currentMessages, null, 2), 'utf-8');
+      await fs.writeFile(sessionFile, safeJsonStringify(this.currentMessages, 2), 'utf-8');
     } catch (error) {
       console.error('Failed to save current session:', error);
     }
@@ -551,6 +552,50 @@ export class EnhancedMemoryManager {
       status: 'failed',
       error,
     });
+  }
+
+  recordTaskResult(input: {
+    description: string;
+    status: 'completed' | 'failed' | 'partial';
+    result?: string;
+    error?: string;
+    currentStep?: string;
+    metadata?: Record<string, any>;
+  }): TaskProgress {
+    const now = Date.now();
+    const task: TaskProgress = {
+      taskId: `task_${now}_${Math.random().toString(36).slice(2, 8)}`,
+      description: input.description,
+      status: input.status,
+      progress: input.status === 'failed' ? 0 : 100,
+      currentStep: input.currentStep,
+      completedSteps: input.status === 'failed' ? [] : ['completed'],
+      pendingSteps: [],
+      result: input.result,
+      error: input.error,
+      startedAt: now,
+      updatedAt: now,
+    };
+
+    this.longTermMemory.taskHistory.push(task);
+    this.upsertPalaceMemory('ergasterion', `task:${task.taskId}`, {
+      title: input.description,
+      content: [
+        `Status: ${task.status}`,
+        input.currentStep ? `Current step: ${input.currentStep}` : undefined,
+        input.result ? `Result: ${input.result}` : undefined,
+        input.error ? `Error: ${input.error}` : undefined,
+      ].filter(Boolean).join('\n'),
+      zone: 'tasks',
+      tags: ['task', task.status],
+      metadata: {
+        taskId: task.taskId,
+        progress: task.progress,
+        ...input.metadata,
+      },
+    });
+    this.saveLongTermMemory();
+    return task;
   }
 
   getLongTermMemory(): LongTermMemory {

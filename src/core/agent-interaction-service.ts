@@ -45,6 +45,32 @@ export class AgentInteractionService {
     this.pendingConfirmation = pending;
   }
 
+  clearPendingInteraction(): void {
+    this.pendingConfirmation = undefined;
+  }
+
+  shouldTreatPendingInputAsNewRequest(input: string): boolean {
+    const pending = this.pendingConfirmation;
+    if (!pending) {
+      return false;
+    }
+
+    const trimmed = input.trim();
+    if (!trimmed || this.isAffirmative(trimmed) || this.isNegative(trimmed) || this.isResumeSignal(trimmed)) {
+      return false;
+    }
+
+    if (pending.type !== 'task_clarification' && pending.type !== 'plan_execution') {
+      return false;
+    }
+
+    if (/(补充|补一下|改成|改为|调整为|路径是|输出到|保存到|目录是|文件名是|继续刚才|基于上面|按刚才|针对上面)/i.test(trimmed)) {
+      return false;
+    }
+
+    return this.isLikelyStandaloneTask(trimmed);
+  }
+
   async confirmAction(confirmed: boolean, params?: any): Promise<string | undefined> {
     let executionResult: string | undefined;
     const pending = this.pendingConfirmation;
@@ -134,15 +160,32 @@ export class AgentInteractionService {
     return undefined;
   }
 
+  private isLikelyStandaloneTask(input: string): boolean {
+    if (/(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|github|gitlab|google|百度|飞书|lark)/i.test(input)) {
+      return true;
+    }
+
+    if (/(帮我|请|麻烦)?(打开|查看|读取|搜索|查找|列出|生成|发送|发到|导出|保存|转换|创建|修复|修改|重构|排查)/i.test(input)) {
+      return true;
+    }
+
+    if (/https?:\/\//i.test(input)) {
+      return true;
+    }
+
+    return false;
+  }
+
   buildTaskClarificationPrompt(input: string): string | null {
     const trimmed = input.trim();
     const missing: string[] = [];
+    const isMemoryWriteTask = /(长期记忆|写入记忆|写进记忆|记住|记下来|存入记忆|用户信息|用户偏好|用户档案)/i.test(trimmed);
 
     if (trimmed.length < 18 || /(处理一下|搞一下|看一下|弄一下|帮我做|帮我处理)$/i.test(trimmed)) {
       missing.push('你真正要交付的目标');
     }
 
-    if (/(导出|生成|输出|保存|写入)/.test(trimmed) && !/(docx|word|pdf|md|txt|json|xlsx|ppt|目录|路径|文件名|输出到)/i.test(trimmed)) {
+    if (!isMemoryWriteTask && /(导出|生成|输出|保存|写入)/.test(trimmed) && !/(docx|word|pdf|md|txt|json|xlsx|ppt|目录|路径|文件名|输出到)/i.test(trimmed)) {
       missing.push('输出格式或输出位置');
     }
 

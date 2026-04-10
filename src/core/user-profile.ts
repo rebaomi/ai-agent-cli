@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
+import { safeJsonStringify } from '../utils/unicode.js';
 
 export interface UserPreferences {
   name?: string;
@@ -74,7 +75,7 @@ export class UserProfileManager {
   async saveProfile(): Promise<void> {
     if (this.currentProfile) {
       this.currentProfile.updatedAt = Date.now();
-      await fs.writeFile(this.profileFile, JSON.stringify(this.currentProfile, null, 2), 'utf-8');
+      await fs.writeFile(this.profileFile, safeJsonStringify(this.currentProfile, 2), 'utf-8');
     }
   }
 
@@ -265,7 +266,7 @@ export class UserProfileManager {
   async exportProfile(): Promise<string> {
     if (!this.currentProfile) return '';
     
-    return JSON.stringify(this.currentProfile, null, 2);
+    return safeJsonStringify(this.currentProfile, 2);
   }
 
   printProfile(): void {

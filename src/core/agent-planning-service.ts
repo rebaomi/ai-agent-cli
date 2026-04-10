@@ -176,9 +176,15 @@ export class AgentPlanningService {
       return false;
     }
 
+    if (/(长期记忆|写入记忆|写进记忆|记住|记下来|存入记忆|用户信息|用户偏好|用户档案)/i.test(input)
+      && /(我是|我喜欢|爱好|兴趣|偏好|习惯)/.test(input)) {
+      return true;
+    }
+
     const directActionPatterns = [
       /^(?:@tool)\b/i,
       /^(?:请)?(?:帮我)?(?:读取|查看|打开|列出|搜索|查找|grep|find)\b/i,
+      /(?:打开|访问|进入|浏览|跳转到).*(?:网页|网站|首页|页面|官网|github|gitlab|google|百度|飞书|lark)/i,
       /(?:保存|导出|转成|转换成|转换为|生成|输出|整理成|整理为|写成).*(?:pdf|word|docx|ppt|pptx|xlsx|excel|飞书|lark)/i,
       /(?:发送|发(?:到|给|我)?|推送).*(?:飞书|lark|附件|文档|word|docx|ppt|pptx|pdf)/i,
       /(?:飞书|lark).*(?:发送|发(?:到|给|我)?|推送)/i,
@@ -194,7 +200,7 @@ export class AgentPlanningService {
       return false;
     }
 
-    return /[\\/]|\.[a-z0-9]{1,8}\b|pdf\b|word\b|docx\b|ppt\b|pptx\b|xlsx\b|excel\b|飞书|lark|目录|文件|关键词|内容|命令|新闻|上面的|刚刚|刚才/i.test(input);
+    return /[\\/]|\.[a-z0-9]{1,8}\b|pdf\b|word\b|docx\b|ppt\b|pptx\b|xlsx\b|excel\b|飞书|lark|目录|文件|关键词|内容|命令|新闻|上面的|刚刚|刚才|网页|网站|首页|页面|官网|github|gitlab|google|百度/i.test(input);
   }
 
   private buildPlanningInput(input: string): string {

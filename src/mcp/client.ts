@@ -1,6 +1,30 @@
 import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import type { MCPConfig, MCPResource, MCPTool } from '../types/index.js';
+import { safeJsonStringify, sanitizeForUtf8 } from '../utils/unicode.js';
+
+const MEMPALACE_TEXT_KEYS = new Set([
+  'query',
+  'q',
+  'text',
+  'title',
+  'name',
+  'content',
+  'entry',
+  'topic',
+  'subject',
+  'predicate',
+  'object',
+  'fact',
+  'relation',
+  'entity',
+  'head',
+  'tail',
+  'source',
+  'target',
+  'label',
+  'value',
+]);
 
 export interface MCPRequest {
   jsonrpc: '2.0';
@@ -57,6 +81,7 @@ export class MCPClient extends EventEmitter {
   private resources: Map<string, MCPResource> = new Map();
   private isInitialized = false;
   private config: MCPConfig;
+  private recentStderr: string[] = [];
 
   constructor(config: MCPConfig) {
     super();
@@ -91,6 +116,7 @@ export class MCPClient extends EventEmitter {
         for (const line of lines) {
           const trimmed = line.trim();
           if (trimmed.length > 0) {
+            this.recordStderr(trimmed);
             this.emit('stderr', trimmed);
           }
         }
@@ -112,15 +138,17 @@ export class MCPClient extends EventEmitter {
 
       this.process.on('exit', (code) => {
         if (stderrBuffer.trim().length > 0) {
+          this.recordStderr(stderrBuffer.trim());
           this.emit('stderr', stderrBuffer.trim());
           stderrBuffer = '';
         }
         this.emit('close', code);
         this.isInitialized = false;
+        this.rejectPendingRequests(this.buildProcessExitError(code));
 
         if (!settled) {
           settled = true;
-          reject(new Error(`MCP process exited${code !== null ? ` (code ${code})` : ''}`));
+          reject(this.buildProcessExitError(code));
         }
       });
 
@@ -180,6 +208,27 @@ export class MCPClient extends EventEmitter {
     }
   }
 
+  private recordStderr(line: string): void {
+    this.recentStderr.push(line);
+    if (this.recentStderr.length > 8) {
+      this.recentStderr.shift();
+    }
+  }
+
+  private buildProcessExitError(code: number | null): Error {
+    const detail = this.recentStderr.length > 0
+      ? `: ${this.recentStderr.join(' | ')}`
+      : '';
+    return new Error(`MCP process exited${code !== null ? ` (code ${code})` : ''}${detail}`);
+  }
+
+  private rejectPendingRequests(error: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
+  }
+
   private handleMessage(message: MCPResponse | MCPNotification): void {
     if ('id' in message && message.id !== undefined) {
       const pending = this.pendingRequests.get(message.id);
@@ -223,11 +272,11 @@ export class MCPClient extends EventEmitter {
         jsonrpc: '2.0',
         id,
         method,
-        params,
+        params: sanitizeForUtf8(params),
       };
 
       this.pendingRequests.set(id, { resolve, reject });
-      this.process.stdin.write(JSON.stringify(request) + '\n');
+      this.process.stdin.write(safeJsonStringify(request) + '\n');
 
       setTimeout(() => {
         if (this.pendingRequests.has(id)) {
@@ -244,10 +293,10 @@ export class MCPClient extends EventEmitter {
     const notification: MCPNotification = {
       jsonrpc: '2.0',
       method,
-      params,
+      params: sanitizeForUtf8(params),
     };
 
-    this.process.stdin.write(JSON.stringify(notification) + '\n');
+    this.process.stdin.write(safeJsonStringify(notification) + '\n');
   }
 
   async initialize(): Promise<InitializeResult> {
@@ -291,7 +340,7 @@ export class MCPClient extends EventEmitter {
   async callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
     const result = await this.sendRequest('tools/call', {
       name,
-      arguments: args,
+      arguments: normalizeMempalaceToolArgs(name, args),
     }) as ToolResult;
     return result;
   }
@@ -333,7 +382,7 @@ export class MCPClient extends EventEmitter {
       this.process = null;
     }
     this.isInitialized = false;
-    this.pendingRequests.clear();
+    this.rejectPendingRequests(new Error('MCP process disconnected'));
     this.tools.clear();
     this.resources.clear();
   }
@@ -392,7 +441,7 @@ export class MCPManager {
     if (!client) {
       throw new Error(`MCP server ${serverName} not found`);
     }
-    return client.callTool(toolName, args);
+    return client.callTool(toolName, normalizeMempalaceToolArgs(toolName, args));
   }
 
   async listResources(serverName?: string): Promise<Array<{ server: string; resource: MCPResource }>> {
@@ -450,4 +499,86 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
 
 export function createMCPManager(): MCPManager {
   return new MCPManager();
+}
+
+function normalizeMempalaceToolArgs(toolName: string, args: Record<string, unknown>): Record<string, unknown> {
+  const sanitized = sanitizeForUtf8(args);
+  if (!toolName.startsWith('mempalace_')) {
+    return sanitized;
+  }
+
+  const normalized = normalizeMempalaceValue(sanitized) as Record<string, unknown>;
+
+  if (toolName === 'mempalace_search' || toolName === 'mempalace_kg_query') {
+    const queryCandidate = normalized.query ?? normalized.q ?? normalized.text;
+    normalized.query = stringifyMempalaceText(queryCandidate);
+    delete normalized.q;
+    if (toolName === 'mempalace_search') {
+      delete normalized.text;
+    }
+  }
+
+  return normalized;
+}
+
+function normalizeMempalaceValue(value: unknown, parentKey?: string): unknown {
+  if (parentKey && MEMPALACE_TEXT_KEYS.has(parentKey)) {
+    return stringifyMempalaceText(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => normalizeMempalaceValue(item, parentKey));
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return value;
+  }
+
+  const clone: Record<string, unknown> = {};
+  for (const [key, entryValue] of Object.entries(value as Record<string, unknown>)) {
+    clone[key] = normalizeMempalaceValue(entryValue, key);
+  }
+  return clone;
+}
+
+function stringifyMempalaceText(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value);
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map(item => stringifyMempalaceText(item))
+      .filter(item => item.length > 0)
+      .join(' ');
+  }
+
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const preferred = record.query ?? record.text ?? record.content ?? record.value ?? record.input;
+    if (preferred !== undefined) {
+      return stringifyMempalaceText(preferred);
+    }
+
+    return safeJsonStringify(value);
+  }
+
+  return '';
 }
