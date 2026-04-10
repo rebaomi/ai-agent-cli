@@ -8,7 +8,7 @@
 
 ## 简体中文
 
-一个以 Agent 为主、以 deterministic direct action 为辅的智能编程助手 CLI。
+这是一个懂你的 agent。
 
 当前系统的核心原则是：
 
