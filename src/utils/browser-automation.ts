@@ -46,6 +46,31 @@ function normalizeActionType(type: string): string {
   return type.trim().toLowerCase().replace(/[\s-]+/g, '_');
 }
 
+function shouldFallbackSubmitClick(selector: string, error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/not visible|timeout/i.test(message)) {
+    return false;
+  }
+
+  return /btnk|btnk|type\s*=\s*['"]submit['"]|button\[type=['"]submit['"]\]|input\[type=['"]submit['"]\]/i.test(selector);
+}
+
+function resolveSubmitFallbackSelector(pageUrl: string, selector: string): string | null {
+  if (/google\./i.test(pageUrl) || /btnk/i.test(selector)) {
+    return 'textarea[name="q"], input[name="q"]';
+  }
+
+  if (/baidu\./i.test(pageUrl) || /name=['"]wd['"]/i.test(selector)) {
+    return 'textarea[name="wd"], input[name="wd"]';
+  }
+
+  if (/type\s*=\s*['"]submit['"]/i.test(selector) || /button\[type=['"]submit['"]\]|input\[type=['"]submit['"]\]/i.test(selector)) {
+    return 'input[type="search"], textarea, input[type="text"]';
+  }
+
+  return null;
+}
+
 function uniqueStrings(values: Array<string | undefined>): string[] {
   return Array.from(new Set(values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map(value => value.trim())));
 }
@@ -198,8 +223,20 @@ export async function runBrowserAutomation(options: BrowserAutomationOptions): P
         }
         case 'click': {
           if (!action.selector) throw new Error(`第 ${index + 1} 个动作缺少 selector`);
-          await page.locator(action.selector).first().click();
-          actionLogs.push({ index, type: 'click', selector: action.selector });
+          try {
+            await page.locator(action.selector).first().click();
+            actionLogs.push({ index, type: 'click', selector: action.selector });
+          } catch (error) {
+            const fallbackSelector = shouldFallbackSubmitClick(action.selector, error)
+              ? resolveSubmitFallbackSelector(page.url(), action.selector)
+              : null;
+            if (!fallbackSelector) {
+              throw error;
+            }
+
+            await page.locator(fallbackSelector).first().press('Enter');
+            actionLogs.push({ index, type: 'click_fallback_press', selector: fallbackSelector });
+          }
           break;
         }
         case 'fill': {

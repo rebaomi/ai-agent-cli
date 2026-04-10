@@ -1,5 +1,6 @@
 import type { DirectActionResult } from '../direct-action-router.js';
 import type { MemoryWriteEntry } from '../memory-provider.js';
+import type { Message } from '../../types/index.js';
 
 export type ConvertibleFormat = 'md' | 'txt' | 'docx' | 'pdf' | 'xlsx' | 'pptx';
 type SourceFormat = ConvertibleFormat | 'csv' | 'tsv';
@@ -15,6 +16,14 @@ export interface ExternalSearchRuntime {
 
 export interface BrowserActionRuntime {
   executeBuiltInTool: (name: string, args: Record<string, unknown>, title: string) => Promise<DirectActionResult>;
+  getConversationMessages: () => Message[];
+}
+
+export interface ObsidianNoteRuntime {
+  executeBuiltInTool: (name: string, args: Record<string, unknown>, title: string) => Promise<DirectActionResult>;
+  normalizePath: (value: string) => string;
+  splitExplicitPaths: (input: string) => string[];
+  getVaultPath: () => string | null;
 }
 
 export interface FileActionRuntime {

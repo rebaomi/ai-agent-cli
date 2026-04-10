@@ -8,6 +8,7 @@ import { LSPManager } from '../lsp/client.js';
 import { Sandbox } from '../sandbox/executor.js';
 import { BuiltInTools } from '../tools/builtin.js';
 import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
+import { extractObsidianVaultPath } from '../core/obsidian-config.js';
 import type { BackgroundServiceConnection } from '../core/background-daemon.js';
 
 export async function runBackgroundDaemonService(): Promise<void> {
@@ -43,7 +44,8 @@ export async function runBackgroundDaemonService(): Promise<void> {
   });
   const desktopPath = getDesktopPath();
   const cronStoreDir = cronManager.getStoreDir();
-  for (const extraPath of [artifactOutputDir, desktopPath, cronStoreDir]) {
+  const obsidianVaultPath = extractObsidianVaultPath(config);
+  for (const extraPath of [artifactOutputDir, desktopPath, cronStoreDir, obsidianVaultPath].filter(Boolean) as string[]) {
     if (!sandboxConfig.allowedPaths.includes(extraPath)) {
       sandboxConfig.allowedPaths.push(extraPath);
     }

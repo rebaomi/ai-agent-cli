@@ -27,6 +27,7 @@ import { AgentToolCallService } from './agent-tool-call-service.js';
 import { AgentPlanRuntimeService } from './agent-plan-runtime-service.js';
 import { AgentMessageViewService } from './agent-message-view-service.js';
 import { AgentToolExecutionLogger } from './agent-tool-execution-logger.js';
+import type { IntentResolver } from './intent-resolver.js';
 
 interface AgentRuntimeEvent {
   type: string;
@@ -41,6 +42,7 @@ export interface AgentRuntimeFactoryOptions {
   memoryProvider?: MemoryProvider;
   skillManager?: any;
   planner?: Planner;
+  intentResolver?: IntentResolver;
   onSkillInstallNeeded?: (skills: string[]) => Promise<void>;
   agentRole?: string;
   contextManager: ContextManager;
@@ -349,6 +351,7 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
   planningService = new AgentPlanningService({
     llm: options.llm,
     planner: options.planner,
+    intentResolver: options.intentResolver,
     generateDirectResponse: () => options.generateResponse(),
     onThinking: (content) => {
       options.onEvent?.({ type: 'thinking', content });

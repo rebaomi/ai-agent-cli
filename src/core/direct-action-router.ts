@@ -6,6 +6,7 @@ import type { Message } from '../types/index.js';
 import { LarkDeliveryWorkflow } from './workflows/lark-delivery.js';
 import { createDirectActionRuntimeComponents } from './direct-action-runtime-factory.js';
 import { DirectActionDispatchService } from './direct-action-dispatch-service.js';
+import type { IntentResolver } from './intent-resolver.js';
 
 export interface DirectActionResult {
   handled: boolean;
@@ -22,6 +23,7 @@ export interface DirectActionRouterOptions {
   config?: unknown;
   getConversationMessages?: () => Message[];
   memoryProvider?: MemoryProvider;
+  intentResolver?: IntentResolver;
 }
 
 export class DirectActionRouter {
@@ -37,6 +39,7 @@ export class DirectActionRouter {
     this.dispatchService = new DirectActionDispatchService({
       handlers: () => runtimeComponents.handlers,
       tryLegacyFallbacks: (input) => runtimeComponents.toolSupport.tryLegacyFallbacks(input),
+      resolveIntent: options.intentResolver ? (input) => options.intentResolver!.resolve(input) : undefined,
     });
   }
 

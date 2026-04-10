@@ -25,6 +25,7 @@ import { createAgentCat, AgentCat } from '../core/companion/index.js';
 import { UserProfileManager, userProfileManager } from '../core/user-profile.js';
 import { ContentModerator, contentModerator } from '../core/content-moderator.js';
 import { createDirectActionRouter, DirectActionRouter } from '../core/direct-action-router.js';
+import { IntentResolver } from '../core/intent-resolver.js';
 import { parseOnboardingInput } from '../core/onboarding.js';
 import { PermissionManager, permissionManager } from '../core/permission-manager.js';
 import { createPlanner } from '../core/planner.js';
@@ -34,6 +35,7 @@ import { createMemoryProvider, type MemoryProvider } from '../core/memory-provid
 import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
 import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
+import { extractObsidianVaultPath } from '../core/obsidian-config.js';
 import { LarkRelayAgent, type LarkRelayMessage, type LarkRelayStatus } from '../lark/relay-agent.js';
 import type { LarkRelayConfig } from '../types/index.js';
 import { BackgroundDaemonManager, type BackgroundDaemonStatus } from '../core/background-daemon.js';
@@ -85,6 +87,7 @@ export class CLI {
   private moderator?: ContentModerator;
   private permissionMgr?: PermissionManager;
   private directActionRouter?: DirectActionRouter;
+  private intentResolver?: IntentResolver;
   private taskManager?: TaskManager;
   private cronManager?: CronManager;
   private isFirstInteraction = true;
@@ -129,6 +132,10 @@ export class CLI {
     this.memoryManager = createMemoryManager();
     await this.memoryManager.initialize();
     printSuccess('Memory manager ready');
+    const discardedPinnedSessionId = this.memoryManager.consumeDiscardedPinnedSessionId();
+    if (discardedPinnedSessionId) {
+      printInfo(`检测到跨天旧会话，已自动新建会话: ${discardedPinnedSessionId} -> ${this.memoryManager.getCurrentSessionId()}`);
+    }
 
     await this.loadInputHistory();
 
@@ -170,6 +177,7 @@ export class CLI {
     this.currentProvider = config.defaultProvider || 'ollama';
     
     this.llm = this.createLLMClient(config);
+    this.intentResolver = new IntentResolver(this.llm);
     
     let connected = false;
     let connectionError = '';
@@ -215,7 +223,8 @@ export class CLI {
     });
     const desktopPath = getDesktopPath();
     const cronStoreDir = this.cronManager.getStoreDir();
-    for (const extraPath of [artifactOutputDir, desktopPath, cronStoreDir]) {
+    const obsidianVaultPath = extractObsidianVaultPath(config);
+    for (const extraPath of [artifactOutputDir, desktopPath, cronStoreDir, obsidianVaultPath].filter(Boolean) as string[]) {
       if (!sandboxConfig.allowedPaths.includes(extraPath)) {
         sandboxConfig.allowedPaths.push(extraPath);
       }
@@ -283,6 +292,7 @@ export class CLI {
       config,
       getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
       memoryProvider: this.memoryProvider,
+      intentResolver: this.intentResolver,
     });
 
     if (config.lsp && config.lsp.length > 0) {
@@ -307,6 +317,7 @@ export class CLI {
       maxIterations: config.maxIterations,
       maxToolCallsPerTurn: config.maxToolCallsPerTurn,
       planner: createPlanner({ llm: this.llm!, memoryProvider: this.memoryProvider, skillManager: this.skillManager }),
+      intentResolver: this.intentResolver,
       memoryProvider: this.memoryProvider,
       config: config as unknown as Record<string, unknown>,
     });
@@ -3841,7 +3852,8 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       documentOutputDir: config.documentOutputDir,
     });
     const desktopPath = getDesktopPath();
-    for (const extraPath of [artifactOutputDir, desktopPath]) {
+    const obsidianVaultPath = extractObsidianVaultPath(config);
+    for (const extraPath of [artifactOutputDir, desktopPath, obsidianVaultPath].filter(Boolean) as string[]) {
       if (!sandboxConfig.allowedPaths.includes(extraPath)) {
         sandboxConfig.allowedPaths.push(extraPath);
       }
@@ -3857,6 +3869,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
     await this.sandbox.initialize();
 
     this.llm = this.createLLMClient(config);
+    this.intentResolver = new IntentResolver(this.llm);
 
     if (this.enhancedMemory) {
       this.memoryProvider = createMemoryProvider({
@@ -3904,6 +3917,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       config,
       getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
       memoryProvider: this.memoryProvider,
+      intentResolver: this.intentResolver,
     });
 
     this.agent = createAgent({
@@ -3916,6 +3930,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       maxIterations: config.maxIterations,
       maxToolCallsPerTurn: config.maxToolCallsPerTurn,
       planner: createPlanner({ llm: this.llm!, memoryProvider: this.memoryProvider, skillManager: this.skillManager }),
+      intentResolver: this.intentResolver,
       memoryProvider: this.memoryProvider,
       config: config as unknown as Record<string, unknown>,
     });

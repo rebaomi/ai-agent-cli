@@ -32,6 +32,7 @@ export class MemoryManager {
   private maxMessagesPerSession: number;
   private currentMessages: Message[] = [];
   private sessionStateFile: string;
+  private discardedPinnedSessionId: string | null = null;
 
   constructor(historyDir?: string, maxMessagesPerSession = 100) {
     const homeDir = process.env.HOME || process.env.USERPROFILE || process.cwd();
@@ -49,15 +50,23 @@ export class MemoryManager {
   async initialize(): Promise<void> {
     await fs.mkdir(this.historyDir, { recursive: true });
     await fs.mkdir(dirname(this.sessionStateFile), { recursive: true });
+    this.discardedPinnedSessionId = null;
 
     const pinnedSessionId = await this.loadPinnedSessionId();
-    if (pinnedSessionId) {
+    if (pinnedSessionId && this.shouldReusePinnedSession(pinnedSessionId)) {
       this.currentSessionId = pinnedSessionId;
       const loaded = await this.loadSessionById(pinnedSessionId);
       if (!loaded) {
         this.currentMessages = [];
         await this.saveSessionState();
       }
+      return;
+    }
+
+    if (pinnedSessionId && !this.shouldReusePinnedSession(pinnedSessionId)) {
+      this.discardedPinnedSessionId = pinnedSessionId;
+      this.currentMessages = [];
+      await this.saveSessionState();
       return;
     }
 
@@ -203,6 +212,12 @@ export class MemoryManager {
     return this.currentSessionId;
   }
 
+  consumeDiscardedPinnedSessionId(): string | null {
+    const discardedSessionId = this.discardedPinnedSessionId;
+    this.discardedPinnedSessionId = null;
+    return discardedSessionId;
+  }
+
   getContextSummary(maxLength = 500): string {
     const recent = this.currentMessages.slice(-10);
     const summary = recent.map(m => `${m.role}: ${m.content.slice(0, 100)}`).join('\n');
@@ -240,6 +255,18 @@ export class MemoryManager {
     } catch {
       return null;
     }
+  }
+
+  private shouldReusePinnedSession(sessionId: string): boolean {
+    const match = sessionId.match(/^session_(\d{4})(\d{2})(\d{2})_/);
+    if (!match) {
+      return true;
+    }
+
+    const today = new Date();
+    const sessionDate = `${match[1]}-${match[2]}-${match[3]}`;
+    const todayDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    return sessionDate === todayDate;
   }
 
   private async saveSessionState(): Promise<void> {

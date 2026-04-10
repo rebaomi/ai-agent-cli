@@ -6,9 +6,10 @@ import type { PermissionManager } from './permission-manager.js';
 import type { DirectActionResult } from './direct-action-router.js';
 import { LarkDeliveryWorkflow, type DirectActionWorkflowRuntime } from './workflows/lark-delivery.js';
 import type { DirectActionHandler } from './direct-actions/request-handler.js';
-import type { BrowserActionRuntime, DocumentActionRuntime, ExternalSearchRuntime, FileActionRuntime, LarkWorkflowRuntime, MemoryActionRuntime } from './direct-actions/runtime-context.js';
+import type { BrowserActionRuntime, DocumentActionRuntime, ExternalSearchRuntime, FileActionRuntime, LarkWorkflowRuntime, MemoryActionRuntime, ObsidianNoteRuntime } from './direct-actions/runtime-context.js';
 import { LarkWorkflowHandler } from './direct-actions/handlers/lark-workflow-handler.js';
 import { BrowserActionHandler } from './direct-actions/handlers/browser-action-handler.js';
+import { ObsidianNoteHandler } from './direct-actions/handlers/obsidian-note-handler.js';
 import { ExternalSearchHandler } from './direct-actions/handlers/external-search-handler.js';
 import { FileActionHandler } from './direct-actions/handlers/file-action-handler.js';
 import { DocumentActionHandler } from './direct-actions/handlers/document-action-handler.js';
@@ -20,6 +21,7 @@ import { DirectActionDocumentExportVerifier } from './direct-actions/document-ex
 import { DirectActionRoutingSupport } from './direct-actions/routing-support.js';
 import { isUnavailableDocxSkillResult } from './skill-execution-error.js';
 import { DirectActionToolSupport } from './direct-actions/tool-support.js';
+import { extractObsidianVaultPath } from './obsidian-config.js';
 
 export interface DirectActionRuntimeFactoryOptions {
   builtInTools: BuiltInTools;
@@ -58,6 +60,7 @@ interface DirectActionHandlerRuntimeBundle {
   larkDeliveryWorkflow: LarkDeliveryWorkflow;
   larkWorkflowRuntime: LarkWorkflowRuntime;
   browserActionRuntime: BrowserActionRuntime;
+  obsidianNoteRuntime: ObsidianNoteRuntime;
   externalSearchRuntime: ExternalSearchRuntime;
   fileActionRuntime: FileActionRuntime;
   documentActionRuntime: DocumentActionRuntime;
@@ -71,6 +74,7 @@ export function createDirectActionRuntimeComponents(options: DirectActionRuntime
     new MemoryActionHandler(runtimeBundle.memoryActionRuntime),
     new LarkWorkflowHandler(runtimeBundle.larkWorkflowRuntime),
     new BrowserActionHandler(runtimeBundle.browserActionRuntime),
+    new ObsidianNoteHandler(runtimeBundle.obsidianNoteRuntime),
     new ExternalSearchHandler(runtimeBundle.externalSearchRuntime),
     new FileActionHandler(runtimeBundle.fileActionRuntime),
     new DocumentActionHandler(runtimeBundle.documentActionRuntime),
@@ -131,7 +135,12 @@ function createDirectActionHandlerRuntimeBundle(
   return {
     larkDeliveryWorkflow: new LarkDeliveryWorkflow(workflowRuntime),
     larkWorkflowRuntime: createLarkWorkflowRuntime(options),
-    browserActionRuntime: createBrowserActionRuntime(sharedToolRuntime),
+    browserActionRuntime: createBrowserActionRuntime(sharedToolRuntime, options),
+    obsidianNoteRuntime: createObsidianNoteRuntime({
+      executeBuiltInTool: sharedToolRuntime.executeBuiltInTool,
+      routingSupport: supportBundle.routingSupport,
+      config: options.config && typeof options.config === 'object' ? options.config as Record<string, unknown> : {},
+    }),
     externalSearchRuntime: createExternalSearchRuntime({
       executeBuiltInTool: sharedToolRuntime.executeBuiltInTool,
       artifactSupport: supportBundle.artifactSupport,
@@ -254,8 +263,22 @@ function createMemoryActionRuntime(options: DirectActionRuntimeFactoryOptions): 
   };
 }
 
-function createBrowserActionRuntime(input: SharedToolExecutionRuntime): BrowserActionRuntime {
+function createBrowserActionRuntime(input: SharedToolExecutionRuntime, options: DirectActionRuntimeFactoryOptions): BrowserActionRuntime {
   return {
     executeBuiltInTool: input.executeBuiltInTool,
+    getConversationMessages: () => options.getConversationMessages?.() || [],
+  };
+}
+
+function createObsidianNoteRuntime(input: {
+  executeBuiltInTool: SharedToolExecutionRuntime['executeBuiltInTool'];
+  routingSupport: DirectActionRoutingSupport;
+  config: Record<string, unknown>;
+}): ObsidianNoteRuntime {
+  return {
+    executeBuiltInTool: input.executeBuiltInTool,
+    normalizePath: (value) => input.routingSupport.normalizePath(value),
+    splitExplicitPaths: (rawInput) => input.routingSupport.splitExplicitPaths(rawInput),
+    getVaultPath: () => extractObsidianVaultPath(input.config),
   };
 }

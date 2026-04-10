@@ -14,6 +14,7 @@ export class SplitScreenRenderer {
   private readonly maxLines = 1200;
   private active = false;
   private promptState: PromptState | null = null;
+  private rightScrollOffset = 0;
   private readonly originalConsole = {
     log: console.log,
     info: console.info,
@@ -22,6 +23,8 @@ export class SplitScreenRenderer {
     clear: console.clear,
   };
   private readonly originalWrite = process.stdout.write.bind(process.stdout);
+  private readonly originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  private readonly originalStderrWrite = process.stderr.write.bind(process.stderr);
 
   isActive(): boolean {
     return this.active;
@@ -44,11 +47,15 @@ export class SplitScreenRenderer {
     console.clear = () => {
       this.leftLines.length = 0;
       this.rightLines.length = 0;
+      this.rightScrollOffset = 0;
       this.render();
     };
 
+    process.stdout.write = this.createStreamInterceptor('stdout');
+    process.stderr.write = this.createStreamInterceptor('stderr');
+
     this.originalWrite('\x1b[?1049h');
-    this.originalWrite('\x1b[?25l');
+    this.originalWrite('\x1b[?25h');
     this.appendLeft('Split view enabled');
     this.render();
   }
@@ -63,9 +70,12 @@ export class SplitScreenRenderer {
     console.warn = this.originalConsole.warn;
     console.error = this.originalConsole.error;
     console.clear = this.originalConsole.clear;
+    process.stdout.write = this.originalStdoutWrite;
+    process.stderr.write = this.originalStderrWrite;
 
     this.promptState = null;
     this.active = false;
+    this.rightScrollOffset = 0;
     this.originalWrite('\x1b[?25h');
     this.originalWrite('\x1b[?1049l');
   }
@@ -103,6 +113,10 @@ export class SplitScreenRenderer {
 
           if (value === '\r' || value === '\n') {
             const answer = this.promptState?.buffer ?? '';
+            const submitted = `${this.promptState?.label || ''}${answer}`;
+            if (submitted.trim().length > 0) {
+              this.appendLeft(submitted);
+            }
             cleanup();
             resolve(answer);
             return;
@@ -124,6 +138,16 @@ export class SplitScreenRenderer {
               this.promptState.cursor = Math.max(0, this.promptState.cursor - 1);
               this.render();
             }
+            return;
+          }
+
+          if (value === '\u001b[5~') {
+            this.scrollRightPanel(10);
+            return;
+          }
+
+          if (value === '\u001b[6~') {
+            this.scrollRightPanel(-10);
             return;
           }
 
@@ -165,7 +189,7 @@ export class SplitScreenRenderer {
 
   private append(panel: Panel, text: string): void {
     const target = panel === 'left' ? this.leftLines : this.rightLines;
-    const normalized = this.stripAnsi(text).replace(/\r\n/g, '\n');
+    const normalized = this.normalizePanelText(text);
     const chunks = normalized.split('\n');
 
     for (let index = 0; index < chunks.length; index += 1) {
@@ -174,6 +198,11 @@ export class SplitScreenRenderer {
 
     if (target.length > this.maxLines) {
       target.splice(0, target.length - this.maxLines);
+    }
+
+    if (panel === 'right' && this.rightScrollOffset > 0) {
+      const maxOffset = Math.max(0, this.wrapLines(target, process.stdout.columns || 60).length - Math.max(6, (process.stdout.rows || 32) - 3));
+      this.rightScrollOffset = Math.min(this.rightScrollOffset, maxOffset);
     }
 
     if (this.active) {
@@ -192,11 +221,16 @@ export class SplitScreenRenderer {
     const leftWidth = Math.max(30, Math.floor((totalWidth - 1) / 2));
     const rightWidth = Math.max(20, totalWidth - leftWidth - 1);
 
-    const leftContent = this.wrapLines(this.leftLines, leftWidth).slice(-contentHeight);
-    const rightContent = this.wrapLines(this.rightLines, rightWidth).slice(-contentHeight);
+    const leftWrapped = this.wrapLines(this.leftLines, leftWidth);
+    const rightWrapped = this.wrapLines(this.rightLines, rightWidth);
+    const leftContent = leftWrapped.slice(-contentHeight);
+    const maxRightOffset = Math.max(0, rightWrapped.length - contentHeight);
+    this.rightScrollOffset = Math.min(this.rightScrollOffset, maxRightOffset);
+    const rightStart = Math.max(0, rightWrapped.length - contentHeight - this.rightScrollOffset);
+    const rightContent = rightWrapped.slice(rightStart, rightStart + contentHeight);
 
-    this.originalWrite('\x1b[2J\x1b[H');
-    this.originalWrite(`${this.pad('Output', leftWidth)}|${this.pad('Agent Process', rightWidth)}\n`);
+    this.originalWrite('\x1b[?25h\x1b[2J\x1b[H');
+    this.originalWrite(`${this.pad('Conversation', leftWidth)}|${this.pad('Agent Process', rightWidth)}\n`);
 
     for (let row = 0; row < contentHeight; row += 1) {
       this.originalWrite(`${this.pad(leftContent[row] || '', leftWidth)}|${this.pad(rightContent[row] || '', rightWidth)}\n`);
@@ -204,12 +238,47 @@ export class SplitScreenRenderer {
 
     const promptLabel = this.promptState?.label || '> ';
     const promptBuffer = this.promptState?.buffer || '';
-    const status = 'split:on  /split off  /mode status';
+    const scrollStatus = this.rightScrollOffset > 0 ? `PgUp/PgDn 右栏滚动 (${this.rightScrollOffset})` : 'PgUp/PgDn 右栏滚动';
+    const status = `${scrollStatus}  /split off`;
     this.originalWrite(`${this.pad(promptLabel + promptBuffer, leftWidth)}|${this.pad(status, rightWidth)}\n`);
 
     const cursorColumn = Math.min(leftWidth, this.visibleWidth(promptLabel + promptBuffer.slice(0, this.promptState?.cursor || 0))) + 1;
-    const cursorRow = totalHeight;
+    const cursorRow = contentHeight + 2;
     this.originalWrite(`\x1b[${cursorRow};${cursorColumn}H`);
+  }
+
+  private scrollRightPanel(delta: number): void {
+    const totalHeight = process.stdout.rows || 32;
+    const contentHeight = Math.max(6, totalHeight - 3);
+    const totalWidth = process.stdout.columns || 120;
+    const leftWidth = Math.max(30, Math.floor((totalWidth - 1) / 2));
+    const rightWidth = Math.max(20, totalWidth - leftWidth - 1);
+    const wrapped = this.wrapLines(this.rightLines, rightWidth);
+    const maxOffset = Math.max(0, wrapped.length - contentHeight);
+    this.rightScrollOffset = Math.max(0, Math.min(maxOffset, this.rightScrollOffset + delta));
+    this.render();
+  }
+
+  private createStreamInterceptor(stream: 'stdout' | 'stderr'): typeof process.stdout.write {
+    return ((chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean => {
+      if (!this.active) {
+        const fallback = stream === 'stderr' ? this.originalStderrWrite : this.originalStdoutWrite;
+        return fallback(chunk as never, encoding as never, callback as never);
+      }
+
+      const cb = typeof encoding === 'function' ? encoding : callback;
+      const text = typeof chunk === 'string'
+        ? chunk
+        : Buffer.from(chunk).toString(typeof encoding === 'string' ? encoding : 'utf-8');
+      const normalized = this.normalizePanelText(text);
+
+      if (normalized.length > 0) {
+        this.appendRight(normalized);
+      }
+
+      cb?.(null);
+      return true;
+    }) as typeof process.stdout.write;
   }
 
   private wrapLines(lines: string[], width: number): string[] {
@@ -239,11 +308,15 @@ export class SplitScreenRenderer {
   }
 
   private visibleWidth(value: string): number {
-    return this.stripAnsi(value).length;
+    return this.normalizePanelText(value).length;
   }
 
-  private stripAnsi(value: string): string {
-    return value.replace(/\x1b\[[0-9;]*m/g, '');
+  private normalizePanelText(value: string): string {
+    return value
+      .replace(/\x1b\][^\u0007]*(?:\u0007|\x1b\\)/g, '')
+      .replace(/\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, '');
   }
 
   private formatArgs(args: unknown[]): string {

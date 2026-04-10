@@ -19,6 +19,7 @@ import { TaskSynthesisService } from './task-synthesis-service.js';
 import type { ToolExecutionEvent } from './tool-executor.js';
 import { buildDefaultAgentSystemPrompt } from './agent-system-prompt.js';
 import { createAgentRuntimeComponents } from './agent-runtime-factory.js';
+import type { IntentResolver } from './intent-resolver.js';
 
 export interface AgentOptions {
   llm: LLMProviderInterface;
@@ -30,6 +31,7 @@ export interface AgentOptions {
   maxIterations?: number;
   maxToolCallsPerTurn?: number;
   planner?: Planner;
+  intentResolver?: IntentResolver;
   onSkillInstallNeeded?: (skills: string[]) => Promise<void>;
   memoryProvider?: MemoryProvider;
   config?: Record<string, unknown>;
@@ -153,6 +155,7 @@ export class Agent {
       memoryProvider: options.memoryProvider,
       skillManager: this.skillManager,
       planner: options.planner,
+      intentResolver: options.intentResolver,
       onSkillInstallNeeded: options.onSkillInstallNeeded,
       agentRole: this.agentRole,
       contextManager: this.contextManager,

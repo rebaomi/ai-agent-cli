@@ -91,7 +91,7 @@ export class TerminalConfigEditor {
 
       process.stdin.on('keypress', onKeypress);
       process.stdout.write('\x1b[?1049h');
-      process.stdout.write('\x1b[?25l');
+      process.stdout.write('\x1b[?25h');
       this.render();
     });
   }
@@ -213,19 +213,21 @@ export class TerminalConfigEditor {
   }
 
   private async executeCommand(command: string): Promise<'continue' | 'exit'> {
+    const normalizedCommand = command.startsWith('/') ? command : `/${command}`;
+
     if (command.length === 0) {
       this.mode = 'insert';
       this.statusMessage = '已返回插入模式。';
       return 'continue';
     }
 
-    if (command === '/save') {
+    if (normalizedCommand === '/save') {
       await this.saveFile();
       this.commandBuffer = '';
       return 'continue';
     }
 
-    if (command === '/q') {
+    if (normalizedCommand === '/q') {
       if (this.dirty) {
         this.statusMessage = '仍有未保存内容。先用 /save，或使用 /q! 强制退出。';
         this.commandBuffer = '';
@@ -234,11 +236,11 @@ export class TerminalConfigEditor {
       return 'exit';
     }
 
-    if (command === '/q!') {
+    if (normalizedCommand === '/q!') {
       return 'exit';
     }
 
-    if (command === '/help') {
+    if (normalizedCommand === '/help') {
       this.statusMessage = '命令：/save 保存，/q 退出，/q! 强制退出，i 或 Esc 返回插入模式。';
       this.commandBuffer = '';
       return 'continue';
@@ -290,7 +292,7 @@ export class TerminalConfigEditor {
     const modeLabel = this.mode === 'insert' ? 'INSERT' : 'COMMAND';
     const header = `${this.title} ${this.filePath}${dirtyFlag}`;
 
-    process.stdout.write('\x1b[2J\x1b[H');
+    process.stdout.write('\x1b[?25h\x1b[H\x1b[J');
     process.stdout.write(`${this.padRight(header, width)}\n`);
 
     for (let index = 0; index < viewportHeight; index++) {

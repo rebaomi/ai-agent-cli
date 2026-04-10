@@ -450,7 +450,7 @@ mcp:
   - name: lark
     command: node
     args:
-      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+      - C:/path/to/ai-agent-cli/dist/mcp/lark-bridge.js
     env:
       LARK_CLI_BIN: lark-cli
 ```
@@ -462,7 +462,7 @@ mcp:
   - name: lark
     command: node
     args:
-      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+      - C:/path/to/ai-agent-cli/dist/mcp/lark-bridge.js
     env:
       LARK_CLI_BIN: lark-cli.cmd
 ```
@@ -1599,7 +1599,7 @@ mcp:
   - name: lark
     command: node
     args:
-      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+      - C:/path/to/ai-agent-cli/dist/mcp/lark-bridge.js
     env:
       LARK_CLI_BIN: lark-cli
 ```
@@ -1611,7 +1611,7 @@ mcp:
   - name: lark
     command: node
     args:
-      - D:/workspace/ai-agent-cli/dist/mcp/lark-bridge.js
+      - C:/path/to/ai-agent-cli/dist/mcp/lark-bridge.js
     env:
       LARK_CLI_BIN: lark-cli.cmd
 ```
@@ -1661,7 +1661,7 @@ npm run push:news:lark -- --type search --keyword AI --chat-id oc_xxx --save
 Windows Task Scheduler example:
 
 ```powershell
-schtasks /Create /SC DAILY /TN "AI-Agent Morning News to Lark" /TR "powershell -NoProfile -Command \"cd D:\workspace\ai-agent-cli; npm.cmd run push:news:lark -- --type morning --user-id ou_xxx --save\"" /ST 08:00
+schtasks /Create /SC DAILY /TN "AI-Agent Morning News to Lark" /TR "powershell -NoProfile -Command \"cd C:\path\to\ai-agent-cli; npm.cmd run push:news:lark -- --type morning --user-id ou_xxx --save\"" /ST 08:00
 ```
 
 The script lives at `scripts/news-to-lark.mjs`. It requires:

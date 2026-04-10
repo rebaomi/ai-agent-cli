@@ -60,11 +60,11 @@ export class AgentInteractionService {
       return false;
     }
 
-    if (pending.type !== 'task_clarification' && pending.type !== 'plan_execution') {
+    if (/(补充|补一下|改成|改为|调整为|路径是|输出到|保存到|目录是|文件名是|继续刚才|基于上面|按刚才|针对上面)/i.test(trimmed)) {
       return false;
     }
 
-    if (/(补充|补一下|改成|改为|调整为|路径是|输出到|保存到|目录是|文件名是|继续刚才|基于上面|按刚才|针对上面)/i.test(trimmed)) {
+    if (pending.type === 'write_file' && /(保存|写入|路径|目录|文件名|文件路径|输出到)/i.test(trimmed) && !this.isLikelyStandaloneTask(trimmed)) {
       return false;
     }
 
@@ -161,7 +161,17 @@ export class AgentInteractionService {
   }
 
   private isLikelyStandaloneTask(input: string): boolean {
-    if (/(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|github|gitlab|google|百度|飞书|lark)/i.test(input)) {
+    if (/(obsidian|vault|笔记|笔记库|markdown|md文件)/i.test(input)
+      && /(打开|查看|读取|搜索|查找|列出|总结|整理|写入|保存|追加|更新|修改|新建|创建)/i.test(input)) {
+      return true;
+    }
+
+    if (/(google|谷歌|百度).*(搜索|查找|查询|输入).*(关键词|关键字)?/i.test(input)
+      || /(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|google|谷歌|百度)/i.test(input)) {
+      return true;
+    }
+
+    if (/(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|飞书|lark)/i.test(input)) {
       return true;
     }
 

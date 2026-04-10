@@ -92,12 +92,16 @@ export class MCPClient extends EventEmitter {
     return new Promise((resolve, reject) => {
       const { command, args = [], env = {} } = this.config;
       let settled = false;
-      const spawnSpec = this.buildSpawnSpec(command, args);
-      
+      const useShellForWindowsScript = process.platform === 'win32' && /\.(cmd|bat)$/i.test(command);
+      const spawnSpec = useShellForWindowsScript
+        ? { command: [command, ...args].map(value => this.escapeWindowsShellArg(value)).join(' '), args: [] as string[] }
+        : this.buildSpawnSpec(command, args);
+
       this.process = spawn(spawnSpec.command, spawnSpec.args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, ...env },
         windowsHide: true,
+        shell: useShellForWindowsScript,
       });
 
       let stdoutBuffer = '';
@@ -175,11 +179,7 @@ export class MCPClient extends EventEmitter {
       return { command, args };
     }
 
-    const escaped = [command, ...args].map(value => this.escapeWindowsShellArg(value)).join(' ');
-    return {
-      command: 'cmd.exe',
-      args: ['/d', '/s', '/c', escaped],
-    };
+    return { command, args };
   }
 
   private escapeWindowsShellArg(value: string): string {

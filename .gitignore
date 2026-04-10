@@ -7,3 +7,7 @@ dist/
 entities.json
 mempalace.yaml
 node-probe.txt
+.regression-current.txt
+.typecheck-current.txt
+.tmp-perm-probe/
+artifacts/
