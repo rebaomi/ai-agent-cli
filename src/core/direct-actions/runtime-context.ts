@@ -1,6 +1,7 @@
 import type { DirectActionResult } from '../direct-action-router.js';
 import type { MemoryWriteEntry } from '../memory-provider.js';
 import type { Message } from '../../types/index.js';
+import type { AnalyzeVisionTargetsResult } from '../ollama-vision-service.js';
 
 export type ConvertibleFormat = 'md' | 'txt' | 'docx' | 'pdf' | 'xlsx' | 'pptx';
 type SourceFormat = ConvertibleFormat | 'csv' | 'tsv';
@@ -17,6 +18,11 @@ export interface ExternalSearchRuntime {
 export interface BrowserActionRuntime {
   executeBuiltInTool: (name: string, args: Record<string, unknown>, title: string) => Promise<DirectActionResult>;
   getConversationMessages: () => Message[];
+}
+
+export interface VisionActionRuntime {
+  analyzeTargets: (input: { targets: string[]; prompt?: string; model?: string; maxImages?: number }) => Promise<AnalyzeVisionTargetsResult>;
+  extractPathCandidates: (input: string) => string[];
 }
 
 export interface ObsidianNoteRuntime {

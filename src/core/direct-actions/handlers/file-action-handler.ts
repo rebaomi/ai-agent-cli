@@ -2,13 +2,16 @@ import type { DirectActionResult } from '../../direct-action-router.js';
 import type { DirectActionHandler } from '../request-handler.js';
 import type { FileActionRuntime } from '../runtime-context.js';
 
+const OPENABLE_DOCUMENT_PATTERN = /\.(?:doc|docx|xls|xlsx|ppt|pptx|pdf|csv|tsv|txt|md)$/i;
+
 export class FileActionHandler implements DirectActionHandler {
   readonly name = 'file-action';
 
   constructor(private readonly runtime: FileActionRuntime) {}
 
   canHandle(input: string): boolean {
-    return /读取|查看文件|打开文件|列出目录|列出文件|查看目录|搜索|查找|grep|find|保存成markdown|保存成txt|保存为markdown|保存为txt|read_file|list_directory/i.test(input);
+    return /读取|查看文件|打开文件|列出目录|列出文件|查看目录|搜索|查找|grep|find|保存成markdown|保存成txt|保存为markdown|保存为txt|read_file|list_directory/i.test(input)
+      || (/^(?:请)?(?:帮我)?打开\s+.+/i.test(input) && OPENABLE_DOCUMENT_PATTERN.test(input));
   }
 
   async handle(input: string): Promise<DirectActionResult | null> {
@@ -42,6 +45,10 @@ export class FileActionHandler implements DirectActionHandler {
   }
 
   private async tryBuiltInFileAction(input: string): Promise<DirectActionResult | null> {
+    const openPatterns = [
+      /^(?:打开文件|打开文档|打开表格|打开word|打开excel|打开ppt|打开pdf|打开)\s+(.+)$/i,
+      /^(?:请)?(?:帮我)?打开\s+(.+)$/i,
+    ];
     const readPatterns = [
       /^(?:read_file|读取文件|读取|查看文件|查看|打开文件|打开)\s+(.+)$/i,
       /^(?:请)?(?:帮我)?(?:读取|查看|打开)\s+(.+)$/i,
@@ -57,6 +64,23 @@ export class FileActionHandler implements DirectActionHandler {
     const filePatternSearchPatterns = [
       /^(?:查找|搜索|列出|寻找)(?:所有|全部)?\s+([a-z0-9]+|\*\.[a-z0-9]+)\s*文件(?:\s+(?:在|于)\s+(.+))?$/i,
     ];
+
+    for (const pattern of openPatterns) {
+      const match = input.match(pattern);
+      const rawTarget = match?.[1]?.trim();
+      if (!rawTarget) {
+        continue;
+      }
+
+      const explicitPaths = this.runtime.splitExplicitPaths(rawTarget);
+      const candidate = this.runtime.normalizePath(explicitPaths[0] || rawTarget);
+      if (OPENABLE_DOCUMENT_PATTERN.test(candidate)) {
+        return this.runtime.executeBuiltInTool('open_path', {
+          path: candidate,
+          background: false,
+        }, '[Direct open_path]');
+      }
+    }
 
     for (const pattern of readPatterns) {
       const match = input.match(pattern);

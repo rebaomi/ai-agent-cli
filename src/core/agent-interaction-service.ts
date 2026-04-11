@@ -1,6 +1,8 @@
 import type { Plan } from './planner.js';
 import type { AgentState } from './agent.js';
 import type { PlanResumeState } from './plan-execution-service.js';
+import { resolveKnownWebsiteUrl } from './site-aliases.js';
+import type { AgentPendingInteractionSnapshot, AgentPlanResumeSnapshot } from '../types/index.js';
 
 export type PendingInteractionType = 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume';
 
@@ -19,6 +21,8 @@ export interface AgentInteractionServiceOptions {
   executePlan: (originalTask: string, plan: Plan) => Promise<string>;
   resumePlanExecution: (resumeState: PlanResumeState, note?: string) => Promise<string>;
   chatWithPlanning: (input: string) => Promise<string>;
+  detectComplexTask: (input: string) => Promise<boolean>;
+  generateDirectResponse: () => Promise<string>;
   setState: (state: AgentState) => void;
   setLastUserInput: (input: string) => void;
   getLastUserInput: () => string;
@@ -38,6 +42,39 @@ export class AgentInteractionService {
       pending: !!this.pendingConfirmation,
       type: this.pendingConfirmation?.type,
       prompt: this.pendingConfirmation?.prompt,
+    };
+  }
+
+  getPendingInteraction(): PendingInteraction | undefined {
+    return this.pendingConfirmation;
+  }
+
+  getPendingInteractionSnapshot(): AgentPendingInteractionSnapshot | undefined {
+    if (!this.pendingConfirmation) {
+      return undefined;
+    }
+
+    return {
+      type: this.pendingConfirmation.type,
+      prompt: this.pendingConfirmation.prompt,
+      originalTask: this.pendingConfirmation.originalTask,
+      hasPlan: Boolean(this.pendingConfirmation.plan),
+      hasResumeState: Boolean(this.pendingConfirmation.resumeState),
+    };
+  }
+
+  getPlanResumeSnapshot(): AgentPlanResumeSnapshot | undefined {
+    const resumeState = this.pendingConfirmation?.resumeState;
+    if (!resumeState) {
+      return undefined;
+    }
+
+    return {
+      originalTask: resumeState.originalTask,
+      nextStepIndex: resumeState.nextStepIndex,
+      blockedStepDescription: resumeState.blockedStepDescription,
+      blockedReason: resumeState.blockedReason,
+      resultCount: resumeState.results.length,
     };
   }
 
@@ -121,7 +158,8 @@ export class AgentInteractionService {
       this.options.setState('THINKING');
       const clarifiedTask = this.mergeTaskWithUserInput(pending.originalTask, trimmed, '用户补充的关键信息');
       this.options.setLastUserInput(clarifiedTask);
-      return this.options.chatWithPlanning(clarifiedTask);
+      const isComplex = await this.options.detectComplexTask(clarifiedTask);
+      return isComplex ? this.options.chatWithPlanning(clarifiedTask) : this.options.generateDirectResponse();
     }
 
     if (pending.type === 'plan_execution') {
@@ -161,17 +199,21 @@ export class AgentInteractionService {
   }
 
   private isLikelyStandaloneTask(input: string): boolean {
+    if (/^(?:帮我|请|麻烦)?(?:打开|访问|进入|浏览|跳转到)/i.test(input) && !!resolveKnownWebsiteUrl(input)) {
+      return true;
+    }
+
     if (/(obsidian|vault|笔记|笔记库|markdown|md文件)/i.test(input)
       && /(打开|查看|读取|搜索|查找|列出|总结|整理|写入|保存|追加|更新|修改|新建|创建)/i.test(input)) {
       return true;
     }
 
     if (/(google|谷歌|百度).*(搜索|查找|查询|输入).*(关键词|关键字)?/i.test(input)
-      || /(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|google|谷歌|百度)/i.test(input)) {
+      || /(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|google|谷歌|百度|网易\s*buff|\bbuff\b)/i.test(input)) {
       return true;
     }
 
-    if (/(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|飞书|lark)/i.test(input)) {
+    if (/(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|网易\s*buff|\bbuff\b|飞书|lark)/i.test(input)) {
       return true;
     }
 
@@ -190,8 +232,9 @@ export class AgentInteractionService {
     const trimmed = input.trim();
     const missing: string[] = [];
     const isMemoryWriteTask = /(长期记忆|写入记忆|写进记忆|记住|记下来|存入记忆|用户信息|用户偏好|用户档案)/i.test(trimmed);
+    const isStructuredGoalTask = this.isStructuredGoalTask(trimmed);
 
-    if (trimmed.length < 18 || /(处理一下|搞一下|看一下|弄一下|帮我做|帮我处理)$/i.test(trimmed)) {
+    if (!isStructuredGoalTask && (trimmed.length < 18 || /(处理一下|搞一下|看一下|弄一下|帮我做|帮我处理)$/i.test(trimmed))) {
       missing.push('你真正要交付的目标');
     }
 
@@ -212,6 +255,32 @@ export class AgentInteractionService {
       `请补充：${missing.join('、')}。`,
       '如果有优先级、截止时间、验收标准或不能碰的范围，也一起说，我会按补充后的信息继续规划。',
     ].join('\n');
+  }
+
+  private isStructuredGoalTask(input: string): boolean {
+    if (this.isStructuredLarkDeliveryTask(input)) {
+      return true;
+    }
+
+    if (/(天气|气温|温度|降雨|降水|空气质量|风力|湿度)/i.test(input)
+      && /(今天|明天|后天|本周|周末|实时|现在|未来)/i.test(input)) {
+      return true;
+    }
+
+    if (/(查|查询|搜索|搜一下|看下|看看|获取|整理|总结)/i.test(input)
+      && /(天气|新闻|热榜|资料|信息|内容|结果|报告)/i.test(input)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private isStructuredLarkDeliveryTask(input: string): boolean {
+    if (!/(飞书|lark)/i.test(input) || !/(发送|发(?:到|给|我)?|推送)/i.test(input)) {
+      return false;
+    }
+
+    return /(天气|气温|温度|降雨|降水|空气质量|风力|湿度|新闻|热榜|搜索|查询|资料|信息|内容|结果|总结|报告)/i.test(input);
   }
 
   private mergeTaskWithUserInput(originalTask: string, userInput: string, label: string): string {

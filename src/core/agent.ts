@@ -20,6 +20,8 @@ import type { ToolExecutionEvent } from './tool-executor.js';
 import { buildDefaultAgentSystemPrompt } from './agent-system-prompt.js';
 import { createAgentRuntimeComponents } from './agent-runtime-factory.js';
 import type { IntentResolver } from './intent-resolver.js';
+import type { AgentGraphCheckpoint, AgentTaskBindingSnapshot, UnifiedAgentState } from '../types/index.js';
+import type { PendingInteraction } from './agent-interaction-service.js';
 
 export interface AgentOptions {
   llm: LLMProviderInterface;
@@ -93,7 +95,9 @@ export class Agent {
   private state: AgentState = 'IDLE';
   private lastUserInput: string = '';
   private toolCallCount = 0;
-  private maxToolCallsPerTurn = 10;
+  private configuredMaxToolCallsPerTurn = 20;
+  private maxToolCallsPerTurn = 20;
+  private maxIterations = 100;
   private lastStopReason: 'completed' | 'tool_limit' | 'max_iterations' | 'error' = 'completed';
   private skillManager?: any;
   private assignedSkills?: Set<string>;
@@ -107,6 +111,9 @@ export class Agent {
   private planningService: AgentPlanningService;
   private taskSynthesisService: TaskSynthesisService;
   private getMessagesForLLMView: () => Message[];
+  private resolvePlannedToolArgsView: (args: Record<string, unknown>) => Record<string, unknown>;
+  private executeToolCallView: (toolCall: ToolCall) => Promise<ToolResult>;
+  private isGenericPlanView: (plan: Plan, input: string) => boolean;
   private readonly usingDefaultSystemPrompt: boolean;
 
   constructor(options: AgentOptions) {
@@ -146,7 +153,9 @@ export class Agent {
     this.systemPrompt = options.systemPrompt ?? this.getDefaultSystemPrompt();
     this.contextManager = createContextManager(options.contextConfig);
     const maxIterations = options.maxIterations ?? 100;
-    this.maxToolCallsPerTurn = options.maxToolCallsPerTurn ?? 10;
+    this.maxIterations = maxIterations;
+    this.configuredMaxToolCallsPerTurn = options.maxToolCallsPerTurn ?? 20;
+    this.maxToolCallsPerTurn = this.configuredMaxToolCallsPerTurn;
     this.agentRole = options.agentRole;
     const runtimeComponents = createAgentRuntimeComponents({
       llm: this.llm,
@@ -161,6 +170,7 @@ export class Agent {
       contextManager: this.contextManager,
       maxIterations,
       maxToolCallsPerTurn: this.maxToolCallsPerTurn,
+      getMaxToolCallsPerTurn: () => this.maxToolCallsPerTurn,
       getTools: () => this.tools,
       getLastReusableContent: () => this.lastReusableContent,
       setLastReusableContent: (content) => {
@@ -200,6 +210,9 @@ export class Agent {
     this.planningService = runtimeComponents.planningService;
     this.taskSynthesisService = runtimeComponents.taskSynthesisService;
     this.getMessagesForLLMView = runtimeComponents.getMessagesForLLM;
+    this.resolvePlannedToolArgsView = runtimeComponents.resolvePlannedToolArgs;
+    this.executeToolCallView = runtimeComponents.executeToolCall;
+    this.isGenericPlanView = runtimeComponents.isGenericPlan;
 
     this.initializeTools();
   }
@@ -216,8 +229,17 @@ export class Agent {
     return this.interactionService.getConfirmationStatus();
   }
 
+  getPendingInteractionDetails(): PendingInteraction | undefined {
+    return this.interactionService.getPendingInteraction();
+  }
+
   clearPendingInteraction(): void {
     this.interactionService.clearPendingInteraction();
+  }
+
+  restorePendingInteraction(pending: PendingInteraction): void {
+    this.interactionService.setPendingInteraction(pending);
+    this.setState('WAITING_CONFIRMATION');
   }
 
   shouldTreatPendingInputAsNewRequest(input: string): boolean {
@@ -258,6 +280,27 @@ export class Agent {
 
   getLastStopReason(): 'completed' | 'tool_limit' | 'max_iterations' | 'error' {
     return this.lastStopReason;
+  }
+
+  getUnifiedStateSnapshot(taskBinding?: AgentTaskBindingSnapshot, checkpoint?: AgentGraphCheckpoint): UnifiedAgentState {
+    return {
+      state: this.state,
+      lastUserInput: this.lastUserInput,
+      runtimeMemoryContext: this.runtimeMemoryContext || undefined,
+      messages: this.getMessages(),
+      taskBinding,
+      pendingInteraction: this.interactionService.getPendingInteractionSnapshot(),
+      planResume: this.interactionService.getPlanResumeSnapshot(),
+      toolBudget: {
+        iteration: this.iteration,
+        toolCallCount: this.toolCallCount,
+        maxToolCallsPerTurn: this.maxToolCallsPerTurn,
+        maxIterations: this.maxIterations,
+        lastStopReason: this.lastStopReason,
+        needsContinuation: this.needsContinuation(),
+      },
+      checkpoint,
+    };
   }
 
   addSkill(skillName: string): void {
@@ -304,26 +347,43 @@ export class Agent {
   }
 
   async chat(input: string): Promise<string> {
-    this.lastUserInput = input;
-    this.beginResponseTurn();
-    this.contextManager.addMessage({ role: 'user', content: input });
-    await this.knownGapManager.prepare(input);
+    return this.chatWithResolvedInput(input, input);
+  }
 
-    const isComplex = await this.planningService.detectComplexTask(input);
+  async chatWithResolvedInput(originalInput: string, effectiveInput: string): Promise<string> {
+    this.lastUserInput = effectiveInput;
+    this.maxToolCallsPerTurn = this.resolveDynamicToolBudget(effectiveInput);
+    this.beginResponseTurn();
+    this.contextManager.addMessage({ role: 'user', content: originalInput });
+    await this.knownGapManager.prepare(effectiveInput);
+
+    const ambiguousShortInputPrompt = this.planningService.buildAmbiguousShortInputPrompt(effectiveInput);
+    if (ambiguousShortInputPrompt) {
+      this.interactionService.setPendingInteraction({
+        type: 'task_clarification',
+        originalTask: effectiveInput,
+        prompt: ambiguousShortInputPrompt,
+      });
+      this.contextManager.addMessage({ role: 'assistant', content: ambiguousShortInputPrompt });
+      this.setState('WAITING_CONFIRMATION');
+      return ambiguousShortInputPrompt;
+    }
+
+    const isComplex = await this.planningService.detectComplexTask(effectiveInput);
 
     if (isComplex) {
-      const clarificationPrompt = this.interactionService.buildTaskClarificationPrompt(input);
+      const clarificationPrompt = this.interactionService.buildTaskClarificationPrompt(effectiveInput);
       if (clarificationPrompt) {
         this.interactionService.setPendingInteraction({
           type: 'task_clarification',
-          originalTask: input,
+          originalTask: effectiveInput,
           prompt: clarificationPrompt,
         });
         this.contextManager.addMessage({ role: 'assistant', content: clarificationPrompt });
         this.setState('WAITING_CONFIRMATION');
         return clarificationPrompt;
       }
-      return this.planningService.chatWithPlanning(input);
+      return this.planningService.chatWithPlanning(effectiveInput);
     }
 
     const response = await this.generateResponse();
@@ -340,6 +400,10 @@ export class Agent {
 
   async detectComplexTask(input: string): Promise<boolean> {
     return this.planningService.detectComplexTask(input);
+  }
+
+  isGenericPlan(plan: Plan, input: string): boolean {
+    return this.isGenericPlanView(plan, input);
   }
 
   async executePlan(originalTask: string, plan: Plan, startStepIndex = 0, existingResults: string[] = []): Promise<string> {
@@ -366,12 +430,55 @@ export class Agent {
     this.lastStopReason = 'completed';
   }
 
+  private resolveDynamicToolBudget(input: string): number {
+    const normalized = input.trim();
+    if (!normalized) {
+      return this.configuredMaxToolCallsPerTurn;
+    }
+
+    const hasResearchIntent = /(搜索|查找|查询|检索|调研|搜集|资料|总结|整理|汇总|分析)/i.test(normalized);
+    const hasExportIntent = /(导出|转换|转成|转为|保存成|保存为|生成).*(pdf|docx|word|ppt|pptx|xlsx|excel|文档|报告)|\b(pdf|docx|pptx|xlsx)\b/i.test(normalized);
+    const hasDeliveryIntent = /(飞书|lark).*(发送|发(?:到|给|我)?|推送)|(?:发送|发(?:到|给|我)?|推送).*(飞书|lark)/i.test(normalized);
+    const hasCodeWorkflowIntent = /(代码|修复|排查|调试|测试|构建|编译|lint|报错|error|bug|重构)/i.test(normalized);
+    const hasExplicitToolWorkflowIntent = /(文件|目录|命令|浏览器|打开|读取|查看|保存|导出|飞书|搜索|测试)/i.test(normalized);
+
+    if (hasResearchIntent && hasExportIntent && hasDeliveryIntent) {
+      return Math.max(this.configuredMaxToolCallsPerTurn, 36);
+    }
+
+    if ((hasResearchIntent && hasDeliveryIntent) || (hasExportIntent && hasDeliveryIntent)) {
+      return Math.max(this.configuredMaxToolCallsPerTurn, 30);
+    }
+
+    if (hasCodeWorkflowIntent) {
+      return Math.max(this.configuredMaxToolCallsPerTurn, 28);
+    }
+
+    if (hasResearchIntent || hasExportIntent || hasDeliveryIntent) {
+      return Math.max(this.configuredMaxToolCallsPerTurn, 24);
+    }
+
+    if (!hasExplicitToolWorkflowIntent) {
+      return Math.min(this.configuredMaxToolCallsPerTurn, 12);
+    }
+
+    return this.configuredMaxToolCallsPerTurn;
+  }
+
   getMessages(): Message[] {
     return this.contextManager.getMessages();
   }
 
   getMessagesForLLM(): Message[] {
     return this.getMessagesForLLMView();
+  }
+
+  resolvePlannedToolArgs(args: Record<string, unknown>): Record<string, unknown> {
+    return this.resolvePlannedToolArgsView(args);
+  }
+
+  async executeToolCall(toolCall: ToolCall): Promise<ToolResult> {
+    return this.executeToolCallView(toolCall);
   }
 
   appendMessage(message: Message): void {

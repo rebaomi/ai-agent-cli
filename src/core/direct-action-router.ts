@@ -7,12 +7,22 @@ import { LarkDeliveryWorkflow } from './workflows/lark-delivery.js';
 import { createDirectActionRuntimeComponents } from './direct-action-runtime-factory.js';
 import { DirectActionDispatchService } from './direct-action-dispatch-service.js';
 import type { IntentResolver } from './intent-resolver.js';
+import type { SessionTaskRecord } from '../types/index.js';
 
 export interface DirectActionResult {
   handled: boolean;
   title?: string;
   output?: string;
   isError?: boolean;
+  handlerName?: string;
+  category?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface DirectActionBindingContext {
+  effectiveInput?: string;
+  isFollowUp?: boolean;
+  boundTask?: SessionTaskRecord;
 }
 
 export interface DirectActionRouterOptions {
@@ -24,6 +34,7 @@ export interface DirectActionRouterOptions {
   getConversationMessages?: () => Message[];
   memoryProvider?: MemoryProvider;
   intentResolver?: IntentResolver;
+  onConversationPreamble?: (message: string) => Promise<void> | void;
 }
 
 export class DirectActionRouter {
@@ -40,11 +51,35 @@ export class DirectActionRouter {
       handlers: () => runtimeComponents.handlers,
       tryLegacyFallbacks: (input) => runtimeComponents.toolSupport.tryLegacyFallbacks(input),
       resolveIntent: options.intentResolver ? (input) => options.intentResolver!.resolve(input) : undefined,
+      conversationMode: this.resolveConversationMode(options.config),
+      onConversationPreamble: options.onConversationPreamble,
     });
   }
 
-  async tryHandle(input: string): Promise<DirectActionResult | null> {
-    return this.dispatchService.tryHandle(input);
+  async tryHandle(input: string, binding?: DirectActionBindingContext): Promise<DirectActionResult | null> {
+    return this.dispatchService.tryHandle({
+      originalInput: input,
+      effectiveInput: binding?.effectiveInput || input,
+      isFollowUp: binding?.isFollowUp === true,
+      boundTask: binding?.boundTask,
+    });
+  }
+
+  private resolveConversationMode(config: unknown): { enabled: boolean; preambleThreshold: number } {
+    const normalized = config && typeof config === 'object' ? config as Record<string, unknown> : {};
+    const directAction = normalized.directAction && typeof normalized.directAction === 'object'
+      ? normalized.directAction as Record<string, unknown>
+      : {};
+    const conversationMode = directAction.conversationMode && typeof directAction.conversationMode === 'object'
+      ? directAction.conversationMode as Record<string, unknown>
+      : {};
+
+    return {
+      enabled: conversationMode.enabled !== false,
+      preambleThreshold: typeof conversationMode.preambleThreshold === 'number' && Number.isFinite(conversationMode.preambleThreshold)
+        ? conversationMode.preambleThreshold
+        : 2,
+    };
   }
 }
 

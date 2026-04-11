@@ -24,6 +24,7 @@ export class TaskSynthesisService {
     const totalSteps = stepResults.length;
     const allSucceeded = failedSteps === 0 && totalSteps > 0;
     const partiallySucceeded = failedSteps > 0 && completedSteps > 0;
+    const overallStatus = allSucceeded ? 'completed' : partiallySucceeded ? 'partial' : 'failed';
 
     let finalResponse = allSucceeded
       ? '## ✅ 任务完成\n\n'
@@ -41,13 +42,14 @@ export class TaskSynthesisService {
     if (!allSucceeded) {
       finalResponse += `\n**最终状态**: ${partiallySucceeded ? '部分完成，至少一个关键步骤失败。' : '执行失败，未达到任务要求。'}`;
     }
+    finalResponse += `\n\n**下一步建议**: ${this.buildNextStepSuggestion(overallStatus)}`;
 
     await this.archiveTaskSummary(
       originalTask,
       stepResults,
       completedSteps,
       totalSteps,
-      allSucceeded ? 'completed' : partiallySucceeded ? 'partial' : 'failed',
+      overallStatus,
     );
 
     this.options.onResponse?.(finalResponse);
@@ -109,5 +111,17 @@ export class TaskSynthesisService {
         content: `Memory provider 归档失败: ${error instanceof Error ? error.message : String(error)}`,
       });
     }
+  }
+
+  private buildNextStepSuggestion(status: 'completed' | 'partial' | 'failed'): string {
+    if (status === 'completed') {
+      return '如果你愿意，我可以继续帮你做结果验证、补测试/文档，或者把这次流程沉淀成可复用模板。';
+    }
+
+    if (status === 'partial') {
+      return '如果你愿意，我可以先定位失败步骤，再继续补跑剩余部分，或者把当前已完成结果整理成可交付输出。';
+    }
+
+    return '如果你愿意，我可以先排查失败原因，缩小问题范围，再给你一个更稳的修复或执行方案。';
   }
 }

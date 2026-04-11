@@ -15,6 +15,9 @@ import { writePptxDocument } from '../utils/pptx-export.js';
 import { writeXlsxDocument } from '../utils/xlsx-export.js';
 import { runBrowserAutomation, resolveBrowserExecutable, type BrowserAutomationAction, type BrowserTarget } from '../utils/browser-automation.js';
 import { resolveOutputPath, resolveUserPath } from '../utils/path-resolution.js';
+import { BrowserAgentService } from '../browser-agent/service.js';
+import type { AgentConfig, BrowserAgentConfig } from '../types/index.js';
+import { BrowserSafetyInterruptionError, SensitiveOperationGuard } from '../browser-agent/safety/sensitive-operation-guard.js';
 
 const execAsync = promisify(exec);
 
@@ -133,6 +136,7 @@ export class BuiltInTools {
       { ...this.grepTool(), category: 'file_operations' },
       { ...this.globTool(), category: 'file_operations' },
       { ...this.readMultipleFilesTool(), category: 'file_operations' },
+      { ...this.openPathTool(), category: 'file_operations' },
       { ...this.txtToDocxTool(), category: 'file_operations' },
       { ...this.txtToPdfTool(), category: 'file_operations' },
       { ...this.txtToPptxTool(), category: 'file_operations' },
@@ -148,6 +152,7 @@ export class BuiltInTools {
       { ...this.fetchUrlTool(), category: 'search_fetch' },
       { ...this.openBrowserTool(), category: 'search_fetch' },
       { ...this.browserAutomateTool(), category: 'search_fetch' },
+      { ...this.browserAgentRunTool(), category: 'search_fetch' },
       { ...this.getWeatherTool(), category: 'search_fetch' },
 
       // Agents & Tasks
@@ -683,25 +688,57 @@ export class BuiltInTools {
     };
   }
 
+  private openPathTool(): Tool {
+    return {
+      name: 'open_path',
+      description: 'Open a local file or directory with the system default application',
+      input_schema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Local file or directory path to open' },
+          background: { type: 'boolean', description: 'Open in background when supported' },
+        },
+        required: ['path'],
+      },
+    };
+  }
+
   private browserAutomateTool(): Tool {
     return {
       name: 'browser_automate',
-      description: 'Use Playwright to open a page and perform scripted browser actions such as click, fill, wait, extract text, and screenshot',
+      description: 'Use Playwright to open a page and perform scripted browser actions such as click, fill, wait, extract text, screenshot, evaluate_script, call_userscript_api, and toggle_userscript_mode. It inherits browserAgent extension and injected script settings by default.',
       input_schema: {
         type: 'object',
         properties: {
           url: { type: 'string', description: 'Initial URL to open' },
           actions: {
             type: 'array',
-            description: 'Browser action list. Supported types: goto, click, fill, press, wait_for_selector, wait, extract_text, screenshot',
+            description: 'Browser action list. Supported types: goto, click, fill, press, wait_for_selector, wait, extract_text, screenshot, evaluate_script, call_userscript_api, toggle_userscript_mode',
             items: { type: 'object' },
           },
-          browser: { type: 'string', description: 'Browser target for automation: chrome, edge, or chromium. Default chrome' },
-          headless: { type: 'boolean', description: 'Run browser headless by default; set false to show the browser window' },
+          browser: { type: 'string', description: 'Browser target for automation: chrome, edge, or chromium. Defaults to browserAgent.browser or chrome' },
+          headless: { type: 'boolean', description: 'Run browser headless by default; set false to show the browser window. Defaults to browserAgent.headless or true' },
           keepOpen: { type: 'boolean', description: 'Keep the browser window open after automation completes' },
-          timeoutMs: { type: 'number', description: 'Default timeout for actions in milliseconds' },
+          timeoutMs: { type: 'number', description: 'Default timeout for actions in milliseconds. Defaults to browserAgent.timeoutMs or 15000' },
         },
         required: ['url'],
+      },
+    };
+  }
+
+  private browserAgentRunTool(): Tool {
+    return {
+      name: 'browser_agent_run',
+      description: 'Run the smart browser agent skeleton for complex browser tasks with Ollama-first model routing',
+      input_schema: {
+        type: 'object',
+        properties: {
+          goal: { type: 'string', description: 'Natural language browser task goal' },
+          startUrl: { type: 'string', description: 'Optional initial URL' },
+          maxSteps: { type: 'number', description: 'Optional max browser-agent steps' },
+          workflow: { type: 'string', description: 'Optional Markdown browser workflow path; relative paths resolve from workspace or browser workflow directory' },
+        },
+        required: ['goal'],
       },
     };
   }
@@ -1250,7 +1287,8 @@ export class BuiltInTools {
 
   async executeTool(name: string, args: unknown): Promise<ToolResult> {
     try {
-      let result: string;
+      let result = '';
+      let directResult: ToolResult | undefined;
 
       switch (name) {
         case 'read_file':
@@ -1457,6 +1495,12 @@ export class BuiltInTools {
           break;
         }
 
+        case 'open_path': {
+          const { path: filePath, background } = args as { path: string; background?: boolean };
+          result = await this.openPath(filePath, background ?? false);
+          break;
+        }
+
         case 'browser_automate': {
           const { url, actions, headless, keepOpen, timeoutMs, browser } = args as {
             url: string;
@@ -1466,7 +1510,13 @@ export class BuiltInTools {
             keepOpen?: boolean;
             timeoutMs?: number;
           };
-          result = await this.browserAutomate(url, actions ?? [], browser ?? 'chrome', headless ?? true, keepOpen ?? false, timeoutMs ?? 15000);
+          result = await this.browserAutomate(url, actions ?? [], browser, headless, keepOpen ?? false, timeoutMs);
+          break;
+        }
+
+        case 'browser_agent_run': {
+          const { goal, startUrl, maxSteps, workflow } = args as { goal: string; startUrl?: string; maxSteps?: number; workflow?: string };
+          directResult = await this.browserAgentRun(goal, startUrl, maxSteps, workflow);
           break;
         }
 
@@ -1708,12 +1758,30 @@ export class BuiltInTools {
           return { tool_call_id: '', output: `Unknown tool: ${name}`, is_error: true };
       }
 
+      if (directResult) {
+        return directResult;
+      }
+
       return {
         tool_call_id: '',
         output: result,
         content: [{ type: 'text', text: result }],
       };
     } catch (error) {
+      if (error instanceof BrowserSafetyInterruptionError) {
+        return {
+          tool_call_id: '',
+          output: error.assessment.reason,
+          content: [{ type: 'text', text: error.assessment.reason }],
+          is_error: true,
+          errorType: error.errorType,
+          statusCode: error.statusCode,
+          metadata: {
+            safety: error.assessment,
+          },
+        };
+      }
+
       const errorText = `Error: ${error instanceof Error ? error.message : String(error)}`;
       return {
         tool_call_id: '',
@@ -2222,16 +2290,137 @@ export class BuiltInTools {
     }
   }
 
-  private async browserAutomate(url: string, actions: BrowserAutomationAction[], browser: BrowserTarget, headless: boolean, keepOpen: boolean, timeoutMs: number): Promise<string> {
+  private async openPath(filePath: string, background: boolean): Promise<string> {
+    try {
+      const resolvedPath = this.resolveInputPath(filePath);
+      const isWindows = process.platform === 'win32';
+      const isMac = process.platform === 'darwin';
+      let command: string;
+
+      if (!existsSync(resolvedPath)) {
+        return `Failed to open path: 文件或目录不存在 ${resolvedPath}`;
+      }
+
+      if (isWindows) {
+        command = `start "" "${resolvedPath}"`;
+      } else if (isMac) {
+        command = `open ${background ? '-g ' : ''}"${resolvedPath}"`;
+      } else {
+        command = background
+          ? `xdg-open "${resolvedPath}" > /dev/null 2>&1 &`
+          : `xdg-open "${resolvedPath}"`;
+      }
+
+      await execAsync(command);
+      return `Opened path: ${resolvedPath}`;
+    } catch (error) {
+      return `Failed to open path: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  private async browserAutomate(url: string, actions: BrowserAutomationAction[], browser?: BrowserTarget, headless?: boolean, keepOpen: boolean = false, timeoutMs?: number): Promise<string> {
+    const appConfig = this.config as AgentConfig | undefined;
+    const browserAgentConfig = appConfig?.browserAgent;
+    const guard = new SensitiveOperationGuard(appConfig?.browserAgent?.safety);
+    const assessment = guard.checkAutomationRequest({ url, actions });
+    if (assessment) {
+      throw new BrowserSafetyInterruptionError(assessment);
+    }
+
+    const environment = this.getBrowserAutomationEnvironment();
     return runBrowserAutomation({
       url,
       actions,
-      browser,
-      headless,
+      browser: browser ?? browserAgentConfig?.browser ?? 'chrome',
+      executablePath: environment.executablePath,
+      headless: headless ?? browserAgentConfig?.headless ?? true,
       keepOpen,
-      timeoutMs,
+      timeoutMs: timeoutMs ?? browserAgentConfig?.timeoutMs ?? 15000,
+      workspace: environment.workspace,
+      appBaseDir: environment.appBaseDir,
+      artifactOutputDir: environment.artifactOutputDir,
+      documentOutputDir: environment.documentOutputDir,
+      userDataDir: environment.userDataDir,
+      extensionPaths: environment.extensionPaths,
+      initScriptPaths: environment.initScriptPaths,
+      initScripts: environment.initScripts,
+      pageScriptPaths: environment.pageScriptPaths,
+      pageScripts: environment.pageScripts,
+      userscripts: environment.userscripts,
+      expectResultMismatchStrategy: environment.expectResultMismatchStrategy,
+      safetyConfig: environment.safetyConfig,
       resolveOutputPath: (requestedPath?: string) => this.resolveOutputFilePath(requestedPath || path.join('browser', `screenshot-${Date.now()}.png`)),
     });
+  }
+
+  private getBrowserAutomationEnvironment(): {
+    workspace?: string;
+    appBaseDir?: string;
+    artifactOutputDir?: string;
+    documentOutputDir?: string;
+    executablePath?: string;
+    userDataDir?: string;
+    extensionPaths?: string[];
+    initScriptPaths?: string[];
+    initScripts?: string[];
+    pageScriptPaths?: string[];
+    pageScripts?: string[];
+    userscripts?: BrowserAgentConfig['userscripts'];
+    expectResultMismatchStrategy?: BrowserAgentConfig['expectResultMismatchStrategy'];
+    safetyConfig?: BrowserAgentConfig['safety'];
+  } {
+    const appConfig = this.config as AgentConfig | undefined;
+    const browserAgentConfig = appConfig?.browserAgent;
+    const pathOptions = this.getPathResolutionOptions();
+
+    return {
+      workspace: pathOptions.workspace,
+      appBaseDir: pathOptions.appBaseDir,
+      artifactOutputDir: pathOptions.artifactOutputDir,
+      documentOutputDir: pathOptions.documentOutputDir,
+      executablePath: browserAgentConfig?.executablePath,
+      userDataDir: browserAgentConfig?.userDataDir,
+      extensionPaths: browserAgentConfig?.extensionPaths,
+      initScriptPaths: browserAgentConfig?.initScriptPaths,
+      initScripts: browserAgentConfig?.initScripts,
+      pageScriptPaths: browserAgentConfig?.pageScriptPaths,
+      pageScripts: browserAgentConfig?.pageScripts,
+      userscripts: browserAgentConfig?.userscripts,
+      expectResultMismatchStrategy: browserAgentConfig?.expectResultMismatchStrategy,
+      safetyConfig: browserAgentConfig?.safety,
+    };
+  }
+
+  private async browserAgentRun(goal: string, startUrl?: string, maxSteps?: number, workflow?: string): Promise<ToolResult> {
+    const appConfig = this.config as AgentConfig | undefined;
+    const browserAgentConfig = appConfig?.browserAgent as BrowserAgentConfig | undefined;
+
+    if (!browserAgentConfig?.enabled) {
+      return {
+        tool_call_id: '',
+        output: 'Browser Agent 未启用。请在配置文件中设置 browserAgent.enabled: true',
+        content: [{ type: 'text', text: 'Browser Agent 未启用。请在配置文件中设置 browserAgent.enabled: true' }],
+        is_error: true,
+      };
+    }
+
+    const service = new BrowserAgentService(appConfig || { ollama: { baseUrl: 'http://localhost:11434', model: 'llama3.2' } } as AgentConfig, browserAgentConfig);
+    const result = await service.run({
+      goal,
+      startUrl,
+      maxSteps,
+      workflowPath: workflow ? this.resolveInputPath(workflow) : undefined,
+    });
+
+    return {
+      tool_call_id: '',
+      output: JSON.stringify(result, null, 2),
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      is_error: result.status === 'failed',
+      errorType: result.errorType,
+      statusCode: result.statusCode,
+      metadata: result.safety ? { safety: result.safety, status: result.status } : { status: result.status },
+    };
   }
 
   private evaluateRepl(code: string): string {

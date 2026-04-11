@@ -299,6 +299,10 @@ export class PermissionManager {
 
     if (dangerousTypes.includes(type)) {
       if (type === 'command_execute' && resource) {
+        if (this.isSafeReadOnlyCommand(resource)) {
+          return false;
+        }
+
         const parts = resource.split(' ');
         const cmd = parts[0] || '';
         if (cmd && this.config.trustedCommands.includes(cmd)) {
@@ -319,6 +323,82 @@ export class PermissionManager {
     }
 
     return false;
+  }
+
+  private isSafeReadOnlyCommand(resource: string): boolean {
+    const normalized = resource.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const parts = normalized.split(/\s+/).filter(Boolean);
+    if (this.isSafeCommandProbe(parts)) {
+      return true;
+    }
+
+    if (this.isSafeShellInspectionCommand(parts)) {
+      return true;
+    }
+
+    if (this.isSafeLarkCliHelpCommand(parts)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private isSafeCommandProbe(parts: string[]): boolean {
+    if (parts.length !== 2) {
+      return false;
+    }
+
+    const command = parts[0];
+    const target = parts[1];
+    if (!command || !target) {
+      return false;
+    }
+
+    const safeProbeCommands = new Set(['where', 'which']);
+    const safeProbeTargets = new Set(['lark-cli', 'lark-cli.exe', 'lark-cli.cmd', 'lark-cli.bat']);
+    return safeProbeCommands.has(command) && safeProbeTargets.has(target);
+  }
+
+  private isSafeShellInspectionCommand(parts: string[]): boolean {
+    const command = parts[0] || '';
+
+    if (command === 'get-location') {
+      return parts.length === 1;
+    }
+
+    if (command === 'get-childitem') {
+      return parts.length === 1;
+    }
+
+    if (parts.length === 1) {
+      return new Set(['pwd', 'dir', 'ls', 'where', 'which']).has(command);
+    }
+
+    return false;
+  }
+
+  private isSafeLarkCliHelpCommand(parts: string[]): boolean {
+    const command = parts[0] || '';
+    if (!new Set(['lark-cli', 'lark-cli.exe', 'lark-cli.cmd', 'lark-cli.bat']).has(command)) {
+      return false;
+    }
+
+    if (parts.length === 1) {
+      return false;
+    }
+
+    const remaining = parts.slice(1);
+    if (remaining.length === 1) {
+      return new Set(['--help', '-h', '--version', 'version', 'help']).has(remaining[0] || '');
+    }
+
+    return remaining.length === 2
+      && remaining[0] === 'auth'
+      && remaining[1] === 'status';
   }
 
   async requestPermission(

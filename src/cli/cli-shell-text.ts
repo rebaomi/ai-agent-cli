@@ -20,11 +20,16 @@ ${chalk.bold('Quick Commands:')}
   ${chalk.cyan('/tools')}    ${chalk.gray('List tools')}
   ${chalk.cyan('/news')}     ${chalk.gray('Tencent news shortcuts')}
   ${chalk.cyan('/browser')}  ${chalk.gray('Open or automate browser pages')}
+  ${chalk.cyan('/vision')}   ${chalk.gray('Analyze images in a directory with Ollama vision model')}
   ${chalk.cyan('/mode')}     ${chalk.gray('Switch active input source: cli or feishu')}
+  ${chalk.cyan('/function')} ${chalk.gray('Switch high-level function mode: workflow or chat')}
+  ${chalk.cyan('/agent-mode')} ${chalk.gray('Legacy alias of /function')}
   ${chalk.cyan('/split')}    ${chalk.gray('Toggle split view for output/process panes')}
   ${chalk.cyan('/relay')}    ${chalk.gray('Show/reconnect Lark relay')}
   ${chalk.cyan('/config')}   ${chalk.gray('Show/reload/edit config')}
   ${chalk.cyan('/model')}    ${chalk.gray('Show/change model')}
+  ${chalk.cyan('/progress')} ${chalk.gray('Show active progress and task bindings')}
+  ${chalk.cyan('/task-context')} ${chalk.gray('Show task stack; supports --json and inspect')}
   ${chalk.cyan('/sessions')} ${chalk.gray('Show sessions')}
   ${chalk.cyan('/cron')}     ${chalk.gray('Manage cron jobs')}
   ${chalk.cyan('/daemon')}   ${chalk.gray('Show/control background daemon')}
@@ -49,6 +54,10 @@ ${chalk.cyan('/config update')}     Reload config from file and refresh runtime
 ${chalk.cyan('/config reload')}     Alias of /config update
 ${chalk.cyan('/mode status')}       Show current input mode and relay status
 ${chalk.cyan('/mode switch')} <name> Switch active input source (cli or feishu)
+${chalk.cyan('/function status')}    Show current function mode (workflow or chat)
+${chalk.cyan('/function switch')} <name> Switch function mode (workflow or chat)
+${chalk.cyan('/agent-mode status')}  Legacy alias of /function status
+${chalk.cyan('/agent-mode switch')} <name> Legacy alias of /function switch
 ${chalk.cyan('/split status')}      Show split view status
 ${chalk.cyan('/split on')}          Enable split view: left=result, right=process
 ${chalk.cyan('/split off')}         Disable split view
@@ -69,6 +78,9 @@ ${chalk.cyan('/lsp')}              Manage LSP servers
 ${chalk.cyan('/skill')}            Manage skills
 ${chalk.cyan('/news')}             Tencent news shortcuts (hot/search/morning/evening)
 ${chalk.cyan('/browser')}          Open or automate browser pages
+${chalk.cyan('/vision')}           Analyze images in a directory with Ollama vision model
+${chalk.cyan('/progress, /p')}     Show active progress plus task-stack context
+${chalk.cyan('/task-context')} [--json|inspect] Show active task and recent follow-up bindings
 ${chalk.cyan('/cron')}             Manage cron jobs
 ${chalk.cyan('/daemon')}           Show/control background daemon
 ${chalk.cyan('/org, /team')}        Manage organization/team (view, load, mode)

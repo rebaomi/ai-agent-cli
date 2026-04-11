@@ -1,4 +1,5 @@
 import { inspect } from 'util';
+import { normalizeDisplayText } from '../utils/text-repair.js';
 
 type Panel = 'left' | 'right';
 
@@ -312,11 +313,11 @@ export class SplitScreenRenderer {
   }
 
   private normalizePanelText(value: string): string {
-    return value
+    return normalizeDisplayText(value
       .replace(/\x1b\][^\u0007]*(?:\u0007|\x1b\\)/g, '')
       .replace(/\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
       .replace(/\r\n?/g, '\n')
-      .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, '');
+      .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, ''));
   }
 
   private formatArgs(args: unknown[]): string {

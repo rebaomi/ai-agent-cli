@@ -77,9 +77,19 @@ const toolPermissionMappings: ToolPermissionMapping[] = [
     resourceExtractor: (args) => args.url as string | undefined,
   },
   {
+    toolPattern: /^open_path$/,
+    permissionType: 'file_read',
+    resourceExtractor: (args) => args.path as string | undefined,
+  },
+  {
     toolPattern: /^browser_automate$/,
     permissionType: 'browser_automation',
     resourceExtractor: (args) => args.url as string | undefined,
+  },
+  {
+    toolPattern: /^browser_agent_run$/,
+    permissionType: 'browser_automation',
+    resourceExtractor: (args) => (args.workflow as string | undefined) || (args.startUrl as string | undefined),
   },
   {
     toolPattern: /^get_current_time$/,

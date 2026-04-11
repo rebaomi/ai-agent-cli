@@ -52,6 +52,32 @@ export function looksLikeToolErrorText(value: string): boolean {
   return /(^|\n)\[[^\]]+\]\s*error:|(^|\n)error:\s|(^|\n)skill tool error:|unhandled exception:|exception:|directorynotfoundexception|invalid or unexpected token/i.test(normalized);
 }
 
+export function looksLikePlaceholderContent(value: string): boolean {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return false;
+  }
+
+  return /(此处为|此处填写|这里填写|待补充|待完善|待填写|占位|placeholder|lorem ipsum|\btodo\b|\btbd\b|to be added|to be completed|内容详见后续|正文略|内容略)/i.test(normalized);
+}
+
+export function looksLikeIncompleteStructuredDocument(value: string): boolean {
+  if (!looksLikePlaceholderContent(value)) {
+    return false;
+  }
+
+  const normalized = value.replace(/\r/g, '');
+  const headingCount = (normalized.match(/^#{1,6}\s+/gm) || []).length;
+  const sectionKeywords = /(摘要|引言|正文|结论|参考文献|主要应用场景|技术实现架构|典型案例分析|挑战与限制|未来发展趋势)/i;
+  const paragraphLikeLines = normalized
+    .split(/\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => line.length >= 12).length;
+
+  return headingCount >= 3 || (sectionKeywords.test(normalized) && paragraphLikeLines >= 4);
+}
+
 function buildExpectedSnippets(expectedText: string, expectedTitle?: string): string[] {
   const snippets: string[] = [];
   const title = (expectedTitle || '').trim();

@@ -6,9 +6,13 @@ import { deflateRawSync } from 'node:zlib';
 
 import { parseOnboardingInput } from '../src/core/onboarding.js';
 import { CLI } from '../src/cli/index.js';
-import { APP_VERSION, buildCliLogo, isFullHelpShortcut, isQuickHelpShortcut } from '../src/cli/cli-shell-text.js';
+import { configManager } from '../src/core/config.js';
+import { APP_VERSION, buildCliLogo, getFullHelpText, getQuickHelpText, isFullHelpShortcut, isQuickHelpShortcut } from '../src/cli/cli-shell-text.js';
 import { createAgent } from '../src/core/agent.js';
+import { createOllamaVisionService } from '../src/core/ollama-vision-service.js';
 import { createDirectActionRouter } from '../src/core/direct-action-router.js';
+import { IntentResolver } from '../src/core/intent-resolver.js';
+import { BrowserSession, buildChromiumExtensionArgs } from '../src/browser-agent/runtime/browser-session.js';
 import { createContextManager } from '../src/core/context-manager.js';
 import { createPlanner } from '../src/core/planner.js';
 import { createEnhancedMemoryManager } from '../src/core/memory-enhanced.js';
@@ -31,27 +35,42 @@ import { buildFallbackIntentContract } from '../src/core/tool-intent-contract.js
 import { validateToolCallsAgainstContract } from '../src/core/tool-call-validator.js';
 import { HybridClient } from '../src/llm/providers/hybrid.js';
 import { DeepSeekRouterClient } from '../src/llm/providers/deepseek-router.js';
-import { LarkRelayAgent, parseLarkRelayMessageLine } from '../src/lark/relay-agent.js';
+import { LarkRelayAgent, normalizeLarkRelayConfig, parseLarkRelayMessageLine } from '../src/lark/relay-agent.js';
 import { ResponseStreamCollector } from '../src/core/response-stream-collector.js';
 import { FinalResponseAssembler } from '../src/core/final-response-assembler.js';
 import { ResponseTurnExecutor } from '../src/core/response-turn-executor.js';
 import { ResponseTurnProcessor } from '../src/core/response-turn-processor.js';
 import { KnownGapManager } from '../src/core/known-gap-manager.js';
 import { SkillLearningService } from '../src/core/skill-learning-service.js';
+import { createModerator } from '../src/core/content-moderator.js';
 import { PlannedToolArgsResolver } from '../src/core/planned-tool-args-resolver.js';
 import { AgentInteractionService } from '../src/core/agent-interaction-service.js';
+import { buildTaskContextJsonPayload, createAgentCheckpoint } from '../src/core/agent-graph-state.js';
+import { createAgentGraphRunner } from '../src/core/agent-graph-runner.js';
 import { TaskSynthesisService } from '../src/core/task-synthesis-service.js';
 import { AgentToolCallService } from '../src/core/agent-tool-call-service.js';
+import { ToolExecutionGuard } from '../src/core/tool-execution-guard.js';
+import { DirectActionDispatchService } from '../src/core/direct-action-dispatch-service.js';
+import { ChatRouter } from '../src/core/chat-router.js';
+import { TaskExecutorService } from '../src/core/task-executor-service.js';
+import { SessionTaskStackManager } from '../src/core/session-task-stack-manager.js';
 import { DirectActionArtifactSupport } from '../src/core/direct-actions/artifact-support.js';
 import { DirectActionExportSupport } from '../src/core/direct-actions/export-support.js';
 import { DirectActionKnownGapSupport } from '../src/core/direct-actions/known-gap-support.js';
 import { DirectActionRoutingSupport } from '../src/core/direct-actions/routing-support.js';
 import { DirectActionToolSupport } from '../src/core/direct-actions/tool-support.js';
+import { BrowserActionHandler } from '../src/core/direct-actions/handlers/browser-action-handler.js';
+import { BrowserWorkflowService } from '../src/browser-agent/workflows/browser-workflow-service.js';
+import { buildBrowserWorkflowQuickFixDrafts } from '../src/browser-agent/workflows/browser-workflow-quick-fix.js';
+import { BrowserActionPlanner } from '../src/browser-agent/planner/action-planner.js';
+import { runBrowserAutomation } from '../src/utils/browser-automation.js';
 import { extractDocxText, validateDocxContent } from '../src/utils/docx-validation.js';
 import { extractPdfText } from '../src/utils/pdf-validation.js';
 import { extractPptxText } from '../src/utils/pptx-validation.js';
 import { extractXlsxText } from '../src/utils/xlsx-validation.js';
+import { repairHighBitAsciiMojibake } from '../src/utils/text-repair.js';
 import type { LLMProviderInterface, LLMResponse, LLMStreamChunk } from '../src/llm/types.js';
+import { TASK_CONTEXT_SCHEMA_VERSION } from '../src/types/index.js';
 import type { Message, Tool, ToolCall } from '../src/types/index.js';
 
 process.env.AI_AGENT_CLI_QUIET_SKILL_LOGS = '1';
@@ -271,6 +290,46 @@ async function testPermissionAskToggle(tempDir: string): Promise<void> {
   assert.equal(granted, false);
 }
 
+async function testPermissionManagerAllowsLarkCliLocatorProbe(tempDir: string): Promise<void> {
+  const permissionDir = path.join(tempDir, 'permissions-safe-probe');
+  const manager = new PermissionManager(permissionDir);
+  await manager.initialize();
+  manager.setAskForPermissions(false);
+
+  const windowsGranted = await manager.requestPermission('command_execute', 'where lark-cli');
+  assert.equal(windowsGranted, true);
+
+  const unixGranted = await manager.requestPermission('command_execute', 'which lark-cli');
+  assert.equal(unixGranted, true);
+}
+
+async function testPermissionManagerAllowsReadOnlyShellCommands(tempDir: string): Promise<void> {
+  const permissionDir = path.join(tempDir, 'permissions-readonly-shell');
+  const manager = new PermissionManager(permissionDir);
+  await manager.initialize();
+  manager.setAskForPermissions(false);
+
+  assert.equal(await manager.requestPermission('command_execute', 'dir'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'pwd'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'where'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'Get-Location'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'Get-ChildItem'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'echo hello'), false);
+}
+
+async function testPermissionManagerAllowsLarkCliHelpCommands(tempDir: string): Promise<void> {
+  const permissionDir = path.join(tempDir, 'permissions-lark-help');
+  const manager = new PermissionManager(permissionDir);
+  await manager.initialize();
+  manager.setAskForPermissions(false);
+
+  assert.equal(await manager.requestPermission('command_execute', 'lark-cli --help'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'lark-cli -h'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'lark-cli --version'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'lark-cli auth status'), true);
+  assert.equal(await manager.requestPermission('command_execute', 'lark-cli im +messages-send --chat-id oc_xxx --text hi'), false);
+}
+
 async function testSandboxAllowedPathNormalization(tempDir: string): Promise<void> {
   const allowedDir = path.join(tempDir, 'sandbox');
   const siblingDir = path.join(tempDir, 'sandbox-other');
@@ -294,6 +353,675 @@ async function testSandboxAllowedPathNormalization(tempDir: string): Promise<voi
     sandbox.readFile(siblingFile),
     /Path not allowed/,
   );
+}
+
+async function testPhaseAwareWorkflowLintAndQuickFixes(tempDir: string): Promise<void> {
+  const workflowDir = path.join(tempDir, 'browser-workflows');
+  await fs.mkdir(workflowDir, { recursive: true });
+
+  const validWorkflowPath = path.join(workflowDir, 'phase-valid.md');
+  const invalidWorkflowPath = path.join(workflowDir, 'phase-invalid.md');
+
+  await fs.writeFile(validWorkflowPath, `---
+name: phase-valid
+description: Valid phase-aware workflow
+match:
+  - example.com
+priority: 100
+selectorSlots:
+  searchBox:
+    - input[name="q"]
+scripts:
+  userscriptPaths:
+    - ./scripts/search-helper.user.js
+  userscriptMode: on
+  userscriptRunAt: document-end
+scriptApis:
+  - name: UserscriptBridge.collectResults
+    description: Return structured search results
+    args:
+      - name: limit
+        type: number
+        required: false
+        description: Maximum result count
+      - name: includeAds
+        type: boolean
+    returns:
+      type: array
+      shape: '{ title: string; url: string; sponsored?: boolean }'
+      description: Ordered search results
+---
+
+# phase-valid
+
+## When to Use
+Use this workflow for example.com searches.
+
+## Steps
+1. Open the search page.
+2. Submit the requested query.
+
+## Success
+- At least one search result is available.
+
+## Phase Steps
+### search-input
+1. Fill the search box with the user query.
+2. Submit the form.
+
+### search-results
+1. Read the top result cards.
+
+## Phase Preferred Selectors
+### search-input
+- fill: $searchBox
+
+### search-results
+- extract: main
+
+## Phase Done Conditions
+### search-results
+- textIncludes:result
+`, 'utf-8');
+
+  await fs.writeFile(invalidWorkflowPath, `---
+name: phase-invalid
+description: Invalid phase-aware workflow
+priority: 100
+phases:
+  search-reslts:
+    steps:
+      - typo phase in frontmatter
+---
+
+# phase-invalid
+
+## When to Use
+Broken sample for regression coverage.
+
+## Phase Steps
+### search-reslts
+1. Mistyped phase heading.
+
+### detail
+1. Open a detail card.
+
+## Phase Preferred Selectors
+### detail
+- click: $detailCard
+`, 'utf-8');
+
+  const service = new BrowserWorkflowService({ workflowDir });
+  const inspected = await service.inspectWorkflow(validWorkflowPath);
+  assert.equal(inspected.phaseConfigurations['search-input']?.steps.length, 2);
+  assert.equal(inspected.phaseConfigurations['search-results']?.doneConditions[0], 'textIncludes:result');
+  assert.equal(inspected.scriptBinding?.userscriptPaths[0], './scripts/search-helper.user.js');
+  assert.equal(inspected.scriptBinding?.userscriptMode, 'on');
+  assert.equal(inspected.scriptApis?.[0]?.name, 'UserscriptBridge.collectResults');
+  assert.equal(inspected.scriptApis?.[0]?.args[0]?.name, 'limit');
+  assert.equal(inspected.scriptApis?.[0]?.args[0]?.type, 'number');
+  assert.equal(inspected.scriptApis?.[0]?.args[0]?.required, false);
+  assert.equal(inspected.scriptApis?.[0]?.returns?.type, 'array');
+  assert.equal(inspected.scriptApis?.[0]?.returns?.shape, '{ title: string; url: string; sponsored?: boolean }');
+  assert.equal(inspected.scriptApis?.[0]?.returns?.description, 'Ordered search results');
+
+  const validLint = await service.lintWorkflow(validWorkflowPath);
+  assert.equal(validLint.valid, true);
+  assert.equal(validLint.issueCounts.errors, 0);
+
+  const invalidLint = await service.lintWorkflow(invalidWorkflowPath);
+  assert.equal(invalidLint.valid, false);
+  assert.equal(invalidLint.issues.some(issue => issue.code === 'invalid-phase-name'), true);
+  assert.equal(invalidLint.issues.some(issue => issue.code === 'unknown-selector-slot'), true);
+  assert.equal(invalidLint.issues.some(issue => issue.code === 'missing-phase-success'), true);
+
+  const summary = await service.lintWorkflows();
+  assert.equal(summary.counts.files, 2);
+  assert.equal(summary.counts.valid, 1);
+  assert.equal(summary.counts.invalid, 1);
+  assert.equal(summary.codeCounts.some(item => item.code === 'invalid-phase-name'), true);
+
+  const drafts = buildBrowserWorkflowQuickFixDrafts([invalidLint]);
+  assert.equal(drafts.some(draft => draft.code === 'invalid-phase-name' && draft.count === 2), true);
+  assert.equal(drafts.some(draft => draft.code === 'unknown-selector-slot' && /(selectorSlots|slot)/i.test(draft.summary)), true);
+}
+
+function testSessionTaskStackContextSnapshot(): void {
+  const manager = new SessionTaskStackManager();
+  const baseTask = manager.recordTask({
+    channel: 'direct_action',
+    title: '百度搜索 AI agent',
+    input: '百度搜索 AI agent',
+    effectiveInput: '百度搜索 AI agent',
+    category: 'browser-action',
+    status: 'completed',
+    metadata: { engine: 'baidu', query: 'AI agent' },
+  });
+
+  const followTask = manager.recordTask({
+    channel: 'agent',
+    title: '按刚才那个方式再来',
+    input: '按刚才那个方式再来',
+    effectiveInput: '延续上一任务：百度搜索 AI agent',
+    category: 'agent',
+    status: 'completed',
+    metadata: {
+      boundTaskId: baseTask.id,
+      boundTaskTitle: baseTask.title,
+    },
+  });
+
+  const snapshot = manager.getContextSnapshot(5);
+  assert.equal(snapshot.activeTask?.id, followTask.id);
+  assert.equal(snapshot.recentBindings.length, 1);
+  assert.equal(snapshot.recentBindings[0]?.sourceTask.id, followTask.id);
+  assert.equal(snapshot.recentBindings[0]?.targetTask?.id, baseTask.id);
+}
+
+function testSessionTaskStackBindsShortAdjustmentFollowUp(): void {
+  const manager = new SessionTaskStackManager();
+  manager.recordTask({
+    channel: 'agent',
+    title: '分析数据库应用并发我飞书',
+    input: '帮我分析大模型在数据库领域的应用，整理成 pdf 发我飞书',
+    effectiveInput: '帮我分析大模型在数据库领域的应用，整理成 pdf 发我飞书',
+    category: 'agent',
+    status: 'completed',
+  });
+
+  const binding = manager.resolveInput('改成word发我飞书');
+  assert.equal(binding.isFollowUp, true);
+  assert.match(binding.effectiveInput, /上一任务内容：.*发我飞书/);
+  assert.match(binding.effectiveInput, /保持上一任务的核心目标、交付动作和目标渠道/);
+  assert.match(binding.effectiveInput, /用户跟进：改成word发我飞书/);
+}
+
+function testSessionTaskStackKeepsStandaloneNewTaskUnbound(): void {
+  const manager = new SessionTaskStackManager();
+  manager.recordTask({
+    channel: 'agent',
+    title: '前一个任务',
+    input: '前一个任务',
+    effectiveInput: '前一个任务',
+    category: 'agent',
+    status: 'completed',
+  });
+
+  const binding = manager.resolveInput('帮我分析一下今天 AI 新闻');
+  assert.equal(binding.isFollowUp, false);
+  assert.equal(binding.effectiveInput, '帮我分析一下今天 AI 新闻');
+}
+
+async function testDirectActionConversationPreambleTemplates(): Promise<void> {
+  const createService = (handlerName: string, messages: string[]) => new DirectActionDispatchService({
+    handlers: () => [{
+      name: handlerName,
+      canHandle: async () => true,
+      handle: async () => ({ handled: true }),
+    }],
+    tryLegacyFallbacks: async () => null,
+    conversationMode: {
+      enabled: true,
+      preambleThreshold: 0,
+    },
+    onConversationPreamble: (message) => {
+      messages.push(message);
+    },
+  });
+
+  const browserSearchMessages: string[] = [];
+  await createService('browser-action', browserSearchMessages).tryHandle({
+    originalInput: '请帮我百度搜索 AI agent',
+    effectiveInput: '请帮我百度搜索 AI agent',
+  });
+  assert.equal(browserSearchMessages[0], '我先查一下，做完告诉你结果。');
+
+  const browserOpenMessages: string[] = [];
+  await createService('browser-action', browserOpenMessages).tryHandle({
+    originalInput: '帮我打开 GitHub 看一下',
+    effectiveInput: '帮我打开 GitHub 看一下',
+  });
+  assert.equal(browserOpenMessages[0], '我先打开看看，做完告诉你结果。');
+
+  const documentMessages: string[] = [];
+  await createService('document-action', documentMessages).tryHandle({
+    originalInput: '把刚刚的内容整理成 word 文档',
+    effectiveInput: '把刚刚的内容整理成 word 文档',
+  });
+  assert.equal(documentMessages[0], '我先整理成文档，做完告诉你结果。');
+
+  const followUpMessages: string[] = [];
+  await createService('browser-action', followUpMessages).tryHandle({
+    originalInput: '按刚才那个方式继续',
+    effectiveInput: '延续上一任务：百度搜索 AI agent',
+    isFollowUp: true,
+    boundTask: {
+      id: 'task_prev',
+      channel: 'direct_action',
+      title: '百度搜索 AI agent',
+      input: '百度搜索 AI agent',
+      effectiveInput: '百度搜索 AI agent',
+      category: 'browser-action',
+      status: 'completed',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  assert.equal(followUpMessages[0], '我先按刚才那个任务继续处理，做完告诉你结果。');
+}
+
+async function testIntentResolverRejectsGenericKnowledgeQueryAsBrowserSearch(): Promise<void> {
+  const resolver = new IntentResolver({
+    async generate() {
+      return JSON.stringify({
+        name: 'browser.search',
+        confidence: 0.96,
+        slots: {
+          engine: 'baidu',
+          query: '最近烟台有什么活动',
+        },
+      });
+    },
+  });
+
+  const resolved = await resolver.resolve('最近烟台有什么活动');
+  assert.equal(resolved.name, 'unknown');
+}
+
+function testBrowserActionHandlerRejectsGenericKnowledgeQueryIntent(): void {
+  const handler = new BrowserActionHandler({
+    executeBuiltInTool: async () => ({ handled: true, output: 'ok' }),
+    getConversationMessages: () => [],
+  });
+
+  assert.equal(handler.canHandle('最近烟台有什么活动', {
+    name: 'browser.search',
+    confidence: 0.98,
+    slots: {
+      engine: 'baidu',
+      query: '最近烟台有什么活动',
+    },
+    source: 'llm',
+  }), false);
+
+  assert.equal(handler.canHandle('帮我百度搜索 烟台最近有什么活动', {
+    name: 'browser.search',
+    confidence: 0.98,
+    slots: {
+      engine: 'baidu',
+      query: '烟台最近有什么活动',
+    },
+    source: 'llm',
+  }), true);
+}
+
+async function testBrowserActionHandlerRoutesCompositeWebsiteTaskToBrowserAgent(): Promise<void> {
+  const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const handler = new BrowserActionHandler({
+    executeBuiltInTool: async (toolName, args) => {
+      calls.push({ toolName, args: args as Record<string, unknown> });
+      return { handled: true, output: 'ok' };
+    },
+    getConversationMessages: () => [],
+  });
+
+  const input = '帮我打开网易buff，点击顶部的饰品市场页面，然后滚动下拉';
+
+  assert.equal(handler.canHandle(input), true);
+  await handler.handle(input);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.toolName, 'browser_agent_run');
+  assert.equal(calls[0]?.args.goal, input);
+  assert.equal(calls[0]?.args.startUrl, 'https://buff.163.com');
+}
+
+async function testBrowserActionHandlerRoutesOpenThenSingleOperationToBrowserAgent(): Promise<void> {
+  const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const handler = new BrowserActionHandler({
+    executeBuiltInTool: async (toolName, args) => {
+      calls.push({ toolName, args: args as Record<string, unknown> });
+      return { handled: true, output: 'ok' };
+    },
+    getConversationMessages: () => [],
+  });
+
+  const input = '打开网易buff点击顶部的饰品市场页面';
+
+  assert.equal(handler.canHandle(input), true);
+  await handler.handle(input);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.toolName, 'browser_agent_run');
+  assert.equal(calls[0]?.args.startUrl, 'https://buff.163.com');
+}
+
+async function testSessionTaskStackPersistence(tempDir: string): Promise<void> {
+  const filePath = path.join(tempDir, 'task-stack.json');
+  const manager = new SessionTaskStackManager();
+  const baseTask = manager.recordTask({
+    channel: 'direct_action',
+    title: 'base search',
+    input: 'base search',
+    effectiveInput: 'base search',
+    category: 'browser-action',
+    status: 'completed',
+  });
+  manager.recordTask({
+    channel: 'agent',
+    title: 'follow up',
+    input: 'follow up',
+    effectiveInput: 'continue base search',
+    category: 'agent',
+    status: 'completed',
+    metadata: { boundTaskId: baseTask.id, boundTaskTitle: baseTask.title },
+  });
+  manager.setCheckpoint(createAgentCheckpoint('execute_step', 'running', 'follow up', '执行节点中'));
+
+  await manager.saveToFile(filePath);
+
+  const restored = new SessionTaskStackManager();
+  await restored.loadFromFile(filePath);
+  const snapshot = restored.getContextSnapshot(5);
+  assert.equal(snapshot.recentTasks.length, 2);
+  assert.equal(snapshot.recentBindings[0]?.targetTask?.title, 'base search');
+  assert.equal(snapshot.checkpoint?.node, 'execute_step');
+}
+
+function testTaskContextJsonPayload(): void {
+  const manager = new SessionTaskStackManager();
+  const baseTask = manager.recordTask({
+    channel: 'direct_action',
+    title: 'base search',
+    input: 'base search',
+    effectiveInput: 'base search',
+    category: 'browser-action',
+    status: 'completed',
+  });
+  manager.recordTask({
+    channel: 'agent',
+    title: 'follow up',
+    input: 'follow up',
+    effectiveInput: 'continue base search',
+    category: 'agent',
+    status: 'completed',
+    metadata: { boundTaskId: baseTask.id, boundTaskTitle: baseTask.title },
+  });
+  manager.setCheckpoint(createAgentCheckpoint('finalize', 'completed', 'follow up', '当前回合已完成'));
+
+  const payload = buildTaskContextJsonPayload(manager.getContextSnapshot(10));
+  assert.equal(payload.schemaVersion, TASK_CONTEXT_SCHEMA_VERSION);
+  assert.equal(payload.mode, 'json');
+  assert.equal(payload.taskContext.recentTasks.length, 2);
+  assert.equal(payload.taskContext.checkpoint?.node, 'finalize');
+}
+
+async function testAgentGraphRunnerDirectAction(): Promise<void> {
+  const agent = createAgent({ llm: new StubLLM() });
+  const runner = createAgentGraphRunner({
+    agent,
+    directActionRouter: {
+      async tryHandle() {
+        return {
+          handled: true,
+          title: 'open page',
+          output: 'opened',
+          category: 'browser-action',
+          handlerName: 'BrowserActionHandler',
+        };
+      },
+    } as any,
+  });
+
+  const result = await runner.runTurn({
+    input: '打开百度',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '打开百度',
+    },
+  });
+
+  assert.equal(result.route, 'direct_action');
+  assert.equal(result.graphState.currentNode, 'finalize');
+  assert.equal(result.graphState.status, 'completed');
+  assert.equal(result.taskRecord?.channel, 'direct_action');
+}
+
+async function testAgentGraphRunnerMainChain(): Promise<void> {
+  const plan = {
+    originalTask: '帮我先生成短视频脚本，然后保存成文档',
+    steps: [
+      {
+        id: 'step_1',
+        description: '生成短视频脚本并整理成文档输出',
+      },
+    ],
+  };
+  const fakePlanner = {
+    async createPlan() {
+      return plan;
+    },
+    completeStep() {},
+    failStep() {},
+  };
+  const agent = createAgent({
+    llm: new StubLLM(),
+    planner: fakePlanner as any,
+    maxIterations: 7,
+    maxToolCallsPerTurn: 3,
+  });
+  const transitions: string[] = [];
+  const runner = createAgentGraphRunner({
+    agent,
+    onStateChange: (state) => {
+      transitions.push(`${state.currentNode}:${state.status}`);
+    },
+  });
+
+  const first = await runner.runTurn({
+    input: '帮我先生成短视频脚本，然后保存成文档',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '帮我先生成短视频脚本，然后保存成文档',
+    },
+  });
+  assert.equal(first.route, 'agent');
+  assert.equal(first.graphState.currentNode, 'clarify');
+  assert.equal(first.graphState.pendingInteraction?.type, 'task_clarification');
+
+  const second = await runner.runTurn({
+    input: '输出成 word 文档，放到 artifacts 目录',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '输出成 word 文档，放到 artifacts 目录',
+    },
+    checkpoint: first.checkpoint,
+  });
+  assert.equal(second.graphState.currentNode, 'plan');
+  assert.equal(second.graphState.pendingInteraction?.type, 'plan_execution');
+
+  const third = await runner.runTurn({
+    input: '是',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '是',
+    },
+    checkpoint: second.checkpoint,
+  });
+  assert.equal(transitions.includes('execute_step:running'), true);
+  assert.equal(third.graphState.currentNode, 'finalize');
+  assert.equal(third.graphState.status, 'completed');
+}
+
+async function testAgentGraphRunnerAutoConfirmPlanExecutionOption(): Promise<void> {
+  const plan = {
+    originalTask: '生成周报并导出文档',
+    steps: [
+      {
+        id: 'step_1',
+        description: '生成周报并整理输出',
+      },
+    ],
+  };
+  const fakePlanner = {
+    async createPlan() {
+      return plan;
+    },
+    completeStep() {},
+    failStep() {},
+  };
+  const agent = createAgent({
+    llm: new StubLLM(),
+    planner: fakePlanner as any,
+    maxIterations: 7,
+    maxToolCallsPerTurn: 3,
+  });
+  const runner = createAgentGraphRunner({
+    agent,
+    autoConfirmPlanExecution: true,
+  });
+
+  const first = await runner.runTurn({
+    input: '帮我处理一下',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '帮我处理一下',
+    },
+  });
+  assert.equal(first.graphState.currentNode, 'clarify');
+
+  const second = await runner.runTurn({
+    input: '生成周报并导出成 word 文档，放到 artifacts 目录',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '生成周报并导出成 word 文档，放到 artifacts 目录',
+    },
+    checkpoint: first.checkpoint,
+  });
+
+  assert.equal(second.graphState.currentNode, 'finalize');
+  assert.equal(second.graphState.status, 'completed');
+  assert.equal(second.graphState.pendingInteraction?.type, undefined);
+  assert.match(second.output || '', /任务完成/);
+  assert.equal(second.notices.some(notice => notice.message.includes('自动确认计划')), true);
+}
+
+async function testAgentGraphRunnerCheckpointRestorePlan(): Promise<void> {
+  const plan = {
+    originalTask: '帮我先生成短视频脚本，然后保存成文档',
+    steps: [
+      { id: 'step_1', description: '生成短视频脚本并整理成文档输出' },
+    ],
+  };
+  const fakePlanner = {
+    async createPlan() {
+      return plan;
+    },
+    completeStep() {},
+    failStep() {},
+  };
+
+  const firstAgent = createAgent({ llm: new StubLLM(), planner: fakePlanner as any });
+  const firstRunner = createAgentGraphRunner({ agent: firstAgent });
+
+  const first = await firstRunner.runTurn({
+    input: '帮我先生成短视频脚本，然后保存成文档',
+    taskBinding: { isFollowUp: false, effectiveInput: '帮我先生成短视频脚本，然后保存成文档' },
+  });
+  const second = await firstRunner.runTurn({
+    input: '输出成 word 文档，放到 artifacts 目录',
+    taskBinding: { isFollowUp: false, effectiveInput: '输出成 word 文档，放到 artifacts 目录' },
+    checkpoint: first.checkpoint,
+  });
+
+  const restoredAgent = createAgent({ llm: new StubLLM(), planner: fakePlanner as any });
+  restoredAgent.setMessages(firstAgent.getMessages());
+  const restoredRunner = createAgentGraphRunner({ agent: restoredAgent });
+  const restored = await restoredRunner.runTurn({
+    input: '是',
+    taskBinding: { isFollowUp: false, effectiveInput: '是' },
+    checkpoint: second.checkpoint,
+  });
+
+  assert.equal(restored.graphState.currentNode, 'finalize');
+  assert.equal(restored.graphState.status, 'completed');
+  assert.equal(restored.output?.includes('任务完成'), true);
+}
+
+async function testAgentGraphRunnerCheckpointRestorePlanResume(): Promise<void> {
+  const plan = {
+    originalTask: '修复部署问题',
+    steps: [
+      { id: 'step_1', description: '执行修复脚本', toolCalls: [{ name: 'mock_resume_tool', args: { command: 'fix.cmd' } }] },
+    ],
+  };
+  const agent = createAgent({ llm: new StubLLM() }) as any;
+  let executeCount = 0;
+  agent.toolRegistry = {
+    execute: async () => {
+      executeCount += 1;
+      if (executeCount === 1) {
+        return { tool_call_id: '', output: 'permission denied: missing approval', is_error: true };
+      }
+      return { tool_call_id: '', output: 'fixed', is_error: false };
+    },
+    getTool: () => undefined,
+    listTools: () => [],
+  };
+
+  const pausedMessage = await agent.executePlan('修复部署问题', plan as any);
+  assert.match(pausedMessage, /任务已暂停/);
+  const checkpoint = createAgentCheckpoint('pause_for_input', 'waiting', '修复部署问题', '等待恢复', {
+    route: 'agent',
+    pendingType: 'plan_resume',
+    resumeState: agent.getPendingInteractionDetails()?.resumeState,
+  });
+
+  const restoredAgent = createAgent({ llm: new StubLLM() }) as any;
+  restoredAgent.toolRegistry = agent.toolRegistry;
+  restoredAgent.setMessages(agent.getMessages());
+  const restoredRunner = createAgentGraphRunner({ agent: restoredAgent });
+  const restored = await restoredRunner.runTurn({
+    input: '继续',
+    taskBinding: { isFollowUp: false, effectiveInput: '继续' },
+    checkpoint,
+  });
+
+  assert.equal(restored.graphState.currentNode, 'finalize');
+  assert.equal(restored.graphState.status, 'completed');
+  assert.equal(executeCount >= 2, true);
+}
+
+async function testUnifiedAgentStateSnapshot(): Promise<void> {
+  const agent = createAgent({
+    llm: new StubLLM(),
+    maxIterations: 7,
+    maxToolCallsPerTurn: 3,
+  });
+
+  agent.setMessages([
+    { role: 'user', content: '旧问题' },
+    { role: 'assistant', content: '旧回答' },
+  ]);
+  agent.setRuntimeMemoryContext('recent memory');
+  agent.setSystemPrompt('system');
+
+  const clarification = await agent.chat('帮我先生成短视频脚本，然后保存成文档');
+  assert.match(clarification, /关键信息/);
+
+  const snapshot = agent.getUnifiedStateSnapshot({
+    isFollowUp: false,
+    effectiveInput: '帮我先生成短视频脚本，然后保存成文档',
+  }, createAgentCheckpoint('clarify', 'waiting', '帮我先生成短视频脚本，然后保存成文档', '等待补充'));
+
+  assert.equal(snapshot.state, 'WAITING_CONFIRMATION');
+  assert.equal(snapshot.pendingInteraction?.type, 'task_clarification');
+  assert.equal(snapshot.toolBudget.maxIterations, 7);
+  assert.equal(snapshot.toolBudget.maxToolCallsPerTurn >= 3, true);
+  assert.equal(snapshot.toolBudget.maxToolCallsPerTurn > 3, true);
+  assert.equal(snapshot.runtimeMemoryContext, 'recent memory');
+  assert.equal(snapshot.checkpoint?.node, 'clarify');
+  assert.equal(snapshot.messages.length >= 3, true);
 }
 
 function testOnboardingParser(): void {
@@ -563,6 +1291,35 @@ async function testDirectActionRouter(tempDir: string): Promise<void> {
     assert.match(xiaohongshuToLarkResult?.output || '', /原始报告已生成/);
     assert.equal(larkCalls.some(call => call.toolName === 'shortcut' && call.args.flags?.['chat-id'] === 'oc_xhs123' && String(call.args.flags?.markdown || '').includes('小红书搜索总结：AI 智能体 方案')), true);
     assert.equal(larkCalls.some(call => call.toolName === 'shortcut' && String(call.args.flags?.markdown || '').includes('AI 智能体落地框架')), true);
+
+    traceDirectAction('vision-action');
+    const visionDir = path.join(tempDir, 'vision-router-images');
+    await fs.mkdir(visionDir, { recursive: true });
+    await fs.writeFile(path.join(visionDir, 'screen-a.png'), Buffer.from('png-data'));
+    await fs.writeFile(path.join(visionDir, 'screen-b.jpg'), Buffer.from('jpg-data'));
+
+    const originalFetch = globalThis.fetch;
+    let capturedVisionBody: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      capturedVisionBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      return {
+        ok: true,
+        json: async () => ({ response: 'vision-router-ok', done: true }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      const visionResult = await router.tryHandle(`分析 ${visionDir} 目录下的图片，检查是否有报错`);
+      assert.equal(visionResult?.handled, true);
+      assert.equal(visionResult?.isError, undefined);
+      assert.equal(visionResult?.category, 'vision-action');
+      assert.match(visionResult?.output || '', /vision-router-ok/);
+      assert.equal(capturedVisionBody?.model, 'minicpm-v');
+      assert.equal(Array.isArray(capturedVisionBody?.images), true);
+      assert.equal((capturedVisionBody?.images as unknown[]).length, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   } finally {
     if (previousExternalSkillsDir === undefined) {
       delete process.env.AI_AGENT_CLI_EXTERNAL_SKILLS_DIR;
@@ -1292,6 +2049,7 @@ async function testAgentInteractionService(): Promise<void> {
   });
 
   assert.match(service.buildTaskClarificationPrompt('帮我处理一下') || '', /缺少一些关键信息/);
+  assert.equal(service.buildTaskClarificationPrompt('看下招远明天天气，然后发我飞书'), null);
 
   service.setPendingInteraction({
     type: 'plan_execution',
@@ -1323,6 +2081,33 @@ async function testAgentInteractionService(): Promise<void> {
   assert.equal(resumed, 'RESUME:none');
   assert.equal(userMessages.includes('继续'), true);
   assert.equal(assistantMessages.length >= 0, true);
+}
+
+async function testWeatherToLarkRequestSkipsClarification(): Promise<void> {
+  const plan = {
+    originalTask: '看下招远明天天气，然后发我飞书',
+    steps: [
+      { id: 'step_1', description: '查询招远明天天气并整理为可发送内容' },
+      { id: 'step_2', description: '将整理好的天气内容发送到飞书' },
+    ],
+  };
+  const fakePlanner = {
+    async createPlan() {
+      return plan;
+    },
+    completeStep() {},
+    failStep() {},
+  };
+
+  const agent = createAgent({
+    llm: new StubLLM(),
+    planner: fakePlanner as any,
+    config: { agentInteractionMode: 'auto' } as any,
+  });
+
+  const summary = await agent.chat('看下招远明天天气，然后发我飞书');
+  assert.doesNotMatch(summary, /缺少一些关键信息/);
+  assert.match(summary, /任务规划已创建/);
 }
 
 function testLarkBridgeToolDefinitions(): void {
@@ -1572,6 +2357,7 @@ function testCliSlashCommandCompletion(): void {
   const [newsMatches] = (cli as any).completeInput('/news ') as [string[], string];
   const [newsSaveMatches] = (cli as any).completeInput('/news s') as [string[], string];
   const [newsOutputMatches] = (cli as any).completeInput('/news o') as [string[], string];
+  const [visionMatches] = (cli as any).completeInput('/vision ') as [string[], string];
 
   assert.equal(matches.includes('/m'), true);
   assert.equal(matches.includes('/model'), true);
@@ -1595,6 +2381,46 @@ function testCliSlashCommandCompletion(): void {
   assert.equal(newsSaveMatches.includes('/news save hot'), true);
   assert.equal(newsSaveMatches.includes('/news save search'), true);
   assert.equal(newsOutputMatches.includes('/news output-dir'), true);
+  assert.equal(visionMatches.includes('/vision analyze ./images'), true);
+}
+
+function testCliVisionAnalyzeArgParsing(): void {
+  const cli = new CLI() as any;
+  const parsed = cli.parseVisionAnalyzeArgs([
+    './images',
+    './captures/error.png',
+    '--model',
+    'minicpm-v',
+    '--limit',
+    '3',
+    '请总结异常状态',
+  ]);
+
+  assert.deepEqual(parsed?.targets, ['./images', './captures/error.png']);
+  assert.equal(parsed?.model, 'minicpm-v');
+  assert.equal(parsed?.limit, 3);
+  assert.equal(parsed?.prompt, '请总结异常状态');
+  assert.throws(() => cli.parseVisionAnalyzeArgs(['./images', '--limit', '0']), /Invalid --limit value/);
+}
+
+async function testCliParseBrowserScriptActions(tempDir: string): Promise<void> {
+  const cli = new CLI() as any;
+  cli.workspace = tempDir;
+
+  const inline = await cli.parseBrowserActions(JSON.stringify([
+    { type: 'evaluate_script', script: 'window.__x = 1' },
+    { type: 'call_userscript_api', api: 'UserscriptBridge.collect', args: ['orders'] },
+    { type: 'toggle_userscript_mode', enabled: false },
+  ]));
+
+  assert.equal(inline[0]?.type, 'evaluate_script');
+  assert.equal(inline[1]?.api, 'UserscriptBridge.collect');
+  assert.equal(inline[2]?.enabled, false);
+
+  const filePath = path.join(tempDir, 'browser-actions.json');
+  await fs.writeFile(filePath, JSON.stringify([{ type: 'evaluate_script', script: '1 + 1' }]), 'utf-8');
+  const fromFile = await cli.parseBrowserActions('@browser-actions.json');
+  assert.equal(fromFile[0]?.type, 'evaluate_script');
 }
 
 async function testCliConfigReloadCommand(): Promise<void> {
@@ -1639,6 +2465,120 @@ async function testCliRelayCommands(): Promise<void> {
   assert.equal(startCount, 1);
   assert.equal(stopCount, 1);
   assert.equal(reconnectCount, 1);
+}
+
+async function testCliSendsFinalAssistantReplyToLarkChat(): Promise<void> {
+  const cli = new CLI() as any;
+  const sentCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+
+  cli.activeLarkReplyTarget = {
+    type: 'im.message.receive_v1',
+    content: '测试消息',
+    chatId: 'oc_reply_target',
+    raw: {},
+  };
+  cli.builtInTools = {
+    executeTool: async (name: string, args: Record<string, unknown>) => {
+      sentCalls.push({ name, args });
+      return { output: 'ok' };
+    },
+  };
+
+  await cli.sendAssistantReplyToActiveLarkTarget('最终结果正文');
+
+  assert.equal(sentCalls.length, 1);
+  assert.equal(sentCalls[0]?.name, 'send_lark_message');
+  assert.deepEqual(sentCalls[0]?.args, {
+    chatId: 'oc_reply_target',
+    text: '最终结果正文',
+  });
+}
+
+async function testCliSendsPendingInteractionPromptToLarkChat(): Promise<void> {
+  const cli = new CLI() as any;
+  const sentCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+
+  cli.activeLarkReplyTarget = {
+    type: 'im.message.receive_v1',
+    content: '测试消息',
+    chatId: 'oc_reply_target',
+    raw: {},
+  };
+  cli.builtInTools = {
+    executeTool: async (name: string, args: Record<string, unknown>) => {
+      sentCalls.push({ name, args });
+      return { output: 'ok' };
+    },
+  };
+  cli.agent = {
+    getPendingInteractionDetails: () => ({
+      type: 'plan_execution',
+      prompt: '请确认是否执行上述计划（回复“是”或“否”）',
+    }),
+  };
+
+  await cli.sendPendingInteractionPromptToActiveLarkTarget('别的正文');
+
+  assert.equal(sentCalls.length, 1);
+  assert.equal(sentCalls[0]?.name, 'send_lark_message');
+  assert.deepEqual(sentCalls[0]?.args, {
+    chatId: 'oc_reply_target',
+    text: '请确认是否执行上述计划（回复“是”或“否”）',
+  });
+
+  sentCalls.length = 0;
+  await cli.sendPendingInteractionPromptToActiveLarkTarget('请确认是否执行上述计划（回复“是”或“否”）');
+  assert.equal(sentCalls.length, 0);
+}
+
+async function testCliForwardsPermissionPromptToLarkAndConsumesLarkReply(tempDir: string): Promise<void> {
+  const cli = new CLI() as any;
+  const sentCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const permissionManager = new PermissionManager(path.join(tempDir, 'permission-forwarding'));
+  await permissionManager.initialize();
+
+  cli.permissionMgr = permissionManager;
+  cli.currentInputMode = 'feishu';
+  cli.activeLarkReplyTarget = {
+    type: 'im.message.receive_v1',
+    content: '执行一下目录命令',
+    chatId: 'oc_permission_chat',
+    senderId: 'ou_sender_1',
+    raw: {},
+  };
+  cli.builtInTools = {
+    executeTool: async (name: string, args: Record<string, unknown>) => {
+      sentCalls.push({ name, args });
+      return { output: 'ok' };
+    },
+  };
+  cli.promptInline = async () => {
+    throw new Error('promptInline should not be used for feishu permission approval');
+  };
+
+  cli.setupPermissionHandler();
+
+  const requestPromise = permissionManager.requestPermission('command_execute', 'dir /b');
+  await Promise.resolve();
+
+  assert.equal(sentCalls.length, 1);
+  assert.equal(sentCalls[0]?.name, 'send_lark_message');
+  assert.equal(sentCalls[0]?.args.chatId, 'oc_permission_chat');
+  assert.match(String(sentCalls[0]?.args.text || ''), /危险操作/);
+  assert.match(String(sentCalls[0]?.args.text || ''), /yes\s+-\s+授权本次/);
+  assert.equal(/\u001B\[[0-9;]*m/.test(String(sentCalls[0]?.args.text || '')), false);
+
+  const consumed = cli.consumePendingLarkInlineReply('yes', {
+    type: 'im.message.receive_v1',
+    content: 'yes',
+    chatId: 'oc_permission_chat',
+    senderId: 'ou_sender_1',
+    raw: {},
+  });
+  assert.equal(consumed, true);
+
+  const granted = await requestPromise;
+  assert.equal(granted, true);
 }
 
 async function testLarkRelayStatusClassification(): Promise<void> {
@@ -1872,6 +2812,7 @@ async function testDirectActionSupportComponents(tempDir: string): Promise<void>
   assert.equal(await artifactSupport.findConvertibleSourceFilePath('把这个csv转换成xlsx文件', 'xlsx'), rememberedCsvPath);
 
   assert.deepEqual(routingSupport.splitExplicitPaths(`${rememberedCsvPath} 和 ${rememberedMarkdownPath}`), [rememberedCsvPath, rememberedMarkdownPath]);
+  assert.deepEqual(routingSupport.extractPathCandidates('分析 ./captures 和 D:/screenshots/error.png 里的图片').slice(0, 2), ['./captures', 'D:/screenshots/error.png']);
   assert.equal(routingSupport.normalizeSearchQuery('关键词： createDirectActionRouter '), 'createDirectActionRouter');
   assert.equal(routingSupport.normalizeGlobPattern('ts'), '**/*.ts');
 
@@ -2408,6 +3349,81 @@ function testLarkRelayFiltersUnexpectedSender(): void {
   assert.equal(parsed, null);
 }
 
+function testLarkRelayParsesAttachmentMessage(): void {
+  const line = JSON.stringify({
+    type: 'im.message.receive_v1',
+    event: {
+      message: {
+        message_id: 'om_attachment_message',
+        chat_id: 'oc_test_chat',
+        chat_type: 'p2p',
+        message_type: 'file',
+        content: JSON.stringify({
+          file_key: 'file_test_key',
+          file_name: '日报.docx',
+        }),
+      },
+      sender: {
+        sender_id: {
+          open_id: 'ou_test_sender',
+        },
+      },
+    },
+  });
+
+  const parsed = parseLarkRelayMessageLine(line, {
+    enabled: true,
+    allowedChatIds: ['oc_test_chat'],
+    allowedSenderIds: ['ou_test_sender'],
+  });
+
+  assert.equal(parsed?.messageId, 'om_attachment_message');
+  assert.equal(parsed?.messageType, 'file');
+  assert.equal(parsed?.attachments?.length, 1);
+  assert.equal(parsed?.attachments?.[0]?.type, 'file');
+  assert.equal(parsed?.attachments?.[0]?.fileName, '日报.docx');
+  assert.match(parsed?.content || '', /飞书文件/);
+}
+
+function testLarkRelayDefaultReceiveDir(): void {
+  const normalized = normalizeLarkRelayConfig({ enabled: true });
+  assert.equal(normalized.downloadAttachments, true);
+  assert.equal(normalized.receiveDir, path.join(os.homedir(), '.ai-agent-cli', 'feishuReceive'));
+}
+
+async function testLarkRelayMaterializesAttachmentContent(): Promise<void> {
+  const relay = new LarkRelayAgent({
+    enabled: true,
+    receiveDir: path.join(os.tmpdir(), 'ai-agent-cli-feishu-test'),
+  }) as any;
+
+  relay.downloadAttachment = async (_message: unknown, attachment: { fileName?: string; type: string }) => {
+    return path.join('C:/Users/521ka/.ai-agent-cli/feishuReceive/2026-04-11', attachment.fileName || `${attachment.type}.bin`);
+  };
+
+  const message = {
+    type: 'im.message.receive_v1',
+    content: '[飞书文件] 日报.docx',
+    messageId: 'om_attachment_message',
+    chatId: 'oc_test_chat',
+    senderId: 'ou_test_sender',
+    messageType: 'file',
+    attachments: [
+      {
+        key: 'file_test_key',
+        type: 'file',
+        fileName: '日报.docx',
+      },
+    ],
+    raw: {},
+  };
+
+  const materialized = await relay.materializeMessageResources(message);
+
+  assert.equal(materialized.attachments?.[0]?.localPath, 'C:/Users/521ka/.ai-agent-cli/feishuReceive/2026-04-11/日报.docx');
+  assert.match(materialized.content, /本地路径: C:\/Users\/521ka\/.ai-agent-cli\/feishuReceive\/2026-04-11\/日报\.docx/);
+}
+
 async function testWebSearchUnwrapsDuckDuckGoRedirectLinks(tempDir: string): Promise<void> {
   const sandbox = new Sandbox({ enabled: true, allowedPaths: [tempDir] });
   await sandbox.initialize();
@@ -2827,6 +3843,30 @@ async function testGreetingDoesNotTriggerPlanning(): Promise<void> {
   assert.equal(compositeLarkDelivery, true);
 }
 
+async function testAmbiguousShortInputRequestsClarification(): Promise<void> {
+  const agent = createAgent({
+    llm: new StaticResponseLLM('不该走到这里'),
+  }) as any;
+
+  const response = await agent.chat('cli');
+  const pending = agent.getConfirmationStatus();
+
+  assert.match(response, /输入有点短|不能准确判断/i);
+  assert.equal(pending.pending, true);
+  assert.equal(pending.type, 'task_clarification');
+}
+
+async function testAmbiguousShortInputClarificationReturnsDirectResponse(): Promise<void> {
+  const agent = createAgent({
+    llm: new StaticResponseLLM('CLI 是命令行界面，用来通过文本命令操作程序。'),
+  }) as any;
+
+  await agent.chat('cli');
+  const response = await agent.respondToPendingInput('我是想问 CLI 是什么');
+
+  assert.match(response || '', /命令行界面/);
+}
+
 function testDefaultPromptEncouragesDirectPaths(): void {
   const agent = createAgent({
     llm: new StubLLM(),
@@ -2845,12 +3885,685 @@ function testDefaultPromptEncouragesDirectPaths(): void {
 function testCliShellTextUtilities(): void {
   assert.equal(APP_VERSION, '1.3.0');
   assert.match(buildCliLogo(), /AI Agent CLI v1\.3\.0/);
+  assert.match(getQuickHelpText(), /\/vision/);
+  assert.match(getFullHelpText(), /\/vision/);
+  assert.match(getQuickHelpText(), /Override routing mode for debug/);
+  assert.match(getFullHelpText(), /Show current routing override/);
   assert.equal(isQuickHelpShortcut('/?'), true);
   assert.equal(isQuickHelpShortcut('/？'), true);
   assert.equal(isQuickHelpShortcut('/help'), false);
   assert.equal(isFullHelpShortcut('/help'), true);
   assert.equal(isFullHelpShortcut('/h'), true);
   assert.equal(isFullHelpShortcut('/?'), false);
+}
+
+async function testOllamaVisionService(tempDir: string): Promise<void> {
+  const imageDir = path.join(tempDir, 'vision-images');
+  await fs.mkdir(imageDir, { recursive: true });
+  await fs.writeFile(path.join(imageDir, 'b.jpg'), Buffer.from('jpg-data'));
+  await fs.writeFile(path.join(imageDir, 'a.png'), Buffer.from('png-data'));
+  await fs.writeFile(path.join(imageDir, 'notes.txt'), 'ignore me', 'utf-8');
+
+  const originalFetch = globalThis.fetch;
+  let capturedBody: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    capturedBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    return {
+      ok: true,
+      json: async () => ({ response: 'vision-ok', done: true }),
+    } as Response;
+  }) as typeof fetch;
+
+  try {
+    const service = createOllamaVisionService({
+      workspace: tempDir,
+      ollamaConfig: {
+        baseUrl: 'http://localhost:11434',
+        model: 'qwen3.5:9b',
+        visionModel: 'minicpm-v',
+        visionMaxImages: 4,
+      },
+    });
+
+    const result = await service.analyzeDirectory({
+      directory: './vision-images',
+      prompt: '请总结这些图片里的异常点',
+      maxImages: 2,
+    });
+
+    assert.equal(result.response, 'vision-ok');
+    assert.equal(result.model, 'minicpm-v');
+    assert.equal(result.imageCount, 2);
+    assert.equal(result.imageFiles.map(file => path.basename(file)).join(','), 'a.png,b.jpg');
+    assert.equal(capturedBody?.model, 'minicpm-v');
+    assert.equal(Array.isArray(capturedBody?.images), true);
+    assert.equal((capturedBody?.images as unknown[]).length, 2);
+    assert.match(String(capturedBody?.prompt || ''), /a\.png, b\.jpg/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testBrowserSessionExtensionBootstrap(tempDir: string): Promise<void> {
+  const extensionDir = path.join(tempDir, 'tampermonkey-extension');
+  const profileDir = path.join(tempDir, 'browser-profile');
+  const initScriptPath = path.join(tempDir, 'inject-init.js');
+  const pageScriptPath = path.join(tempDir, 'inject-page.js');
+  await fs.mkdir(extensionDir, { recursive: true });
+  await fs.writeFile(initScriptPath, 'window.__initScriptLoaded = true;', 'utf-8');
+  await fs.writeFile(pageScriptPath, 'window.__pageScriptLoaded = true;', 'utf-8');
+
+  const initScripts: string[] = [];
+  const evaluatedScripts: string[] = [];
+  const evaluatedObjects: unknown[] = [];
+  const evaluatedBooleans: boolean[] = [];
+  const gotoUrls: string[] = [];
+  let launchUserDataDir = '';
+  let launchOptions: Record<string, unknown> | undefined;
+
+  const page = {
+    addInitScript: async (script: string) => {
+      initScripts.push(script);
+    },
+    goto: async (url: string) => {
+      gotoUrls.push(url);
+    },
+    title: async () => 'Example',
+    url: () => gotoUrls[gotoUrls.length - 1] || 'about:blank',
+    setDefaultTimeout: () => {},
+    waitForTimeout: async () => {},
+    waitForSelector: async () => {},
+    waitForLoadState: async () => {},
+    locator: () => ({
+      first: () => ({
+        click: async () => {},
+        fill: async (_value: string) => {},
+        press: async (_key: string) => {},
+        innerText: async () => '',
+      }),
+    }),
+    evaluate: async (_pageFunction: unknown, arg: unknown) => {
+      if (typeof arg === 'string') {
+        evaluatedScripts.push(arg);
+        if (arg.includes('window.__scriptResult = 1')) {
+          return { ok: true };
+        }
+        return undefined;
+      }
+
+      if (typeof arg === 'boolean') {
+        evaluatedBooleans.push(arg);
+        return arg;
+      }
+
+      evaluatedObjects.push(arg);
+      return 'api-ok';
+    },
+  };
+
+  const context = {
+    addInitScript: async (script: string) => {
+      initScripts.push(script);
+    },
+    newPage: async () => page,
+    close: async () => {},
+    pages: () => [],
+  };
+
+  const session = new BrowserSession({
+    browser: 'chrome',
+    headless: true,
+    timeoutMs: 4321,
+    workspace: tempDir,
+    userDataDir: './browser-profile',
+    extensionPaths: ['./tampermonkey-extension'],
+    initScriptPaths: ['./inject-init.js'],
+    initScripts: ['window.__inlineInitLoaded = true;'],
+    pageScriptPaths: ['./inject-page.js'],
+    pageScripts: ['window.__inlinePageLoaded = true;'],
+    userscripts: {
+      inline: ['window.__userscriptLoaded = true;'],
+      runAt: 'document-end',
+    },
+  }) as any;
+
+  session.loadPlaywright = async () => ({
+    chromium: {
+      launch: async () => {
+        throw new Error('launch should not be used when extension paths are configured');
+      },
+      launchPersistentContext: async (userDataDir: string, options: Record<string, unknown>) => {
+        launchUserDataDir = userDataDir;
+        launchOptions = options;
+        return context;
+      },
+    },
+  });
+
+  await session.start('https://example.com/dashboard');
+  const scriptResult = await session.executeWithOptions({
+    type: 'evaluate_script',
+    script: 'window.__scriptResult = 1',
+    expectResult: {
+      type: 'object',
+      shape: '{ ok: boolean }',
+      description: 'script execution payload',
+    },
+    reason: 'execute explicit script',
+    confidence: 0.9,
+  }, {});
+  const apiResult = await session.executeWithOptions({
+    type: 'call_userscript_api',
+    api: 'UserscriptBridge.collect',
+    args: ['foo', 2],
+    expectResult: {
+      type: 'array',
+      shape: '{ id: string }[]',
+      description: 'order list',
+    },
+    reason: 'call userscript api',
+    confidence: 0.9,
+  }, {});
+  const toggleResult = await session.executeWithOptions({
+    type: 'toggle_userscript_mode',
+    enabled: false,
+    reason: 'disable userscript mode',
+    confidence: 0.9,
+  }, {});
+  await session.close();
+
+  assert.equal(launchUserDataDir, profileDir);
+  assert.equal(launchOptions?.channel, 'chromium');
+  assert.equal(launchOptions?.headless, false);
+  assert.deepEqual(launchOptions?.ignoreDefaultArgs, ['--disable-extensions']);
+  assert.deepEqual(launchOptions?.args, buildChromiumExtensionArgs([extensionDir]));
+  assert.equal(initScripts.length, 3);
+  assert.equal(initScripts[0]?.includes('__AI_AGENT_USERSCRIPT_STATE__'), true);
+  assert.equal(evaluatedScripts.length, 3);
+  assert.match(scriptResult.summary, /返回值匹配预期 object <\{ ok: boolean \}> script execution payload/);
+  assert.deepEqual(JSON.parse(scriptResult.extractedText || '{}'), {
+    matched: true,
+    expected: 'object <{ ok: boolean }> script execution payload',
+    actual: 'object',
+    value: { ok: true },
+  });
+  assert.match(apiResult.summary, /返回值与预期不匹配/);
+  assert.deepEqual(JSON.parse(apiResult.extractedText || '{}'), {
+    matched: false,
+    expected: 'array <{ id: string }[]> order list',
+    actual: 'string',
+    value: 'api-ok',
+  });
+  assert.equal(toggleResult.summary, '已关闭用户脚本模式');
+  assert.equal(evaluatedObjects.length, 1);
+  assert.deepEqual(evaluatedObjects[0], { apiPath: 'UserscriptBridge.collect', args: ['foo', 2] });
+  assert.deepEqual(evaluatedBooleans, [false]);
+  assert.deepEqual(gotoUrls, ['https://example.com/dashboard']);
+}
+
+async function testBrowserAutomationScriptEnvironment(tempDir: string): Promise<void> {
+  const extensionDir = path.join(tempDir, 'tm-extension');
+  const profileDir = path.join(tempDir, 'browser-profile');
+  const initScriptPath = path.join(tempDir, 'init.js');
+  const pageScriptPath = path.join(tempDir, 'page.js');
+  const userscriptPath = path.join(tempDir, 'userscript.js');
+  await fs.mkdir(extensionDir, { recursive: true });
+  await fs.writeFile(initScriptPath, 'window.__initScriptLoaded = true;', 'utf-8');
+  await fs.writeFile(pageScriptPath, 'window.__pageScriptLoaded = (window.__pageScriptLoaded || 0) + 1;', 'utf-8');
+  await fs.writeFile(userscriptPath, 'window.__userscriptLoaded = (window.__userscriptLoaded || 0) + 1;', 'utf-8');
+
+  const initScripts: string[] = [];
+  const gotoUrls: string[] = [];
+  const evaluatedStrings: string[] = [];
+  const evaluatedObjects: unknown[] = [];
+  const evaluatedBooleans: boolean[] = [];
+  let launchUserDataDir = '';
+  let launchOptions: Record<string, unknown> | undefined;
+
+  const page = {
+    addInitScript: async (script: string) => {
+      initScripts.push(script);
+    },
+    goto: async (url: string) => {
+      gotoUrls.push(url);
+    },
+    title: async () => 'Example',
+    url: () => gotoUrls[gotoUrls.length - 1] || 'about:blank',
+    setDefaultTimeout: () => {},
+    waitForTimeout: async () => {},
+    waitForSelector: async () => {},
+    locator: () => ({
+      first: () => ({
+        click: async () => {},
+        fill: async (_value: string) => {},
+        press: async (_key: string) => {},
+        innerText: async () => 'body text',
+      }),
+    }),
+    evaluate: async (_pageFunction: unknown, arg: unknown) => {
+      if (typeof arg === 'string') {
+        evaluatedStrings.push(arg);
+        if (arg.includes('window.__manualScript = true;')) {
+          return { ok: true };
+        }
+        return undefined;
+      }
+
+      if (typeof arg === 'boolean') {
+        evaluatedBooleans.push(arg);
+        return arg;
+      }
+
+      evaluatedObjects.push(arg);
+      return 'api-ok';
+    },
+    screenshot: async () => {},
+  };
+
+  const context = {
+    addInitScript: async (script: string) => {
+      initScripts.push(script);
+    },
+    newPage: async () => page,
+    close: async () => {},
+    pages: () => [],
+  };
+
+  const result = await runBrowserAutomation({
+    url: 'https://example.com/home',
+    actions: [
+      { type: 'goto', url: 'https://example.com/dashboard' },
+      {
+        type: 'evaluate_script',
+        script: 'window.__manualScript = true;',
+        expectResult: {
+          type: 'object',
+          shape: '{ ok: boolean }',
+          description: 'manual script payload',
+        },
+      },
+      {
+        type: 'call_userscript_api',
+        api: 'UserscriptBridge.collect',
+        args: ['orders'],
+        expectResult: {
+          type: 'array',
+          shape: '{ id: string }[]',
+          description: 'orders result',
+        },
+      },
+      { type: 'toggle_userscript_mode', enabled: false },
+    ],
+    browser: 'chrome',
+    headless: true,
+    timeoutMs: 4321,
+    workspace: tempDir,
+    userDataDir: './browser-profile',
+    extensionPaths: ['./tm-extension'],
+    initScriptPaths: ['./init.js'],
+    initScripts: ['window.__inlineInitLoaded = true;'],
+    pageScriptPaths: ['./page.js'],
+    pageScripts: ['window.__inlinePageLoaded = true;'],
+    userscripts: {
+      paths: ['./userscript.js'],
+      inline: ['window.__inlineUserscriptLoaded = true;'],
+      runAt: 'document-end',
+      enabled: true,
+    },
+    resolveOutputPath: requestedPath => requestedPath || path.join(tempDir, 'artifacts', 'browser.png'),
+    loadPlaywright: async () => ({
+      chromium: {
+        launch: async () => {
+          throw new Error('launch should not be used when extension paths are configured');
+        },
+        launchPersistentContext: async (userDataDir: string, options: Record<string, unknown>) => {
+          launchUserDataDir = userDataDir;
+          launchOptions = options;
+          return context;
+        },
+      },
+    }),
+  });
+
+  const parsed = JSON.parse(result);
+  assert.equal(launchUserDataDir, profileDir);
+  assert.equal(launchOptions?.channel, 'chromium');
+  assert.equal(launchOptions?.headless, false);
+  assert.deepEqual(launchOptions?.ignoreDefaultArgs, ['--disable-extensions']);
+  assert.equal(initScripts.length, 3);
+  assert.deepEqual(gotoUrls, ['https://example.com/home', 'https://example.com/dashboard']);
+  assert.equal(initScripts[0]?.includes('__AI_AGENT_USERSCRIPT_STATE__'), true);
+  assert.equal(evaluatedStrings.filter(script => script.includes('__inlinePageLoaded')).length, 2);
+  assert.equal(evaluatedStrings.filter(script => script.includes('__pageScriptLoaded')).length, 2);
+  assert.equal(evaluatedStrings.filter(script => script.includes('__inlineUserscriptLoaded')).length, 2);
+  assert.equal(evaluatedStrings.filter(script => script.includes('__userscriptLoaded')).length, 2);
+  assert.equal(evaluatedStrings.some(script => script.includes('window.__manualScript = true;')), true);
+  assert.deepEqual(evaluatedObjects, [{ apiPath: 'UserscriptBridge.collect', args: ['orders'] }]);
+  assert.deepEqual(evaluatedBooleans, [false]);
+  assert.equal(parsed.actions[1].type, 'evaluate_script');
+  assert.equal(parsed.actions[1].validation, '返回值匹配预期 object <{ ok: boolean }> manual script payload');
+  assert.deepEqual(JSON.parse(parsed.actions[1].text), {
+    matched: true,
+    expected: 'object <{ ok: boolean }> manual script payload',
+    actual: 'object',
+    value: { ok: true },
+  });
+  assert.equal(parsed.actions[2].type, 'call_userscript_api');
+  assert.equal(parsed.actions[2].validation, '返回值与预期不匹配，预期 array <{ id: string }[]> orders result，实际 string');
+  assert.deepEqual(JSON.parse(parsed.actions[2].text), {
+    matched: false,
+    expected: 'array <{ id: string }[]> orders result',
+    actual: 'string',
+    value: 'api-ok',
+  });
+  assert.equal(parsed.actions[3].type, 'toggle_userscript_mode');
+}
+
+async function testBuiltInBrowserAutomationEnvironmentDefaults(tempDir: string): Promise<void> {
+  const sandbox = new Sandbox({ enabled: true, allowedPaths: [tempDir] });
+  await sandbox.initialize();
+
+  const tools = new BuiltInTools(sandbox, new LSPManager(), {
+    workspace: tempDir,
+    config: {
+      appBaseDir: path.join(tempDir, 'app-base'),
+      artifactOutputDir: path.join(tempDir, 'artifacts'),
+      documentOutputDir: path.join(tempDir, 'documents'),
+      browserAgent: {
+        browser: 'edge',
+        executablePath: 'C:/Browsers/msedge.exe',
+        expectResultMismatchStrategy: 'hard-fail',
+        userDataDir: './profile',
+        extensionPaths: ['./ext-a'],
+        initScriptPaths: ['./init-a.js'],
+        initScripts: ['window.__init = true;'],
+        pageScriptPaths: ['./page-a.js'],
+        pageScripts: ['window.__page = true;'],
+        userscripts: {
+          paths: ['./userscript-a.js'],
+          inline: ['window.__userscript = true;'],
+          runAt: 'document-end',
+          enabled: true,
+        },
+      },
+    },
+  });
+
+  const environment = (tools as any).getBrowserAutomationEnvironment();
+  assert.equal(environment.workspace, tempDir);
+  assert.equal(environment.appBaseDir, path.join(tempDir, 'app-base'));
+  assert.equal(environment.artifactOutputDir, path.join(tempDir, 'artifacts'));
+  assert.equal(environment.documentOutputDir, path.join(tempDir, 'documents'));
+  assert.equal(environment.executablePath, 'C:/Browsers/msedge.exe');
+  assert.equal(environment.userDataDir, './profile');
+  assert.deepEqual(environment.extensionPaths, ['./ext-a']);
+  assert.deepEqual(environment.initScriptPaths, ['./init-a.js']);
+  assert.deepEqual(environment.pageScriptPaths, ['./page-a.js']);
+  assert.deepEqual(environment.userscripts.paths, ['./userscript-a.js']);
+  assert.equal(environment.expectResultMismatchStrategy, 'hard-fail');
+}
+
+async function testBrowserSessionExpectResultMismatchStrategies(tempDir: string): Promise<void> {
+  const page = {
+    addInitScript: async () => {},
+    goto: async () => {},
+    title: async () => 'Example',
+    url: () => 'https://example.com',
+    setDefaultTimeout: () => {},
+    waitForTimeout: async () => {},
+    waitForSelector: async () => {},
+    waitForLoadState: async () => {},
+    locator: () => ({
+      first: () => ({
+        click: async () => {},
+        fill: async () => {},
+        press: async () => {},
+        innerText: async () => '',
+      }),
+    }),
+    evaluate: async (_pageFunction: unknown, arg: unknown) => {
+      if (typeof arg === 'object' && arg !== null) {
+        return 'api-ok';
+      }
+      return undefined;
+    },
+  };
+
+  const browser = {
+    newPage: async () => page,
+    close: async () => {},
+  };
+
+  const recordOnlySession = new BrowserSession({
+    workspace: tempDir,
+    expectResultMismatchStrategy: 'record-only',
+  }) as any;
+  recordOnlySession.loadPlaywright = async () => ({
+    chromium: {
+      launch: async () => browser,
+      launchPersistentContext: async () => { throw new Error('should not use persistent context'); },
+    },
+  });
+
+  await recordOnlySession.start('https://example.com');
+  const recordOnlyResult = await recordOnlySession.executeWithOptions({
+    type: 'call_userscript_api',
+    api: 'UserscriptBridge.collect',
+    args: [],
+    expectResult: {
+      type: 'array',
+      shape: '{ id: string }[]',
+      description: 'order list',
+    },
+    reason: 'test mismatch strategy',
+    confidence: 0.9,
+  }, {});
+  await recordOnlySession.close();
+
+  assert.equal(recordOnlyResult.summary, '已调用用户脚本 API: UserscriptBridge.collect');
+  assert.deepEqual(JSON.parse(recordOnlyResult.extractedText || '{}'), {
+    matched: false,
+    expected: 'array <{ id: string }[]> order list',
+    actual: 'string',
+    value: 'api-ok',
+  });
+
+  const hardFailSession = new BrowserSession({
+    workspace: tempDir,
+    expectResultMismatchStrategy: 'hard-fail',
+  }) as any;
+  hardFailSession.loadPlaywright = async () => ({
+    chromium: {
+      launch: async () => browser,
+      launchPersistentContext: async () => { throw new Error('should not use persistent context'); },
+    },
+  });
+
+  await hardFailSession.start('https://example.com');
+  await assert.rejects(() => hardFailSession.executeWithOptions({
+    type: 'call_userscript_api',
+    api: 'UserscriptBridge.collect',
+    args: [],
+    expectResult: {
+      type: 'array',
+      shape: '{ id: string }[]',
+      description: 'order list',
+    },
+    reason: 'test hard fail strategy',
+    confidence: 0.9,
+  }, {}), /call_userscript_api\(UserscriptBridge\.collect\) 返回值校验失败/);
+  await hardFailSession.close();
+}
+
+async function testBrowserAutomationExpectResultMismatchStrategies(tempDir: string): Promise<void> {
+  const page = {
+    addInitScript: async () => {},
+    goto: async () => {},
+    title: async () => 'Example',
+    url: () => 'https://example.com',
+    setDefaultTimeout: () => {},
+    waitForTimeout: async () => {},
+    waitForSelector: async () => {},
+    locator: () => ({
+      first: () => ({
+        click: async () => {},
+        fill: async () => {},
+        press: async () => {},
+        innerText: async () => 'body text',
+      }),
+    }),
+    evaluate: async (_pageFunction: unknown, arg: unknown) => {
+      if (typeof arg === 'object' && arg !== null) {
+        return 'api-ok';
+      }
+      return undefined;
+    },
+    screenshot: async () => {},
+  };
+
+  const browser = {
+    newPage: async () => page,
+    close: async () => {},
+  };
+
+  const recordOnlyOutput = await runBrowserAutomation({
+    url: 'https://example.com',
+    actions: [{
+      type: 'call_userscript_api',
+      api: 'UserscriptBridge.collect',
+      args: [],
+      expectResult: {
+        type: 'array',
+        shape: '{ id: string }[]',
+        description: 'order list',
+      },
+    }],
+    expectResultMismatchStrategy: 'record-only',
+    resolveOutputPath: requestedPath => requestedPath || path.join(tempDir, 'artifacts', 'browser.png'),
+    loadPlaywright: async () => ({
+      chromium: {
+        launch: async () => browser,
+        launchPersistentContext: async () => { throw new Error('should not use persistent context'); },
+      },
+    }),
+  });
+  const parsedRecordOnly = JSON.parse(recordOnlyOutput);
+  assert.equal(parsedRecordOnly.actions[0].validation, '返回值与预期不匹配，预期 array <{ id: string }[]> order list，实际 string');
+
+  await assert.rejects(() => runBrowserAutomation({
+    url: 'https://example.com',
+    actions: [{
+      type: 'call_userscript_api',
+      api: 'UserscriptBridge.collect',
+      args: [],
+      expectResult: {
+        type: 'array',
+        shape: '{ id: string }[]',
+        description: 'order list',
+      },
+    }],
+    expectResultMismatchStrategy: 'hard-fail',
+    resolveOutputPath: requestedPath => requestedPath || path.join(tempDir, 'artifacts', 'browser.png'),
+    loadPlaywright: async () => ({
+      chromium: {
+        launch: async () => browser,
+        launchPersistentContext: async () => { throw new Error('should not use persistent context'); },
+      },
+    }),
+  }), /call_userscript_api\(UserscriptBridge\.collect\) 返回值校验失败/);
+}
+
+async function testBrowserActionPlannerScriptActions(): Promise<void> {
+  const workflows = [{
+    name: 'orders-script-workflow',
+    description: 'Collect order data via userscript API',
+    sourcePath: 'browser-workflows/orders-script.md',
+    startUrl: 'https://example.com/orders',
+    matchPatterns: ['example.com/orders'],
+    whenToUse: 'Need structured order data',
+    steps: ['open order list', 'collect data'],
+    hints: ['prefer userscript api'],
+    successCriteria: ['orders collected'],
+    selectorSlots: {},
+    preferredSelectors: {},
+    fallbackActions: {},
+    doneConditions: [],
+    phaseConfigurations: {},
+    scriptApis: [{
+      name: 'UserscriptBridge.collect',
+      description: 'Collect order summaries',
+      args: [{ name: 'scope', type: 'string', required: false }],
+      returns: {
+        type: 'array',
+        shape: '{ id: string; status: string }',
+        description: 'visible orders',
+      },
+    }],
+    maxRetries: 2,
+    priority: 100,
+  }];
+
+  const planner = new BrowserActionPlanner({
+    plannerClient: new StaticResponseLLM(JSON.stringify({
+      finalMessage: 'use script actions',
+      actions: [
+        {
+          type: 'toggle_userscript_mode',
+          enabled: true,
+          reason: 'ensure userscript is enabled',
+          confidence: 0.91,
+        },
+        {
+          type: 'call_userscript_api',
+          api: 'UserscriptBridge.collect',
+          args: ['orders'],
+          reason: 'collect data through userscript api',
+          confidence: 0.88,
+        },
+      ],
+    })),
+    maxActionsPerPlan: 3,
+  });
+
+  const plan = await planner.createPlan(
+    { goal: '调用用户脚本 API 抓取订单列表' },
+    {
+      url: 'https://example.com/orders',
+      title: 'Orders',
+      visibleText: '订单列表 页面',
+      interactiveElements: [],
+      interactiveSummary: [],
+    },
+    [],
+    { allowFastPath: false, workflows },
+  );
+
+  assert.equal(plan.source, 'llm');
+  assert.equal(plan.actions[0]?.type, 'toggle_userscript_mode');
+  assert.equal(plan.actions[0]?.enabled, true);
+  assert.equal(plan.actions[1]?.type, 'call_userscript_api');
+  assert.equal(plan.actions[1]?.api, 'UserscriptBridge.collect');
+  assert.deepEqual(plan.actions[1]?.args, ['orders']);
+  assert.deepEqual(plan.actions[1]?.expectResult, {
+    type: 'array',
+    shape: '{ id: string; status: string }',
+    description: 'visible orders',
+  });
+}
+
+async function testBrowserWorkflowTemplateIncludesScriptScaffolding(tempDir: string): Promise<void> {
+  const service = new BrowserWorkflowService({ workflowDir: path.join(tempDir, 'workflow-template') });
+  const created = await service.createWorkflowTemplate('script-ready-workflow', {
+    description: 'workflow with script helpers',
+    match: ['example.com'],
+  });
+
+  const content = await fs.readFile(created.filePath, 'utf-8');
+  assert.match(content, /scripts:/);
+  assert.match(content, /scriptApis:/);
+  assert.match(content, /UserscriptBridge\.collectResults/);
+  assert.match(content, /type: array/);
+  assert.match(content, /shape: \{ title: string; url: string \}/);
 }
 
 function testSharedExportIntentRules(): void {
@@ -2867,6 +4580,353 @@ function testSharedExportIntentRules(): void {
   assert.equal(selectPreferredExportTool('xlsx', ['xlsx_create_from_text', 'txt_to_xlsx']), 'xlsx_create_from_text');
   assert.equal(selectPreferredExportTool('pptx', ['pptx_create_from_text', 'txt_to_pptx']), 'pptx_create_from_text');
   assert.equal(buildFallbackIntentContract('分析搜索结果，确定《将进酒》中最有名的诗句', []).action, 'file_write');
+}
+
+function testCliAgentInteractionMode(): void {
+  const originalFunctionMode = configManager.get('functionMode');
+  const originalMode = configManager.get('agentInteractionMode');
+
+  try {
+    configManager.set('functionMode', 'workflow');
+    const workflowCli = new CLI();
+    assert.equal((workflowCli as any).getFunctionMode(), 'workflow');
+    assert.equal((workflowCli as any).getPromptLabel(), '[cli|workflow] > ');
+
+    configManager.set('functionMode', 'chat');
+    const chatCli = new CLI();
+    assert.equal((chatCli as any).getFunctionMode(), 'chat');
+    assert.equal((chatCli as any).getPromptLabel(), '[cli|chat] > ');
+
+    const functionCandidates = (chatCli as any).getCompletionCandidates('/function sw');
+    const candidates = (chatCli as any).getCompletionCandidates('/agent-mode sw');
+    assert.equal(functionCandidates.includes('/function switch workflow'), true);
+    assert.equal(functionCandidates.includes('/function switch chat'), true);
+    assert.equal(candidates.includes('/agent-mode switch workflow'), true);
+    assert.equal(candidates.includes('/agent-mode switch chat'), true);
+  } finally {
+    configManager.set('functionMode', originalFunctionMode ?? 'workflow');
+    configManager.set('agentInteractionMode', originalMode ?? 'auto');
+  }
+}
+
+async function testCliSuppressesDirectActionPreambleInTaskMode(): Promise<void> {
+  const originalFunctionMode = configManager.get('functionMode');
+
+  try {
+    configManager.set('functionMode', 'workflow');
+    const taskCli = new CLI() as any;
+    let streamed = '';
+    taskCli.streamResponse = async (text: string) => {
+      streamed += text;
+    };
+
+    await taskCli.showDirectActionPreamble('我先打开看看，做完告诉你结果。');
+    assert.equal(taskCli.pendingDirectActionPreamble, undefined);
+    assert.equal(streamed, '');
+
+    configManager.set('functionMode', 'chat');
+    const chatCli = new CLI() as any;
+    let chatStreamed = '';
+    chatCli.streamResponse = async (text: string) => {
+      chatStreamed += text;
+    };
+
+    await chatCli.showDirectActionPreamble('我先打开看看，做完告诉你结果。');
+    assert.equal(chatCli.pendingDirectActionPreamble, '我先打开看看，做完告诉你结果。');
+    assert.equal(chatStreamed, '我先打开看看，做完告诉你结果。');
+  } finally {
+    configManager.set('functionMode', originalFunctionMode ?? 'workflow');
+  }
+}
+
+async function testCliAutoModeUsesWorkflowHandlerForComplexTask(): Promise<void> {
+  const cli = new CLI() as any;
+  let handledInTaskMode = false;
+
+  cli.chatRouter = {
+    route: async () => ({ target: 'task', reason: 'complex_task', intent: 'workflow_task' }),
+  };
+  cli.reportAutoRouteDecision = () => {};
+  cli.agent = {};
+  cli.handleTaskModeMessage = async (input: string, taskBinding: { effectiveInput: string }) => {
+    handledInTaskMode = input === '帮我先整理需求，再生成周报并导出文档'
+      && taskBinding.effectiveInput === '帮我先整理需求，再生成周报并导出文档';
+  };
+
+  await cli.handleAutoModeMessage('帮我先整理需求，再生成周报并导出文档', {
+    isFollowUp: false,
+    effectiveInput: '帮我先整理需求，再生成周报并导出文档',
+  });
+
+  assert.equal(handledInTaskMode, true);
+}
+
+async function testCliAutoModeUsesChatRouterForConversation(): Promise<void> {
+  const cli = new CLI() as any;
+  let handledInChatMode = false;
+  let handledInTaskMode = false;
+  const infoMessages: string[] = [];
+
+  cli.chatRouter = {
+    route: async () => ({ target: 'chat', reason: 'knowledge_chat', intent: 'knowledge_chat' }),
+  };
+  cli.agent = {};
+  cli.reportAutoRouteDecision = (decision: { reason: string; target: string }) => {
+    infoMessages.push(`${decision.target}:${decision.reason}`);
+  };
+  cli.handleChatModeMessage = async (input: string, taskBinding: { effectiveInput: string }) => {
+    handledInChatMode = input === '你是谁'
+      && taskBinding.effectiveInput === '你是谁';
+  };
+  cli.handleTaskModeMessage = async () => {
+    handledInTaskMode = true;
+  };
+
+  await cli.handleAutoModeMessage('你是谁', {
+    isFollowUp: false,
+    effectiveInput: '你是谁',
+  });
+
+  assert.equal(handledInChatMode, true);
+  assert.equal(handledInTaskMode, false);
+  assert.deepEqual(infoMessages, ['chat:knowledge_chat']);
+}
+
+async function testChatRouterSeparatesConversationAndTask(): Promise<void> {
+  const router = new ChatRouter();
+  const agent = {
+    getConfirmationStatus: () => ({ pending: false }),
+    detectComplexTask: async (input: string) => /先整理需求/.test(input),
+  };
+
+  const chatDecision = await router.route({
+    input: '你是谁',
+    taskBinding: { isFollowUp: false, effectiveInput: '你是谁' },
+    agent,
+    policy: { preferWorkflow: false },
+  });
+  assert.equal(chatDecision.target, 'chat');
+  assert.equal(chatDecision.reason, 'knowledge_chat');
+  assert.equal(chatDecision.intent, 'knowledge_chat');
+
+  const socialDecision = await router.route({
+    input: '你好',
+    taskBinding: { isFollowUp: false, effectiveInput: '你好' },
+    agent,
+    policy: { preferWorkflow: false },
+  });
+  assert.equal(socialDecision.target, 'chat');
+  assert.equal(socialDecision.reason, 'social_chat');
+
+  const taskDecision = await router.route({
+    input: '帮我读取这个目录并导出报告',
+    taskBinding: { isFollowUp: false, effectiveInput: '帮我读取这个目录并导出报告' },
+    agent,
+    policy: { preferWorkflow: true },
+  });
+  assert.equal(taskDecision.target, 'task');
+  assert.equal(taskDecision.reason, 'direct_action_request');
+  assert.equal(taskDecision.intent, 'direct_action');
+
+  const complexDecision = await router.route({
+    input: '帮我先整理需求，再生成周报',
+    taskBinding: { isFollowUp: false, effectiveInput: '帮我先整理需求，再生成周报' },
+    agent,
+    policy: { preferWorkflow: true },
+  });
+  assert.equal(complexDecision.target, 'task');
+  assert.equal(complexDecision.reason, 'workflow_request');
+}
+
+async function testTaskExecutorServiceDelegatesToGraphRunner(): Promise<void> {
+  const agent = createAgent({ llm: new StubLLM() });
+  const executor = new TaskExecutorService({
+    agent,
+    recallLimit: 4,
+    autoContinueOnToolLimit: true,
+    maxContinuationTurns: 2,
+    permissionManager: {
+      getConfig: () => ({ autoGrantDangerous: false, askForPermissions: true }),
+    } as any,
+    memoryProvider: {
+      buildContext: async () => 'memory-context',
+      syncSession: async () => {},
+      archiveSession: async () => undefined,
+    } as any,
+  });
+
+  const result = await executor.executeTurn('你好', {
+    isFollowUp: false,
+    effectiveInput: '你好',
+  });
+
+  assert.equal(result.route, 'agent');
+  assert.equal(typeof result.graphState.currentNode, 'string');
+  assert.equal(result.executionContext.mode, 'fresh_task');
+  assert.equal(result.executionPolicy.permissionStrategy, 'ask_dangerous');
+}
+
+function testTaskExecutorServiceDescribesResumeContexts(): void {
+  const agent = {
+    getConfirmationStatus: () => ({ pending: true }),
+  } as unknown as Agent;
+  const executor = new TaskExecutorService({
+    agent,
+    recallLimit: 4,
+    autoContinueOnToolLimit: true,
+    maxContinuationTurns: 2,
+  });
+
+  const pendingContext = executor.describeExecutionContext({
+    isFollowUp: false,
+    effectiveInput: '继续',
+  });
+  assert.equal(pendingContext.mode, 'pending_interaction');
+  assert.equal(pendingContext.isResuming, true);
+
+  const checkpointExecutor = new TaskExecutorService({
+    agent: {
+      getConfirmationStatus: () => ({ pending: false }),
+    } as unknown as Agent,
+    recallLimit: 4,
+    autoContinueOnToolLimit: true,
+    maxContinuationTurns: 2,
+  });
+
+  const checkpointContext = checkpointExecutor.describeExecutionContext({
+    isFollowUp: true,
+    effectiveInput: '按刚才那个继续',
+  }, {
+    node: 'resume',
+    status: 'waiting',
+    updatedAt: new Date().toISOString(),
+  });
+  assert.equal(checkpointContext.mode, 'checkpoint_resume');
+  assert.equal(checkpointContext.isResuming, true);
+}
+
+async function testCliChatModeAutoSwitchesToWorkflow(): Promise<void> {
+  const originalFunctionMode = configManager.get('functionMode');
+  const originalRouting = configManager.get('functionRouting');
+  const cli = new CLI() as any;
+  let switchedTo: string | undefined;
+  let handledTaskInput: string | undefined;
+
+  try {
+    configManager.set('functionMode', 'chat');
+    configManager.set('functionRouting', {
+      ...originalRouting,
+      allowAutoSwitchFromChatToWorkflow: true,
+      workflowSwitchKeywords: ['切换workflow'],
+    });
+
+    cli.agent = {
+      getConfirmationStatus: () => ({ pending: false }),
+    };
+    cli.switchFunctionMode = async (target: string) => {
+      switchedTo = target;
+    };
+    cli.handleTaskModeMessage = async (input: string) => {
+      handledTaskInput = input;
+    };
+
+    await cli.handleChatModeMessage('切换workflow，帮我整理周报', {
+      isFollowUp: false,
+      effectiveInput: '切换workflow，帮我整理周报',
+    });
+
+    assert.equal(switchedTo, 'workflow');
+    assert.equal(handledTaskInput, '帮我整理周报');
+  } finally {
+    configManager.set('functionMode', originalFunctionMode ?? 'workflow');
+    configManager.set('functionRouting', originalRouting);
+  }
+}
+
+async function testAutoModeWorkflowProgressUsesConversationalCopy(): Promise<void> {
+  const plan = {
+    originalTask: '整理需求并输出结论',
+    steps: [
+      { id: 'step_1', description: '整理需求要点并输出结论' },
+    ],
+  };
+  const fakePlanner = {
+    async createPlan() {
+      return plan;
+    },
+    completeStep() {},
+    failStep() {},
+  };
+  const thinkingMessages: string[] = [];
+  const progressMessages: string[] = [];
+  const originalLog = console.log;
+  const consoleMessages: string[] = [];
+  console.log = (...args: unknown[]) => {
+    consoleMessages.push(args.map(String).join(' '));
+  };
+
+  try {
+    const agent = createAgent({
+      llm: new StubLLM(),
+      planner: fakePlanner as any,
+      config: { agentInteractionMode: 'auto' } as any,
+    });
+    agent.setEventHandler((event) => {
+      if (event.type === 'thinking') {
+        thinkingMessages.push(event.content);
+      }
+      if (event.type === 'plan_progress') {
+        progressMessages.push(event.content);
+      }
+    });
+
+    const clarification = await agent.chat('帮我处理一下');
+    assert.match(clarification, /缺少一些关键信息/);
+
+    const replanned = await agent.respondToPendingInput('整理需求并输出成 markdown');
+    assert.match(replanned || '', /任务规划已创建/);
+
+    const execution = await agent.confirmAction(true);
+    assert.match(execution || '', /任务完成/);
+    assert.equal(thinkingMessages.some(message => message.includes('我先处理第 1/1 步')), true);
+    assert.equal(progressMessages.some(message => message.includes('这一步已经处理完了')), true);
+    assert.equal(consoleMessages.some(message => message.includes('我先处理第 1/1 步')), true);
+  } finally {
+    console.log = originalLog;
+  }
+}
+
+async function testCliChatModeDoesNotAutoSwitchToWorkflow(): Promise<void> {
+  const cli = new CLI() as any;
+  let handledInTaskMode = false;
+  let chatted = false;
+
+  cli.agent = {
+    getConfirmationStatus: () => ({ pending: false }),
+    getMessages: () => [],
+    setRuntimeMemoryContext: () => {},
+    chat: async () => {
+      chatted = true;
+      return 'chat-response';
+    },
+    needsContinuation: () => false,
+  };
+  cli.memoryManager = { setMessages: () => {} };
+  cli.memoryProvider = { buildContext: async () => '', syncSession: async () => {} };
+  cli.streamingOutput = { clear: () => {} };
+  cli.printHybridRouteSummary = () => {};
+  cli.streamResponse = async () => {};
+  cli.handleTaskModeMessage = async () => {
+    handledInTaskMode = true;
+  };
+
+  await cli.handleChatModeMessage('帮我先整理需求，再生成周报并导出文档', {
+    isFollowUp: false,
+    effectiveInput: '帮我先整理需求，再生成周报并导出文档',
+  });
+
+  assert.equal(chatted, true);
+  assert.equal(handledInTaskMode, false);
 }
 
 async function testOfficialDocumentSkillBridges(tempDir: string): Promise<void> {
@@ -3190,6 +5250,89 @@ async function testPlannerProducesConcreteToolCalls(): Promise<void> {
 
   const newsStockPlan = await newsStockPlanner.createPlan('把今天热点新闻整理一下，附带分析相关的股票，然后整理成word文档发我飞书');
   assert.equal(newsStockPlan.steps[0]?.toolCalls?.length || 0, 0);
+
+  const recencyYearPlanner = createPlanner({
+    llm: new StaticResponseLLM(`{
+      "task": "最近烟台有什么活动",
+      "steps": [
+        {
+          "id": "step_1",
+          "description": "搜索近期活动信息",
+          "toolCalls": [
+            {
+              "name": "web_search",
+              "args": {
+                "query": "烟台 近期 活动 2024",
+                "numResults": 10
+              }
+            }
+          ]
+        }
+      ]
+    }`),
+  });
+
+  const recencyYearPlan = await recencyYearPlanner.createPlan('最近烟台有什么活动');
+  assert.equal(recencyYearPlan.steps[0]?.toolCalls?.[0]?.name, 'web_search');
+  const correctedRecencyQuery = String(recencyYearPlan.steps[0]?.toolCalls?.[0]?.args.query || '');
+  assert.equal(/2024/.test(correctedRecencyQuery), false);
+  assert.equal(new RegExp(String(new Date().getFullYear())).test(correctedRecencyQuery), true);
+
+  const historicalYearPlanner = createPlanner({
+    llm: new StaticResponseLLM(`{
+      "task": "查 2024 年烟台有哪些活动",
+      "steps": [
+        {
+          "id": "step_1",
+          "description": "搜索 2024 年活动",
+          "toolCalls": [
+            {
+              "name": "web_search",
+              "args": {
+                "query": "烟台 2024 活动",
+                "numResults": 10
+              }
+            }
+          ]
+        }
+      ]
+    }`),
+  });
+
+  const historicalYearPlan = await historicalYearPlanner.createPlan('查 2024 年烟台有哪些活动');
+  assert.equal(historicalYearPlan.steps[0]?.toolCalls?.[0]?.args.query, '烟台 2024 活动');
+}
+
+async function testPlannerSuppressesRedundantSearchForFollowUpAdjustmentTask(): Promise<void> {
+  const planner = createPlanner({
+    llm: new StaticResponseLLM(`{
+      "task": "follow up export",
+      "steps": [
+        {
+          "id": "step_1",
+          "description": "重新搜索资料",
+          "toolCalls": [
+            { "name": "web_search", "args": { "query": "大模型 数据库 应用" } },
+            { "name": "search_files", "args": { "path": "$WORKSPACE", "content": "数据库" } }
+          ]
+        },
+        {
+          "id": "step_2",
+          "description": "改成 word 文档"
+        }
+      ]
+    }`),
+  });
+
+  const plan = await planner.createPlan([
+    '延续上一任务：分析数据库应用并发我飞书',
+    '上一任务内容：帮我分析大模型在数据库领域的应用，整理成 pdf 发我飞书',
+    '要求：默认保持上一任务的核心目标、交付动作和目标渠道；如果这次跟进只修改格式、路径、标题、发送方式或局部步骤，应在不丢失原目标的前提下调整。',
+    '用户跟进：改成word发我飞书',
+  ].join('\n'));
+
+  assert.equal(plan.steps[0]?.toolCalls, undefined);
+  assert.equal(plan.steps[1]?.toolCalls?.[0]?.name, 'docx_create_from_text');
 }
 
 async function testPlannerPrefersProceduralCandidate(tempDir: string): Promise<void> {
@@ -3301,6 +5444,128 @@ async function testSkillLearningServiceCreatesTodo(tempDir: string): Promise<voi
   const todos = await skillManager.listLearningTodos();
   assert.equal(todos[0]?.suggestedSkill, 'markdown-to-docx-workflow');
   assert.match(todos[0]?.issueSummary || '', /markdown/);
+}
+
+async function testSkillLearningServiceSkipsPlaceholderExportTodo(tempDir: string): Promise<void> {
+  const skillManager = createSkillManager(path.join(tempDir, 'placeholder-todo-skills'));
+  await skillManager.initialize();
+
+  const service = new SkillLearningService({
+    llm: new StaticResponseLLM(`{
+      "shouldTrack": true,
+      "issueSummary": "这条不该被写入。",
+      "suggestedSkill": "should-not-exist"
+    }`),
+    skillManager,
+  });
+
+  await service.processExecution(
+    '生成详细报告并导出 PDF',
+    {
+      id: 'plan_placeholder_fail',
+      originalTask: '生成详细报告并导出 PDF',
+      currentStepIndex: 0,
+      status: 'failed',
+      steps: [
+        { id: 'step_1', description: '撰写详细报告', status: 'completed' },
+        { id: 'step_2', description: '导出 PDF', status: 'failed' },
+      ],
+    },
+    [
+      '[步骤 1] 已生成文本',
+      '[步骤 2] 失败: PDF 文件已创建，但正文校验失败: C:/tmp/report.pdf 缺少预期内容: （此处为报告详细内容，基于搜索结果和分析整理，包含具体的技术细节、应用案例、数据支持和专业分析）',
+    ],
+  );
+
+  const todos = await skillManager.listLearningTodos();
+  assert.equal(todos.length, 0);
+}
+
+async function testToolExecutionGuardRejectsPlaceholderExportInput(): Promise<void> {
+  const guard = new ToolExecutionGuard({
+    getTool: () => undefined,
+  } as any);
+
+  const result = await guard.authorize('pdf_create_from_text', {
+    out: 'report.pdf',
+    text: '# 报告\n\n## 摘要\n本报告系统分析了当前情况...\n\n（此处为报告详细内容，基于搜索结果和分析整理，包含具体的技术细节、应用案例、数据支持和专业分析）',
+    title: '报告',
+  });
+
+  assert.equal(result?.is_error, true);
+  assert.match(result?.output || '', /占位稿或模板骨架/);
+}
+
+async function testToolExecutionGuardRejectsIncompleteStructuredTextWrite(): Promise<void> {
+  const guard = new ToolExecutionGuard({
+    getTool: () => undefined,
+  } as any);
+
+  const result = await guard.authorize('write_file', {
+    path: '大模型在数据库领域的应用详细报告.txt',
+    content: '# 大模型在当今数据库领域的应用分析报告\n\n## 摘要\n本报告系统分析了大模型在数据库领域的最新应用现状...\n\n（此处为报告详细内容，基于搜索结果和分析整理，包含具体的技术细节、应用案例、数据支持和专业分析）\n\n## 1. 引言\n\n## 2. 主要应用场景\n\n## 3. 技术实现架构\n\n## 4. 典型案例分析\n\n## 5. 挑战与限制\n\n## 6. 未来发展趋势\n\n## 7. 结论与建议',
+  });
+
+  assert.equal(result?.is_error, true);
+  assert.match(result?.output || '', /未完成报告骨架|占位稿/);
+}
+
+async function testAgentUsesExpandedBudgetForResearchExportDeliveryTask(): Promise<void> {
+  const agent = createAgent({
+    llm: new StaticResponseLLM('处理完成'),
+  });
+
+  await agent.chat('先搜索资料，整理成 pdf 报告，再发我飞书');
+  const snapshot = agent.getUnifiedStateSnapshot();
+  assert.equal(snapshot.toolBudget.maxToolCallsPerTurn, 36);
+}
+
+async function testAgentUsesLeanBudgetForPlainConversation(): Promise<void> {
+  const agent = createAgent({
+    llm: new StaticResponseLLM('你好，我在。'),
+  });
+
+  await agent.chat('你好，介绍一下你自己');
+  const snapshot = agent.getUnifiedStateSnapshot();
+  assert.equal(snapshot.toolBudget.maxToolCallsPerTurn, 12);
+}
+
+async function testToolExecutionGuardAllowsTemplateTextWrite(): Promise<void> {
+  const guard = new ToolExecutionGuard({
+    getTool: () => undefined,
+  } as any);
+
+  const result = await guard.authorize('write_file', {
+    path: '数据库应用报告模板.txt',
+    content: '# 数据库应用报告模板\n\n（此处为报告详细内容，后续补充）',
+  });
+
+  assert.equal(result, null);
+}
+
+function testContentModeratorDoesNotCountBenignConfirmation(): void {
+  const moderator = createModerator();
+  moderator.recordWarning('是', true);
+  moderator.recordWarning('是', true);
+  moderator.recordWarning('是', true);
+
+  assert.equal(moderator.getWarningCount(), 0);
+}
+
+function testContentModeratorCountsRepeatedViolations(): void {
+  const moderator = createModerator();
+  moderator.recordWarning('你他妈的真烦', true);
+  moderator.recordWarning('你他妈的真烦', true);
+  moderator.recordWarning('你他妈的真烦', true);
+
+  assert.equal(moderator.getWarningCount(), 1);
+}
+
+function testRepairHighBitAsciiMojibake(): void {
+  const garbled = 'ÛÔÏÏÌÝ Message: Óõããåóóæõììù ÷òïôå ôï C:\\Users\\test\\文档\\note.md';
+  const repaired = repairHighBitAsciiMojibake(garbled);
+
+  assert.equal(repaired, '[TOOL] Message: Successfully wrote to C:\\Users\\test\\文档\\note.md');
 }
 
 async function testKnownGapManagerBuildsNotice(tempDir: string): Promise<void> {
@@ -4015,7 +6280,25 @@ async function main(): Promise<void> {
   try {
     await runRegressionStep('testToolOutputBackflow', () => testToolOutputBackflow(tempDir));
     await runRegressionStep('testPermissionAskToggle', () => testPermissionAskToggle(tempDir));
+    await runRegressionStep('testPermissionManagerAllowsLarkCliLocatorProbe', () => testPermissionManagerAllowsLarkCliLocatorProbe(tempDir));
+    await runRegressionStep('testPermissionManagerAllowsReadOnlyShellCommands', () => testPermissionManagerAllowsReadOnlyShellCommands(tempDir));
+    await runRegressionStep('testPermissionManagerAllowsLarkCliHelpCommands', () => testPermissionManagerAllowsLarkCliHelpCommands(tempDir));
     await runRegressionStep('testSandboxAllowedPathNormalization', () => testSandboxAllowedPathNormalization(tempDir));
+    await runRegressionStep('testPhaseAwareWorkflowLintAndQuickFixes', () => testPhaseAwareWorkflowLintAndQuickFixes(tempDir));
+    await runRegressionStep('testSessionTaskStackContextSnapshot', () => testSessionTaskStackContextSnapshot());
+    await runRegressionStep('testSessionTaskStackPersistence', () => testSessionTaskStackPersistence(tempDir));
+    await runRegressionStep('testTaskContextJsonPayload', () => testTaskContextJsonPayload());
+    await runRegressionStep('testAgentGraphRunnerDirectAction', () => testAgentGraphRunnerDirectAction());
+    await runRegressionStep('testAgentGraphRunnerMainChain', () => testAgentGraphRunnerMainChain());
+    await runRegressionStep('testAgentGraphRunnerAutoConfirmPlanExecutionOption', () => testAgentGraphRunnerAutoConfirmPlanExecutionOption());
+    await runRegressionStep('testAgentGraphRunnerCheckpointRestorePlan', () => testAgentGraphRunnerCheckpointRestorePlan());
+    await runRegressionStep('testAgentGraphRunnerCheckpointRestorePlanResume', () => testAgentGraphRunnerCheckpointRestorePlanResume());
+    await runRegressionStep('testUnifiedAgentStateSnapshot', () => testUnifiedAgentStateSnapshot());
+    await runRegressionStep('testDirectActionConversationPreambleTemplates', () => testDirectActionConversationPreambleTemplates());
+    await runRegressionStep('testIntentResolverRejectsGenericKnowledgeQueryAsBrowserSearch', () => testIntentResolverRejectsGenericKnowledgeQueryAsBrowserSearch());
+    await runRegressionStep('testBrowserActionHandlerRejectsGenericKnowledgeQueryIntent', () => testBrowserActionHandlerRejectsGenericKnowledgeQueryIntent());
+    await runRegressionStep('testBrowserActionHandlerRoutesCompositeWebsiteTaskToBrowserAgent', () => testBrowserActionHandlerRoutesCompositeWebsiteTaskToBrowserAgent());
+    await runRegressionStep('testBrowserActionHandlerRoutesOpenThenSingleOperationToBrowserAgent', () => testBrowserActionHandlerRoutesOpenThenSingleOperationToBrowserAgent());
     await runRegressionStep('testOnboardingParser', () => testOnboardingParser());
     await runRegressionStep('testDirectActionRouter', () => testDirectActionRouter(tempDir));
     await runRegressionStep('testNestedSkillDirectoryDiscovery', () => testNestedSkillDirectoryDiscovery(tempDir));
@@ -4023,6 +6306,7 @@ async function main(): Promise<void> {
     await runRegressionStep('testCrLfMarkdownOnlySkillLoads', () => testCrLfMarkdownOnlySkillLoads(tempDir));
     await runRegressionStep('testMarkdownOnlySkillDescriptionCleanup', () => testMarkdownOnlySkillDescriptionCleanup(tempDir));
     await runRegressionStep('testPlannerProducesConcreteToolCalls', () => testPlannerProducesConcreteToolCalls());
+    await runRegressionStep('testPlannerSuppressesRedundantSearchForFollowUpAdjustmentTask', () => testPlannerSuppressesRedundantSearchForFollowUpAdjustmentTask());
     await runRegressionStep('testLearnedSkillCandidateLifecycle', () => testLearnedSkillCandidateLifecycle(tempDir));
     await runRegressionStep('testMemoryManagerResume', () => testMemoryManagerResume(tempDir));
     await runRegressionStep('testUnifiedToolRegistry', () => testUnifiedToolRegistry(tempDir));
@@ -4042,6 +6326,9 @@ async function main(): Promise<void> {
     await runRegressionStep('testSendLarkMessagePrefersFileOverText', () => testSendLarkMessagePrefersFileOverText(tempDir));
     await runRegressionStep('testLarkRelayParsesCompactMessage', () => testLarkRelayParsesCompactMessage());
     await runRegressionStep('testLarkRelayFiltersUnexpectedSender', () => testLarkRelayFiltersUnexpectedSender());
+    await runRegressionStep('testLarkRelayParsesAttachmentMessage', () => testLarkRelayParsesAttachmentMessage());
+    await runRegressionStep('testLarkRelayDefaultReceiveDir', () => testLarkRelayDefaultReceiveDir());
+    await runRegressionStep('testLarkRelayMaterializesAttachmentContent', () => testLarkRelayMaterializesAttachmentContent());
     await runRegressionStep('testLarkBridgeSpawnSpecBypassesCmdWrapper', () => testLarkBridgeSpawnSpecBypassesCmdWrapper(tempDir));
     await runRegressionStep('testCliNewsPushRejectsUserIdAndIgnoresLegacyUserDefault', () => testCliNewsPushRejectsUserIdAndIgnoresLegacyUserDefault());
     await runRegressionStep('testMemoryProviderBaselineIncludesArtifactHints', () => testMemoryProviderBaselineIncludesArtifactHints(tempDir));
@@ -4055,13 +6342,39 @@ async function main(): Promise<void> {
     await runRegressionStep('testContextManagerDropsDanglingAssistantToolCalls', () => testContextManagerDropsDanglingAssistantToolCalls());
     await runRegressionStep('testContextManagerCompressionKeepsToolMessagesValid', () => testContextManagerCompressionKeepsToolMessagesValid());
     await runRegressionStep('testCliSlashCommandCompletion', () => testCliSlashCommandCompletion());
+    await runRegressionStep('testCliAgentInteractionMode', () => testCliAgentInteractionMode());
+    await runRegressionStep('testCliSuppressesDirectActionPreambleInTaskMode', () => testCliSuppressesDirectActionPreambleInTaskMode());
+    await runRegressionStep('testCliAutoModeUsesWorkflowHandlerForComplexTask', () => testCliAutoModeUsesWorkflowHandlerForComplexTask());
+    await runRegressionStep('testCliAutoModeUsesChatRouterForConversation', () => testCliAutoModeUsesChatRouterForConversation());
+    await runRegressionStep('testCliChatModeDoesNotAutoSwitchToWorkflow', () => testCliChatModeDoesNotAutoSwitchToWorkflow());
+    await runRegressionStep('testCliChatModeAutoSwitchesToWorkflow', () => testCliChatModeAutoSwitchesToWorkflow());
+    await runRegressionStep('testChatRouterSeparatesConversationAndTask', () => testChatRouterSeparatesConversationAndTask());
+    await runRegressionStep('testTaskExecutorServiceDelegatesToGraphRunner', () => testTaskExecutorServiceDelegatesToGraphRunner());
+    await runRegressionStep('testTaskExecutorServiceDescribesResumeContexts', () => testTaskExecutorServiceDescribesResumeContexts());
+    await runRegressionStep('testAutoModeWorkflowProgressUsesConversationalCopy', () => testAutoModeWorkflowProgressUsesConversationalCopy());
+    await runRegressionStep('testCliVisionAnalyzeArgParsing', () => testCliVisionAnalyzeArgParsing());
+    await runRegressionStep('testCliParseBrowserScriptActions', () => testCliParseBrowserScriptActions(tempDir));
     await runRegressionStep('testCliConfigReloadCommand', () => testCliConfigReloadCommand());
     await runRegressionStep('testCliRelayCommands', () => testCliRelayCommands());
+    await runRegressionStep('testCliSendsFinalAssistantReplyToLarkChat', () => testCliSendsFinalAssistantReplyToLarkChat());
+    await runRegressionStep('testCliSendsPendingInteractionPromptToLarkChat', () => testCliSendsPendingInteractionPromptToLarkChat());
+    await runRegressionStep('testCliForwardsPermissionPromptToLarkAndConsumesLarkReply', () => testCliForwardsPermissionPromptToLarkAndConsumesLarkReply(tempDir));
     await runRegressionStep('testAgentInteractionService', () => testAgentInteractionService());
+    await runRegressionStep('testWeatherToLarkRequestSkipsClarification', () => testWeatherToLarkRequestSkipsClarification());
     await runRegressionStep('testHybridClientRouting', () => testHybridClientRouting());
+    await runRegressionStep('testOllamaVisionService', () => testOllamaVisionService(tempDir));
+    await runRegressionStep('testBrowserSessionExtensionBootstrap', () => testBrowserSessionExtensionBootstrap(tempDir));
+    await runRegressionStep('testBrowserAutomationScriptEnvironment', () => testBrowserAutomationScriptEnvironment(tempDir));
+    await runRegressionStep('testBuiltInBrowserAutomationEnvironmentDefaults', () => testBuiltInBrowserAutomationEnvironmentDefaults(tempDir));
+    await runRegressionStep('testBrowserSessionExpectResultMismatchStrategies', () => testBrowserSessionExpectResultMismatchStrategies(tempDir));
+    await runRegressionStep('testBrowserAutomationExpectResultMismatchStrategies', () => testBrowserAutomationExpectResultMismatchStrategies(tempDir));
+    await runRegressionStep('testBrowserActionPlannerScriptActions', () => testBrowserActionPlannerScriptActions());
+    await runRegressionStep('testBrowserWorkflowTemplateIncludesScriptScaffolding', () => testBrowserWorkflowTemplateIncludesScriptScaffolding(tempDir));
     await runRegressionStep('testDeepSeekRouterBehavior', () => testDeepSeekRouterBehavior());
     await runRegressionStep('testMemPalaceSystemPromptProtocol', () => testMemPalaceSystemPromptProtocol());
     await runRegressionStep('testGreetingDoesNotTriggerPlanning', () => testGreetingDoesNotTriggerPlanning());
+    await runRegressionStep('testAmbiguousShortInputRequestsClarification', () => testAmbiguousShortInputRequestsClarification());
+    await runRegressionStep('testAmbiguousShortInputClarificationReturnsDirectResponse', () => testAmbiguousShortInputClarificationReturnsDirectResponse());
     await runRegressionStep('testDefaultPromptEncouragesDirectPaths', () => testDefaultPromptEncouragesDirectPaths());
     await runRegressionStep('testCliShellTextUtilities', () => testCliShellTextUtilities());
     await runRegressionStep('testSharedExportIntentRules', () => testSharedExportIntentRules());
@@ -4076,7 +6389,18 @@ async function main(): Promise<void> {
     await runRegressionStep('testAgentStoresArtifactOutputInMemory', () => testAgentStoresArtifactOutputInMemory());
     await runRegressionStep('testSkillLearningServiceCandidateAssessment', () => testSkillLearningServiceCandidateAssessment());
     await runRegressionStep('testSkillLearningServiceCreatesTodo', () => testSkillLearningServiceCreatesTodo(tempDir));
+    await runRegressionStep('testSkillLearningServiceSkipsPlaceholderExportTodo', () => testSkillLearningServiceSkipsPlaceholderExportTodo(tempDir));
     await runRegressionStep('testLearningTodoCanSeedCandidate', () => testLearningTodoCanSeedCandidate(tempDir));
+    await runRegressionStep('testToolExecutionGuardRejectsPlaceholderExportInput', () => testToolExecutionGuardRejectsPlaceholderExportInput());
+    await runRegressionStep('testToolExecutionGuardRejectsIncompleteStructuredTextWrite', () => testToolExecutionGuardRejectsIncompleteStructuredTextWrite());
+    await runRegressionStep('testAgentUsesExpandedBudgetForResearchExportDeliveryTask', () => testAgentUsesExpandedBudgetForResearchExportDeliveryTask());
+    await runRegressionStep('testAgentUsesLeanBudgetForPlainConversation', () => testAgentUsesLeanBudgetForPlainConversation());
+    await runRegressionStep('testToolExecutionGuardAllowsTemplateTextWrite', () => testToolExecutionGuardAllowsTemplateTextWrite());
+    await runRegressionStep('testContentModeratorDoesNotCountBenignConfirmation', () => testContentModeratorDoesNotCountBenignConfirmation());
+    await runRegressionStep('testContentModeratorCountsRepeatedViolations', () => testContentModeratorCountsRepeatedViolations());
+    await runRegressionStep('testRepairHighBitAsciiMojibake', () => testRepairHighBitAsciiMojibake());
+    await runRegressionStep('testSessionTaskStackBindsShortAdjustmentFollowUp', () => testSessionTaskStackBindsShortAdjustmentFollowUp());
+    await runRegressionStep('testSessionTaskStackKeepsStandaloneNewTaskUnbound', () => testSessionTaskStackKeepsStandaloneNewTaskUnbound());
     await runRegressionStep('testKnownGapManagerBuildsNotice', () => testKnownGapManagerBuildsNotice(tempDir));
     await runRegressionStep('testAgentKnownGapNotice', () => testAgentKnownGapNotice(tempDir));
     await runRegressionStep('testAgentIntentContractRejectsMismatchedTool', () => testAgentIntentContractRejectsMismatchedTool());

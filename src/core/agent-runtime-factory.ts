@@ -48,6 +48,7 @@ export interface AgentRuntimeFactoryOptions {
   contextManager: ContextManager;
   maxIterations: number;
   maxToolCallsPerTurn: number;
+  getMaxToolCallsPerTurn?: () => number;
   getTools: () => Tool[];
   getLastReusableContent: () => string;
   setLastReusableContent: (content: string) => void;
@@ -71,6 +72,9 @@ export interface AgentRuntimeComponents {
   knownGapManager: KnownGapManager;
   planRuntimeService: AgentPlanRuntimeService;
   toolExecutionLogger: AgentToolExecutionLogger;
+  resolvePlannedToolArgs: (args: Record<string, unknown>) => Record<string, unknown>;
+  executeToolCall: (toolCall: ToolCall) => Promise<ToolResult>;
+  isGenericPlan: (plan: Plan, input: string) => boolean;
   planExecutionService: PlanExecutionService;
   interactionService: AgentInteractionService;
   planningService: AgentPlanningService;
@@ -79,6 +83,41 @@ export interface AgentRuntimeComponents {
 }
 
 export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions): AgentRuntimeComponents {
+  const interactionMode = options.config.agentInteractionMode === 'chat' || options.config.agentInteractionMode === 'task'
+    ? options.config.agentInteractionMode
+    : 'auto';
+  const useConversationalWorkflowFeedback = interactionMode === 'auto';
+  const formatStepStartMessage = (stepNum: number, totalSteps: number, description: string): string => (
+    useConversationalWorkflowFeedback
+      ? `我先处理第 ${stepNum}/${totalSteps} 步：${description}`
+      : `执行步骤 ${stepNum}: ${description}`
+  );
+  const formatStepStartConsole = (stepNum: number, totalSteps: number, description: string): string => (
+    useConversationalWorkflowFeedback
+      ? `\n🔄 我先处理第 ${stepNum}/${totalSteps} 步：${description}`
+      : `\n🔄 执行步骤 ${stepNum}/${totalSteps}: ${description}`
+  );
+  const formatStepCompletedMessage = (description: string): string => (
+    useConversationalWorkflowFeedback
+      ? `这一步已经处理完了：${description}`
+      : `步骤完成: ${description}`
+  );
+  const formatStepCompletedConsole = (stepNum: number): string => (
+    useConversationalWorkflowFeedback
+      ? `✅ 第 ${stepNum} 步已完成，我继续往下推进。`
+      : `✅ 步骤 ${stepNum} 完成`
+  );
+  const formatStepFailedMessage = (description: string): string => (
+    useConversationalWorkflowFeedback
+      ? `这一步暂时卡住了：${description}`
+      : `步骤失败: ${description}`
+  );
+  const formatStepFailedConsole = (stepNum: number, errorMessage: string): string => (
+    useConversationalWorkflowFeedback
+      ? `❌ 第 ${stepNum} 步遇到问题：${errorMessage}`
+      : `❌ 步骤 ${stepNum} 失败: ${errorMessage}`
+  );
+
   let interactionService!: AgentInteractionService;
   let planExecutionService!: PlanExecutionService;
   let planningService!: AgentPlanningService;
@@ -272,11 +311,11 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
   planExecutionService = new PlanExecutionService({
     onStepStart: (plan, step, stepIndex, totalSteps) => {
       const stepNum = stepIndex + 1;
-      console.log(chalk.yellow(`\n🔄 执行步骤 ${stepNum}/${totalSteps}: ${step.description}`));
-      options.onEvent?.({ type: 'thinking', content: `执行步骤 ${stepNum}: ${step.description}` });
+      console.log(chalk.yellow(formatStepStartConsole(stepNum, totalSteps, step.description)));
+      options.onEvent?.({ type: 'thinking', content: formatStepStartMessage(stepNum, totalSteps, step.description) });
       options.onEvent?.({
         type: 'plan_progress',
-        content: `步骤开始: ${step.description}`,
+        content: formatStepStartMessage(stepNum, totalSteps, step.description),
         plan,
         planProgress: {
           stepId: step.id,
@@ -291,7 +330,7 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
       options.planner?.completeStep(step.id, result);
       options.onEvent?.({
         type: 'plan_progress',
-        content: `步骤完成: ${step.description}`,
+        content: formatStepCompletedMessage(step.description),
         plan,
         planProgress: {
           stepId: step.id,
@@ -302,12 +341,12 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
           result,
         },
       });
-      console.log(chalk.green(`✅ 步骤 ${stepIndex + 1} 完成`));
+      console.log(chalk.green(formatStepCompletedConsole(stepIndex + 1)));
     },
     onStepFailed: (plan, step, stepIndex, totalSteps, errorMessage) => {
       options.onEvent?.({
         type: 'plan_progress',
-        content: `步骤失败: ${step.description}`,
+        content: formatStepFailedMessage(step.description),
         plan,
         planProgress: {
           stepId: step.id,
@@ -318,7 +357,7 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
           result: errorMessage,
         },
       });
-      console.log(chalk.red(`❌ 步骤 ${stepIndex + 1} 失败: ${errorMessage}`));
+      console.log(chalk.red(formatStepFailedConsole(stepIndex + 1, errorMessage)));
     },
     executePlannedToolCalls: (step, stepContext) => planRuntimeService.executePlannedToolCalls(step, stepContext),
     generateStepResponse: async (stepContext) => {
@@ -342,6 +381,8 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
     executePlan: (originalTask, plan) => planExecutionService.executePlan(originalTask, plan),
     resumePlanExecution: (resumeState, note) => planRuntimeService.resumePlanExecution(resumeState, note),
     chatWithPlanning: (input) => planningService.chatWithPlanning(input),
+    detectComplexTask: (input) => planningService.detectComplexTask(input),
+    generateDirectResponse: () => options.generateResponse(),
     setState: (state) => options.setState(state),
     setLastUserInput: (input) => {
       options.setLastUserInput(input);
@@ -382,7 +423,9 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
     isToolOverLimit: () => options.isToolOverLimit(),
     onToolLimit: () => {
       options.setLastStopReason('tool_limit');
-      console.log(chalk.yellow(`\n⚠️ 工具调用次数达到上限 (${options.maxToolCallsPerTurn})，强制结束当前响应`));
+      console.log(chalk.yellow(useConversationalWorkflowFeedback
+        ? '\n⚠️ 这一轮调用工具已经比较多了，我先收一下当前结果，再继续往下处理。'
+        : `\n⚠️ 工具调用次数达到上限 (${options.getMaxToolCallsPerTurn?.() ?? options.maxToolCallsPerTurn})，强制结束当前响应`));
     },
     onIterationStart: (iteration) => {
       options.setIteration(iteration);
@@ -410,6 +453,9 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
     knownGapManager,
     planRuntimeService,
     toolExecutionLogger,
+    resolvePlannedToolArgs: (args) => plannedToolArgsResolver.resolve(args),
+    executeToolCall: (toolCall) => toolCallService.executeToolCall(toolCall),
+    isGenericPlan: (plan, input) => planningService.isGenericPlan(plan, input),
     planExecutionService,
     interactionService,
     planningService,

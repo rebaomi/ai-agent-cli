@@ -6,9 +6,10 @@ import type { PermissionManager } from './permission-manager.js';
 import type { DirectActionResult } from './direct-action-router.js';
 import { LarkDeliveryWorkflow, type DirectActionWorkflowRuntime } from './workflows/lark-delivery.js';
 import type { DirectActionHandler } from './direct-actions/request-handler.js';
-import type { BrowserActionRuntime, DocumentActionRuntime, ExternalSearchRuntime, FileActionRuntime, LarkWorkflowRuntime, MemoryActionRuntime, ObsidianNoteRuntime } from './direct-actions/runtime-context.js';
+import type { BrowserActionRuntime, DocumentActionRuntime, ExternalSearchRuntime, FileActionRuntime, LarkWorkflowRuntime, MemoryActionRuntime, ObsidianNoteRuntime, VisionActionRuntime } from './direct-actions/runtime-context.js';
 import { LarkWorkflowHandler } from './direct-actions/handlers/lark-workflow-handler.js';
 import { BrowserActionHandler } from './direct-actions/handlers/browser-action-handler.js';
+import { VisionActionHandler } from './direct-actions/handlers/vision-action-handler.js';
 import { ObsidianNoteHandler } from './direct-actions/handlers/obsidian-note-handler.js';
 import { ExternalSearchHandler } from './direct-actions/handlers/external-search-handler.js';
 import { FileActionHandler } from './direct-actions/handlers/file-action-handler.js';
@@ -22,6 +23,7 @@ import { DirectActionRoutingSupport } from './direct-actions/routing-support.js'
 import { isUnavailableDocxSkillResult } from './skill-execution-error.js';
 import { DirectActionToolSupport } from './direct-actions/tool-support.js';
 import { extractObsidianVaultPath } from './obsidian-config.js';
+import { createOllamaVisionService } from './ollama-vision-service.js';
 
 export interface DirectActionRuntimeFactoryOptions {
   builtInTools: BuiltInTools;
@@ -60,6 +62,7 @@ interface DirectActionHandlerRuntimeBundle {
   larkDeliveryWorkflow: LarkDeliveryWorkflow;
   larkWorkflowRuntime: LarkWorkflowRuntime;
   browserActionRuntime: BrowserActionRuntime;
+  visionActionRuntime: VisionActionRuntime;
   obsidianNoteRuntime: ObsidianNoteRuntime;
   externalSearchRuntime: ExternalSearchRuntime;
   fileActionRuntime: FileActionRuntime;
@@ -73,9 +76,10 @@ export function createDirectActionRuntimeComponents(options: DirectActionRuntime
   const handlers: DirectActionHandler[] = [
     new MemoryActionHandler(runtimeBundle.memoryActionRuntime),
     new LarkWorkflowHandler(runtimeBundle.larkWorkflowRuntime),
+    new ExternalSearchHandler(runtimeBundle.externalSearchRuntime),
+    new VisionActionHandler(runtimeBundle.visionActionRuntime),
     new BrowserActionHandler(runtimeBundle.browserActionRuntime),
     new ObsidianNoteHandler(runtimeBundle.obsidianNoteRuntime),
-    new ExternalSearchHandler(runtimeBundle.externalSearchRuntime),
     new FileActionHandler(runtimeBundle.fileActionRuntime),
     new DocumentActionHandler(runtimeBundle.documentActionRuntime),
   ];
@@ -136,6 +140,7 @@ function createDirectActionHandlerRuntimeBundle(
     larkDeliveryWorkflow: new LarkDeliveryWorkflow(workflowRuntime),
     larkWorkflowRuntime: createLarkWorkflowRuntime(options),
     browserActionRuntime: createBrowserActionRuntime(sharedToolRuntime, options),
+    visionActionRuntime: createVisionActionRuntime(options, supportBundle.routingSupport),
     obsidianNoteRuntime: createObsidianNoteRuntime({
       executeBuiltInTool: sharedToolRuntime.executeBuiltInTool,
       routingSupport: supportBundle.routingSupport,
@@ -280,5 +285,35 @@ function createObsidianNoteRuntime(input: {
     normalizePath: (value) => input.routingSupport.normalizePath(value),
     splitExplicitPaths: (rawInput) => input.routingSupport.splitExplicitPaths(rawInput),
     getVaultPath: () => extractObsidianVaultPath(input.config),
+  };
+}
+
+function createVisionActionRuntime(
+  options: DirectActionRuntimeFactoryOptions,
+  routingSupport: DirectActionRoutingSupport,
+): VisionActionRuntime {
+  const config = options.config && typeof options.config === 'object' ? options.config as Record<string, unknown> : {};
+  const ollamaConfig = config.ollama && typeof config.ollama === 'object'
+    ? config.ollama as { baseUrl?: string; model?: string; visionModel?: string; visionMaxImages?: number; temperature?: number; maxTokens?: number; systemPrompt?: string }
+    : {};
+  const visionService = createOllamaVisionService({
+    workspace: options.workspace,
+    appBaseDir: typeof config.appBaseDir === 'string' ? config.appBaseDir : undefined,
+    artifactOutputDir: typeof config.artifactOutputDir === 'string' ? config.artifactOutputDir : undefined,
+    documentOutputDir: typeof config.documentOutputDir === 'string' ? config.documentOutputDir : undefined,
+    ollamaConfig: {
+      baseUrl: ollamaConfig.baseUrl || 'http://localhost:11434',
+      model: ollamaConfig.model || 'llama3.2',
+      visionModel: ollamaConfig.visionModel,
+      visionMaxImages: ollamaConfig.visionMaxImages,
+      temperature: ollamaConfig.temperature,
+      maxTokens: ollamaConfig.maxTokens,
+      systemPrompt: ollamaConfig.systemPrompt,
+    },
+  });
+
+  return {
+    analyzeTargets: (input) => visionService.analyzeTargets(input),
+    extractPathCandidates: (input) => routingSupport.extractPathCandidates(input),
   };
 }

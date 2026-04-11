@@ -36,12 +36,17 @@ export interface ToolResult {
   tool_call_id: string;
   output?: string;
   is_error?: boolean;
+  errorType?: string;
+  statusCode?: string;
+  metadata?: Record<string, unknown>;
   content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string; data?: string; mimeType?: string }>;
 }
 
 export interface LLMConfig {
   baseUrl: string;
   model: string;
+  visionModel?: string;
+  visionMaxImages?: number;
   temperature?: number;
   maxTokens?: number;
   tools?: Tool[];
@@ -74,6 +79,206 @@ export interface HybridLLMConfig {
   localAvailabilityCacheMs?: number;
 }
 
+export interface DirectActionConversationModeConfig {
+  enabled?: boolean;
+  preambleThreshold?: number;
+}
+
+export interface DirectActionConfig {
+  conversationMode?: DirectActionConversationModeConfig;
+}
+
+export type AgentInteractionMode = 'auto' | 'chat' | 'task';
+export type FunctionMode = 'chat' | 'workflow';
+
+export interface FunctionRoutingConfig {
+  preferWorkflow?: boolean;
+  allowAutoSwitchFromChatToWorkflow?: boolean;
+  announceRouteDecisions?: boolean;
+  socialChatKeywords?: string[];
+  knowledgeChatKeywords?: string[];
+  directActionKeywords?: string[];
+  workflowKeywords?: string[];
+  workflowSwitchKeywords?: string[];
+  chatSwitchKeywords?: string[];
+}
+
+export const TASK_CONTEXT_SCHEMA_VERSION = 'task-context/v1' as const;
+export const AGENT_GRAPH_STATE_SCHEMA_VERSION = 'agent-graph-state/v1' as const;
+
+export type AgentGraphNode = 'direct_action' | 'clarify' | 'plan' | 'execute_step' | 'pause_for_input' | 'resume' | 'finalize';
+export type AgentCheckpointStatus = 'running' | 'waiting' | 'completed' | 'failed';
+export type AgentGraphMode = 'fresh' | 'resume';
+export type AgentGraphRoute = 'direct_action' | 'agent';
+
+export interface AgentGraphCheckpoint {
+  node: AgentGraphNode;
+  status: AgentCheckpointStatus;
+  updatedAt: string;
+  summary?: string;
+  input?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentTaskBindingSnapshot {
+  isFollowUp: boolean;
+  effectiveInput: string;
+  boundTask?: SessionTaskRecord;
+}
+
+export interface AgentPendingInteractionSnapshot {
+  type: 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume';
+  prompt?: string;
+  originalTask?: string;
+  hasPlan: boolean;
+  hasResumeState: boolean;
+}
+
+export interface AgentPlanResumeSnapshot {
+  originalTask: string;
+  nextStepIndex: number;
+  blockedStepDescription: string;
+  blockedReason: string;
+  resultCount: number;
+}
+
+export interface AgentToolBudgetSnapshot {
+  iteration: number;
+  toolCallCount: number;
+  maxToolCallsPerTurn: number;
+  maxIterations: number;
+  lastStopReason: 'completed' | 'tool_limit' | 'max_iterations' | 'error';
+  needsContinuation: boolean;
+}
+
+export interface UnifiedAgentState {
+  state: 'IDLE' | 'THINKING' | 'TOOL_CALLING' | 'WAITING_CONFIRMATION' | 'RESPONDING';
+  lastUserInput: string;
+  runtimeMemoryContext?: string;
+  messages: Message[];
+  taskBinding?: AgentTaskBindingSnapshot;
+  pendingInteraction?: AgentPendingInteractionSnapshot;
+  planResume?: AgentPlanResumeSnapshot;
+  toolBudget: AgentToolBudgetSnapshot;
+  checkpoint?: AgentGraphCheckpoint;
+}
+
+export interface AgentGraphState extends UnifiedAgentState {
+  schemaVersion: typeof AGENT_GRAPH_STATE_SCHEMA_VERSION;
+  mode: AgentGraphMode;
+  route: AgentGraphRoute;
+  originalInput: string;
+  effectiveInput: string;
+  currentNode: AgentGraphNode;
+  status: AgentCheckpointStatus;
+  output?: string;
+}
+
+export type SessionTaskChannel = 'direct_action' | 'agent';
+export type SessionTaskStatus = 'completed' | 'failed';
+
+export interface SessionTaskRecord {
+  id: string;
+  channel: SessionTaskChannel;
+  title: string;
+  input: string;
+  effectiveInput?: string;
+  category?: string;
+  handlerName?: string;
+  status: SessionTaskStatus;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BrowserAgentObserveConfig {
+  useScreenshotByDefault?: boolean;
+  forceScreenshotAfterFailures?: number;
+  fullPageScreenshot?: boolean;
+  maxDomNodes?: number;
+  maxTextChars?: number;
+}
+
+export interface BrowserAgentOptimizationConfig {
+  enableStateCache?: boolean;
+  enableDiffObservation?: boolean;
+  enableRuleFastPath?: boolean;
+  enableActionBatching?: boolean;
+}
+
+export interface BrowserAgentSafetyKeywordPolicy {
+  global?: string[];
+  financial?: string[];
+  privacy?: string[];
+  illegal?: string[];
+}
+
+export interface BrowserAgentSafetyDomainPolicy {
+  name?: string;
+  match: string[];
+  allowKeywords?: BrowserAgentSafetyKeywordPolicy;
+  blockKeywords?: BrowserAgentSafetyKeywordPolicy;
+  blockFinancialActions?: boolean;
+  blockPrivacyActions?: boolean;
+  blockIllegalActions?: boolean;
+}
+
+export interface BrowserAgentSafetyConfig {
+  enabled?: boolean;
+  blockFinancialActions?: boolean;
+  blockPrivacyActions?: boolean;
+  blockIllegalActions?: boolean;
+  allowKeywords?: BrowserAgentSafetyKeywordPolicy;
+  blockKeywords?: BrowserAgentSafetyKeywordPolicy;
+  domainPolicies?: BrowserAgentSafetyDomainPolicy[];
+}
+
+export interface BrowserAgentDebugConfig {
+  saveTrace?: boolean;
+  saveScreenshotsOnFailure?: boolean;
+}
+
+export interface BrowserAgentUserscriptConfig {
+  paths?: string[];
+  inline?: string[];
+  runAt?: 'document-start' | 'document-end';
+  enabled?: boolean;
+}
+
+export type BrowserScriptResultMismatchStrategy = 'record-only' | 'warn' | 'hard-fail';
+
+export interface BrowserAgentConfig {
+  enabled?: boolean;
+  mode?: 'off' | 'hybrid' | 'smart';
+  browser?: 'chrome' | 'edge' | 'chromium';
+  headless?: boolean;
+  timeoutMs?: number;
+  userDataDir?: string;
+  executablePath?: string;
+  extensionPaths?: string[];
+  initScriptPaths?: string[];
+  initScripts?: string[];
+  pageScriptPaths?: string[];
+  pageScripts?: string[];
+  userscripts?: BrowserAgentUserscriptConfig;
+  workflowDir?: string;
+  autoMatchWorkflows?: boolean;
+  preferredLocalProvider?: 'ollama';
+  fallbackProvider?: 'default' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini';
+  ollamaHealthCheckUrl?: string;
+  ollamaHealthCacheMs?: number;
+  plannerModel?: string;
+  extractorModel?: string;
+  visionProvider?: 'default' | 'ollama' | 'deepseek' | 'kimi' | 'glm' | 'doubao' | 'minimax' | 'openai' | 'claude' | 'gemini';
+  expectResultMismatchStrategy?: BrowserScriptResultMismatchStrategy;
+  maxSteps?: number;
+  maxActionsPerPlan?: number;
+  observe?: BrowserAgentObserveConfig;
+  optimization?: BrowserAgentOptimizationConfig;
+  safety?: BrowserAgentSafetyConfig;
+  debug?: BrowserAgentDebugConfig;
+}
+
 export interface MemoryConfig {
   backend?: 'local' | 'mempalace' | 'hybrid';
   recallLimit?: number;
@@ -99,6 +304,8 @@ export interface LarkRelayConfig {
   allowedChatIds?: string[];
   allowedSenderIds?: string[];
   allowCommands?: boolean;
+  downloadAttachments?: boolean;
+  receiveDir?: string;
   cliBin?: string;
 }
 
@@ -121,10 +328,15 @@ export interface AgentConfig {
   claude?: LLMConfig;
   gemini?: LLMConfig;
   hybrid?: HybridLLMConfig;
+  browserAgent?: BrowserAgentConfig;
   mcp?: MCPConfig[];
   lsp?: LSPServerConfig[];
   sandbox?: SandboxConfig;
   memory?: MemoryConfig;
+  directAction?: DirectActionConfig;
+  functionMode?: FunctionMode;
+  functionRouting?: FunctionRoutingConfig;
+  agentInteractionMode?: AgentInteractionMode;
   appBaseDir?: string;
   artifactOutputDir?: string;
   documentOutputDir?: string;

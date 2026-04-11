@@ -1,6 +1,11 @@
 import { existsSync, promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type { BrowserAgentSafetyConfig, BrowserAgentUserscriptConfig, BrowserScriptResultMismatchStrategy } from '../types/index.js';
+import type { BrowserScriptResultContract } from '../browser-agent/domain/types.js';
+import { formatScriptActionLogText, resolveScriptResultValidationHandling, validateScriptResultContract } from '../browser-agent/script-result-validation.js';
+import { BrowserSafetyInterruptionError, SensitiveOperationGuard } from '../browser-agent/safety/sensitive-operation-guard.js';
+import { resolveUserPath } from './path-resolution.js';
 
 export type BrowserTarget = 'chrome' | 'edge' | 'chromium';
 
@@ -10,6 +15,11 @@ export type BrowserAutomationAction = {
   value?: string;
   key?: string;
   url?: string;
+  script?: string;
+  api?: string;
+  args?: unknown[];
+  enabled?: boolean;
+  expectResult?: BrowserScriptResultContract;
   timeoutMs?: number;
   path?: string;
   fullPage?: boolean;
@@ -20,11 +30,65 @@ export interface BrowserAutomationOptions {
   url: string;
   actions?: BrowserAutomationAction[];
   browser?: BrowserTarget;
+  executablePath?: string;
   headless?: boolean;
   keepOpen?: boolean;
   timeoutMs?: number;
+  workspace?: string;
+  appBaseDir?: string;
+  artifactOutputDir?: string;
+  documentOutputDir?: string;
+  userDataDir?: string;
+  extensionPaths?: string[];
+  initScriptPaths?: string[];
+  initScripts?: string[];
+  pageScriptPaths?: string[];
+  pageScripts?: string[];
+  userscripts?: BrowserAgentUserscriptConfig;
+  expectResultMismatchStrategy?: BrowserScriptResultMismatchStrategy;
   resolveOutputPath: (requestedPath?: string) => string;
+  safetyConfig?: BrowserAgentSafetyConfig;
+  loadPlaywright?: () => Promise<PlaywrightModule>;
 }
+
+type PlaywrightBrowser = {
+  newPage: () => Promise<PlaywrightPage>;
+  close: () => Promise<void>;
+};
+
+type PlaywrightBrowserContext = {
+  newPage: () => Promise<PlaywrightPage>;
+  close: () => Promise<void>;
+  pages: () => PlaywrightPage[];
+  addInitScript: (script: string) => Promise<void>;
+};
+
+type PlaywrightPage = {
+  addInitScript: (script: string) => Promise<void>;
+  goto: (url: string, options?: Record<string, unknown>) => Promise<void>;
+  title: () => Promise<string>;
+  url: () => string;
+  setDefaultTimeout: (timeout: number) => void;
+  waitForTimeout: (timeout: number) => Promise<void>;
+  waitForSelector: (selector: string, options?: Record<string, unknown>) => Promise<void>;
+  locator: (selector: string) => {
+    first: () => {
+      click: (options?: Record<string, unknown>) => Promise<void>;
+      fill: (value: string, options?: Record<string, unknown>) => Promise<void>;
+      press: (key: string, options?: Record<string, unknown>) => Promise<void>;
+      innerText: () => Promise<string>;
+    };
+  };
+  evaluate: <T, A>(pageFunction: (arg: A) => T | Promise<T>, arg: A) => Promise<T>;
+  screenshot: (options: Record<string, unknown>) => Promise<void>;
+};
+
+type PlaywrightModule = {
+  chromium: {
+    launch: (options: Record<string, unknown>) => Promise<PlaywrightBrowser>;
+    launchPersistentContext: (userDataDir: string, options: Record<string, unknown>) => Promise<PlaywrightBrowserContext>;
+  };
+};
 
 interface BrowserActionLog {
   index: number;
@@ -33,6 +97,8 @@ interface BrowserActionLog {
   url?: string;
   outputPath?: string;
   text?: string;
+  api?: string;
+  validation?: string;
 }
 
 function normalizeUrl(url: string): string {
@@ -170,54 +236,79 @@ export function resolveBrowserExecutable(browser: BrowserTarget): string | undef
   return undefined;
 }
 
-function resolvePlaywrightLaunchOptions(browser: BrowserTarget, headless: boolean): Record<string, unknown> {
-  if (browser === 'chromium') {
-    const executablePath = resolveBrowserExecutable('chromium');
-    return executablePath ? { headless, executablePath } : { headless };
-  }
-
-  const executablePath = resolveBrowserExecutable(browser);
-  if (!executablePath) {
-    const browserName = browser === 'chrome' ? 'Chrome' : 'Edge';
-    throw new Error(`未找到可用的 ${browserName} 浏览器。可设置环境变量 AI_AGENT_BROWSER_PATH 或对应的浏览器路径变量后重试。`);
-  }
-
-  return {
-    headless,
-    executablePath,
-  };
-}
-
-async function loadPlaywright(): Promise<{ chromium: { launch: (options: Record<string, unknown>) => Promise<any> } }> {
+async function loadPlaywright(): Promise<PlaywrightModule> {
   try {
     const module = await import('playwright');
-    return module as unknown as { chromium: { launch: (options: Record<string, unknown>) => Promise<any> } };
+    return module as unknown as PlaywrightModule;
   } catch {
     throw new Error('缺少 Playwright 运行环境。请先安装 playwright，并执行 npx playwright install chromium');
   }
 }
 
 export async function runBrowserAutomation(options: BrowserAutomationOptions): Promise<string> {
-  const playwright = await loadPlaywright();
+  const playwright = await (options.loadPlaywright ? options.loadPlaywright() : loadPlaywright());
   const browserTarget = options.browser || 'chrome';
-  const browser = await playwright.chromium.launch(resolvePlaywrightLaunchOptions(browserTarget, options.headless !== false));
-  const page = await browser.newPage();
+  const guard = new SensitiveOperationGuard(options.safetyConfig);
+  const startup = await buildBrowserAutomationStartupOptions(options, browserTarget);
+  let browser: PlaywrightBrowser | undefined;
+  let context: PlaywrightBrowserContext | undefined;
+  let temporaryUserDataDir: string | undefined;
+  let page: PlaywrightPage;
+  let userscriptEnabled = options.userscripts?.enabled !== false;
 
   try {
+    if (startup.usePersistentContext) {
+      context = await playwright.chromium.launchPersistentContext(startup.userDataDir, startup.launchOptions);
+      temporaryUserDataDir = startup.temporaryUserDataDir;
+      for (const script of startup.initScripts) {
+        await context.addInitScript(script);
+      }
+      page = context.pages()[0] || await context.newPage();
+    } else {
+      browser = await playwright.chromium.launch(startup.launchOptions);
+      page = await browser.newPage();
+      for (const script of startup.initScripts) {
+        await page.addInitScript(script);
+      }
+    }
+
     const timeoutMs = Math.max(1000, options.timeoutMs ?? 15000);
     page.setDefaultTimeout(timeoutMs);
 
     const actionLogs: BrowserActionLog[] = [];
     await page.goto(normalizeUrl(options.url), { waitUntil: 'domcontentloaded' });
+    await runBrowserAutomationPostLoadScripts(page, startup.pageScripts, startup.userscriptPageScripts);
+
+    const initialPageText = await page.locator('body').first().innerText().catch(() => '');
+    const pageAssessment = guard.checkPage({
+      url: page.url(),
+      title: await page.title(),
+      visibleText: String(initialPageText || '').slice(0, 4000),
+      interactiveSummary: [],
+    });
+    if (pageAssessment) {
+      throw new BrowserSafetyInterruptionError(pageAssessment);
+    }
 
     const actions = options.actions ?? [];
     for (const [index, action] of actions.entries()) {
+      const actionAssessment = guard.checkAutomationAction(action, {
+        url: page.url(),
+        title: await page.title(),
+        visibleText: String(initialPageText || '').slice(0, 4000),
+        interactiveSummary: [],
+      });
+      if (actionAssessment) {
+        throw new BrowserSafetyInterruptionError(actionAssessment);
+      }
+
       const normalizedType = normalizeActionType(action.type);
 
       switch (normalizedType) {
         case 'goto': {
           const targetUrl = normalizeUrl(action.url || options.url);
           await page.goto(targetUrl, { waitUntil: action.waitUntil || 'domcontentloaded' });
+          await runBrowserAutomationPostLoadScripts(page, startup.pageScripts, startup.userscriptPageScripts);
           actionLogs.push({ index, type: 'goto', url: targetUrl });
           break;
         }
@@ -281,6 +372,53 @@ export async function runBrowserAutomation(options: BrowserAutomationOptions): P
           actionLogs.push({ index, type: 'screenshot', outputPath });
           break;
         }
+        case 'evaluate_script': {
+          const script = action.script || action.value;
+          if (!script?.trim()) {
+            throw new Error(`第 ${index + 1} 个动作缺少 script`);
+          }
+          const result = await page.evaluate(executeBrowserAutomationScript, script);
+          const validation = validateScriptResultContract(result, action.expectResult);
+          const handling = resolveScriptResultValidationHandling(validation, options.expectResultMismatchStrategy, 'evaluate_script 动作返回值校验失败，');
+          actionLogs.push({ index, type: 'evaluate_script', text: formatScriptActionLogText(result, validation), validation: handling.recordedValidation });
+          break;
+        }
+        case 'call_userscript_api': {
+          if (!action.api?.trim()) {
+            throw new Error(`第 ${index + 1} 个动作缺少 api`);
+          }
+          const result = await page.evaluate(({ apiPath, args }) => {
+            const runtime = globalThis as Record<string, unknown>;
+            const segments = String(apiPath || '').split('.').map(item => item.trim()).filter(Boolean);
+            let target: unknown = runtime;
+            for (const segment of segments) {
+              if (!target || typeof target !== 'object' || !(segment in (target as Record<string, unknown>))) {
+                throw new Error(`未找到用户脚本 API: ${apiPath}`);
+              }
+              target = (target as Record<string, unknown>)[segment];
+            }
+            if (typeof target !== 'function') {
+              throw new Error(`用户脚本 API 不是函数: ${apiPath}`);
+            }
+            return (target as (...input: unknown[]) => unknown)(...(Array.isArray(args) ? args : []));
+          }, { apiPath: action.api, args: action.args || [] });
+          const validation = validateScriptResultContract(result, action.expectResult);
+          const handling = resolveScriptResultValidationHandling(validation, options.expectResultMismatchStrategy, `call_userscript_api(${action.api}) 返回值校验失败，`);
+          actionLogs.push({ index, type: 'call_userscript_api', api: action.api, text: formatScriptActionLogText(result, validation), validation: handling.recordedValidation });
+          break;
+        }
+        case 'toggle_userscript_mode': {
+          userscriptEnabled = action.enabled ?? !userscriptEnabled;
+          await page.evaluate((enabled: boolean) => {
+            const runtime = globalThis as Record<string, unknown>;
+            runtime.__AI_AGENT_USERSCRIPT_ENABLED__ = enabled;
+            const bridge = (runtime.__AI_AGENT_BROWSER_RUNTIME ||= {}) as Record<string, unknown>;
+            bridge.userscriptEnabled = enabled;
+            return enabled;
+          }, userscriptEnabled);
+          actionLogs.push({ index, type: 'toggle_userscript_mode', text: userscriptEnabled ? 'on' : 'off' });
+          break;
+        }
         default:
           throw new Error(`不支持的浏览器动作: ${action.type}`);
       }
@@ -295,7 +433,227 @@ export async function runBrowserAutomation(options: BrowserAutomationOptions): P
     }, null, 2);
   } finally {
     if (options.keepOpen !== true) {
-      await browser.close();
+      if (context) {
+        await context.close();
+      } else if (browser) {
+        await browser.close();
+      }
+      if (temporaryUserDataDir) {
+        await fs.rm(temporaryUserDataDir, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
+}
+
+async function buildBrowserAutomationStartupOptions(options: BrowserAutomationOptions, browser: BrowserTarget): Promise<{
+  launchOptions: Record<string, unknown>;
+  usePersistentContext: boolean;
+  userDataDir: string;
+  temporaryUserDataDir?: string;
+  initScripts: string[];
+  pageScripts: string[];
+  userscriptPageScripts: string[];
+}> {
+  const resolvedExtensions = (options.extensionPaths || []).map(item => resolveConfiguredPath(item, options));
+  const usePersistentContext = Boolean(options.userDataDir?.trim()) || resolvedExtensions.length > 0;
+  const { initScripts, pageScripts, userscriptPageScripts } = await loadConfiguredScripts(options);
+
+  const launchOptions: Record<string, unknown> = {
+    headless: resolvedExtensions.length > 0 ? false : options.headless !== false,
+  };
+
+  const explicitExecutablePath = options.executablePath?.trim();
+  if (explicitExecutablePath) {
+    launchOptions.executablePath = explicitExecutablePath;
+  } else if (resolvedExtensions.length === 0) {
+    if (browser === 'chromium') {
+      const executablePath = resolveBrowserExecutable('chromium');
+      if (executablePath) {
+        launchOptions.executablePath = executablePath;
+      }
+    } else {
+      const executablePath = resolveBrowserExecutable(browser);
+      if (!executablePath) {
+        const browserName = browser === 'chrome' ? 'Chrome' : 'Edge';
+        throw new Error(`未找到可用的 ${browserName} 浏览器。可设置环境变量 AI_AGENT_BROWSER_PATH 或对应的浏览器路径变量后重试。`);
+      }
+      launchOptions.executablePath = executablePath;
+    }
+  }
+
+  if (resolvedExtensions.length > 0) {
+    launchOptions.channel = 'chromium';
+    launchOptions.args = buildChromiumExtensionArgs(resolvedExtensions);
+    launchOptions.ignoreDefaultArgs = ['--disable-extensions'];
+  }
+
+  if (!usePersistentContext) {
+    return {
+      launchOptions,
+      usePersistentContext: false,
+      userDataDir: '',
+      initScripts,
+      pageScripts,
+      userscriptPageScripts,
+    };
+  }
+
+  const configuredUserDataDir = options.userDataDir?.trim();
+  if (configuredUserDataDir) {
+    return {
+      launchOptions,
+      usePersistentContext: true,
+      userDataDir: resolveConfiguredPath(configuredUserDataDir, options),
+      initScripts,
+      pageScripts,
+      userscriptPageScripts,
+    };
+  }
+
+  const temporaryUserDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ai-agent-browser-'));
+  return {
+    launchOptions,
+    usePersistentContext: true,
+    userDataDir: temporaryUserDataDir,
+    temporaryUserDataDir,
+    initScripts,
+    pageScripts,
+    userscriptPageScripts,
+  };
+}
+
+async function loadConfiguredScripts(options: BrowserAutomationOptions): Promise<{ initScripts: string[]; pageScripts: string[]; userscriptPageScripts: string[] }> {
+  const userscripts = options.userscripts || {};
+  const initPathScripts = await loadScriptContents(options.initScriptPaths || [], options);
+  const pagePathScripts = await loadScriptContents(options.pageScriptPaths || [], options);
+  const userscriptPathScripts = await loadScriptContents(userscripts.paths || [], options);
+  const userscriptInline = (userscripts.inline || []).map(script => script.trim()).filter(Boolean);
+  const runtimeBridgeScript = buildBrowserAutomationRuntimeBridge(userscripts.enabled !== false);
+
+  const initScripts = [
+    runtimeBridgeScript,
+    ...(options.initScripts || []),
+    ...initPathScripts,
+    ...(userscripts.runAt === 'document-start'
+      ? [...userscriptPathScripts, ...userscriptInline].map(script => wrapUserscriptSource(script))
+      : []),
+  ].map(script => script.trim()).filter(Boolean);
+
+  const pageScripts = [
+    ...(options.pageScripts || []),
+    ...pagePathScripts,
+  ].map(script => script.trim()).filter(Boolean);
+
+  const userscriptPageScripts = userscripts.runAt !== 'document-start'
+    ? [...userscriptPathScripts, ...userscriptInline].map(script => wrapUserscriptSource(script))
+    : [];
+
+  return { initScripts, pageScripts, userscriptPageScripts };
+}
+
+async function loadScriptContents(inputPaths: string[], options: BrowserAutomationOptions): Promise<string[]> {
+  return Promise.all(
+    inputPaths
+      .map(value => value.trim())
+      .filter(Boolean)
+      .map(value => fs.readFile(resolveConfiguredPath(value, options), 'utf-8')),
+  );
+}
+
+async function runBrowserAutomationPostLoadScripts(page: PlaywrightPage, pageScripts: string[], userscriptPageScripts: string[]): Promise<void> {
+  for (const script of pageScripts) {
+    await page.evaluate(executeBrowserAutomationScript, script);
+  }
+
+  for (const script of userscriptPageScripts) {
+    await page.evaluate(executeBrowserAutomationScript, script);
+  }
+}
+
+function buildBrowserAutomationRuntimeBridge(enabled: boolean): string {
+  return `(() => {
+    const runtime = globalThis;
+    const stateKey = '__AI_AGENT_USERSCRIPT_STATE__';
+    const parsePersistedState = () => {
+      const currentName = typeof runtime.window?.name === 'string' ? runtime.window.name : '';
+      const match = currentName.match(new RegExp('(?:^|\\n)' + stateKey + '=(true|false)(?:\\n|$)'));
+      if (!match || !match[1]) {
+        return undefined;
+      }
+      return match[1] === 'true';
+    };
+    const persistState = (value) => {
+      if (!runtime.window) {
+        return value;
+      }
+      const currentName = typeof runtime.window.name === 'string' ? runtime.window.name : '';
+      const markerPattern = new RegExp('(?:^|\\n)' + stateKey + '=(?:true|false)(?=\\n|$)', 'g');
+      const sanitized = currentName.replace(markerPattern, '').replace(/^\\n+|\\n+$/g, '');
+      runtime.window.name = [sanitized, stateKey + '=' + String(Boolean(value))].filter(Boolean).join('\\n');
+      return value;
+    };
+    const persistedEnabled = parsePersistedState();
+    const bridge = runtime.__AI_AGENT_BROWSER_RUNTIME || {};
+    bridge.userscriptEnabled = persistedEnabled ?? ${enabled ? 'true' : 'false'};
+    bridge.toggleUserscriptMode = (value) => {
+      bridge.userscriptEnabled = Boolean(value);
+      runtime.__AI_AGENT_USERSCRIPT_ENABLED__ = bridge.userscriptEnabled;
+      persistState(bridge.userscriptEnabled);
+      return bridge.userscriptEnabled;
+    };
+    bridge.callUserscriptApi = (apiPath, ...args) => {
+      const segments = String(apiPath || '').split('.').map(item => item.trim()).filter(Boolean);
+      let target = runtime;
+      for (const segment of segments) {
+        if (!target || !(segment in target)) {
+          throw new Error('未找到用户脚本 API: ' + apiPath);
+        }
+        target = target[segment];
+      }
+      if (typeof target !== 'function') {
+        throw new Error('用户脚本 API 不是函数: ' + apiPath);
+      }
+      return target(...args);
+    };
+    runtime.__AI_AGENT_BROWSER_RUNTIME = bridge;
+    runtime.__AI_AGENT_USERSCRIPT_ENABLED__ = bridge.userscriptEnabled;
+    persistState(bridge.userscriptEnabled);
+  })();`;
+}
+
+function wrapUserscriptSource(source: string): string {
+  return `(() => {
+    const runtime = globalThis;
+    if (runtime.__AI_AGENT_BROWSER_RUNTIME && runtime.__AI_AGENT_BROWSER_RUNTIME.userscriptEnabled === false) {
+      return;
+    }
+    ${source}
+  })();`;
+}
+
+function executeBrowserAutomationScript(source: string): unknown {
+  const runtime = globalThis as unknown as { eval: (code: string) => unknown };
+  return runtime.eval(source);
+}
+
+function buildChromiumExtensionArgs(extensionPaths: string[]): string[] {
+  const normalizedPaths = Array.from(new Set(extensionPaths.map(item => item.trim()).filter(Boolean)));
+  if (normalizedPaths.length === 0) {
+    return [];
+  }
+
+  const joined = normalizedPaths.join(',');
+  return [
+    `--disable-extensions-except=${joined}`,
+    `--load-extension=${joined}`,
+  ];
+}
+
+function resolveConfiguredPath(inputPath: string, options: BrowserAutomationOptions): string {
+  return resolveUserPath(inputPath, {
+    workspace: options.workspace || process.cwd(),
+    appBaseDir: options.appBaseDir,
+    artifactOutputDir: options.artifactOutputDir,
+    documentOutputDir: options.documentOutputDir,
+  });
 }

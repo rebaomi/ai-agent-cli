@@ -57,6 +57,7 @@ export class MemoryActionHandler implements DirectActionHandler {
     return {
       handled: true,
       title: '[Direct memory write]',
+      category: 'memory-action',
       output: [
         '已写入长期记忆。',
         profile.job ? `职业: ${profile.job}` : undefined,

@@ -3,6 +3,11 @@ export class DirectActionRoutingSupport {
     return rawPath.replace(/^['"]|['"]$/g, '');
   }
 
+  extractPathCandidates(input: string): string[] {
+    const matches = input.match(/(?:[a-zA-Z]:[\\/][^\s,'"]+|(?:\.{1,2}[\\/]|[\\/])[^\s,'"]+|[^\s,'"]+\.(?:png|jpg|jpeg|webp|gif|bmp|md|markdown|txt|csv|tsv|docx|pdf|xlsx|ppt|pptx))/gi);
+    return matches?.map(item => this.normalizePath(item.trim())) || [];
+  }
+
   splitExplicitPaths(input: string): string[] {
     return input
       .split(/\s*(?:,|，|、|\s和\s|\s及\s|\s以及\s|\sand\s)\s*/i)

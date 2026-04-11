@@ -1,6 +1,7 @@
 import type { LLMProviderInterface } from '../llm/types.js';
 import type { Plan } from './planner.js';
 import type { SkillCandidateRefinement, SkillLearningTodo } from './skills.js';
+import { looksLikePlaceholderContent } from '../utils/docx-validation.js';
 
 export interface SkillLearningCandidate {
   name: string;
@@ -78,6 +79,11 @@ export class SkillLearningService {
 
     const failedResults = stepResults.filter(result => result.includes('失败'));
     if (failedResults.length === 0) {
+      return;
+    }
+
+    if (this.shouldSkipLearningTodo(failedResults)) {
+      this.options.onSkip?.('Skill learning todo skipped: failure looks like an execution bug or placeholder artifact, not a reusable skill gap.');
       return;
     }
 
@@ -296,6 +302,21 @@ export class SkillLearningService {
       .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 48) || 'learn-skill-gap';
+  }
+
+  private shouldSkipLearningTodo(failedResults: string[]): boolean {
+    return failedResults.some(result => {
+      const normalized = result.replace(/\s+/g, ' ').trim();
+      if (/enoent:.*\$[A-Z_][A-Z0-9_]*/i.test(normalized) || /stat '.*\$[A-Z_][A-Z0-9_]*'/i.test(normalized)) {
+        return true;
+      }
+
+      if (/正文校验失败|缺少预期内容/i.test(normalized) && looksLikePlaceholderContent(normalized)) {
+        return true;
+      }
+
+      return false;
+    });
   }
 
   private extractProceduralTags(originalTask: string, stepDescriptions: string[], stepResults: string[]): string[] {

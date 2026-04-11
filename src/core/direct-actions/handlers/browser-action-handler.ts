@@ -1,8 +1,10 @@
 import type { DirectActionResult } from '../../direct-action-router.js';
+import type { DirectActionDispatchContext } from '../../direct-action-dispatch-service.js';
 import type { ResolvedIntent } from '../../intent-resolver.js';
 import type { DirectActionHandler } from '../request-handler.js';
 import type { BrowserActionRuntime } from '../runtime-context.js';
 import type { Message } from '../../../types/index.js';
+import { resolveKnownWebsiteUrl } from '../../site-aliases.js';
 
 type BrowserEngine = 'google' | 'baidu' | 'doubao';
 
@@ -17,40 +19,80 @@ export class BrowserActionHandler implements DirectActionHandler {
 
   constructor(private readonly runtime: BrowserActionRuntime) {}
 
-  canHandle(input: string, intent?: ResolvedIntent): boolean {
-    if (intent?.name === 'browser.search') {
+  canHandle(input: string, intent?: ResolvedIntent, context?: DirectActionDispatchContext): boolean {
+    if (intent?.name === 'browser.search' && this.isExplicitBrowserSearchRequest(input, intent)) {
       return true;
     }
 
-    return /(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|豆包|doubao|飞书|lark|https?:\/\/)/i.test(input)
+    if (this.isSmartBrowserTask(input)) {
+      return true;
+    }
+
+    return (/^(?:帮我|请|麻烦)?(?:打开|访问|进入|浏览|跳转到)/i.test(input) && !!this.resolveUrl(input))
+      || /(打开|访问|进入|浏览|跳转到).*(网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|豆包|doubao|飞书|lark|https?:\/\/)/i.test(input)
       || /(google|谷歌|百度|豆包|doubao).*(输入|搜索|查找|查询).*(关键词|关键字)?/i.test(input)
-      || this.isBrowserFollowUp(input);
+      || this.isBrowserFollowUp(input)
+      || Boolean(context?.isFollowUp && context?.boundTask?.category === 'browser-action');
   }
 
-  async handle(input: string, intent?: ResolvedIntent): Promise<DirectActionResult | null> {
-    const context = this.resolveSearchContext(input, intent);
-    const directOpenUrl = this.buildDirectOpenUrl(context);
+  async handle(input: string, intent?: ResolvedIntent, context?: DirectActionDispatchContext): Promise<DirectActionResult | null> {
+    if (this.isSmartBrowserTask(input)) {
+      return this.runtime.executeBuiltInTool('browser_agent_run', {
+        goal: input,
+        startUrl: this.extractStartUrl(input) || this.resolveUrl(input) || undefined,
+      }, '[Direct browser_agent_run]');
+    }
+
+    const searchContext = this.resolveSearchContext(input, intent, context);
+    const directOpenUrl = this.buildDirectOpenUrl(searchContext);
     if (directOpenUrl) {
-      return this.runtime.executeBuiltInTool('open_browser', {
+      const result = await this.runtime.executeBuiltInTool('open_browser', {
         url: directOpenUrl,
         background: false,
       }, '[Direct open_browser]');
+      return {
+        ...result,
+        category: 'browser-action',
+        metadata: {
+          engine: searchContext.engine,
+          query: searchContext.query,
+          url: directOpenUrl,
+        },
+      };
     }
 
-    const automationRequest = this.buildAutomationRequest(context);
+    const automationRequest = this.buildAutomationRequest(searchContext);
     if (automationRequest) {
-      return this.runtime.executeBuiltInTool('browser_automate', automationRequest, '[Direct browser_automate]');
+      const result = await this.runtime.executeBuiltInTool('browser_automate', automationRequest, '[Direct browser_automate]');
+      return {
+        ...result,
+        category: 'browser-action',
+        metadata: {
+          engine: searchContext.engine,
+          query: searchContext.query,
+          url: searchContext.url,
+        },
+      };
     }
 
-    const url = context.url || this.resolveUrl(input);
+    const url = searchContext.url || this.resolveUrl(input);
     if (!url) {
       return null;
     }
 
-    return this.runtime.executeBuiltInTool('open_browser', {
+    const result = await this.runtime.executeBuiltInTool('open_browser', {
       url,
       background: false,
     }, '[Direct open_browser]');
+    return {
+      ...result,
+      category: 'browser-action',
+      metadata: {
+        engine: searchContext.engine,
+        query: searchContext.query,
+        url,
+      },
+    };
   }
 
   private buildDirectOpenUrl(context: BrowserSearchContext): string | null {
@@ -93,11 +135,23 @@ export class BrowserActionHandler implements DirectActionHandler {
     return null;
   }
 
-  private resolveSearchContext(input: string, intent?: ResolvedIntent): BrowserSearchContext {
+  private resolveSearchContext(input: string, intent?: ResolvedIntent, context?: DirectActionDispatchContext): BrowserSearchContext {
+    const boundTaskMetadata = context?.boundTask?.metadata && typeof context.boundTask.metadata === 'object'
+      ? context.boundTask.metadata as Record<string, unknown>
+      : undefined;
     let engine = this.resolveEngine(input, intent);
     let query = typeof intent?.slots.query === 'string' && intent.slots.query.trim()
       ? intent.slots.query.trim()
       : this.extractSearchQuery(input) || '';
+
+    if ((!engine || !query) && context?.isFollowUp && context?.boundTask?.category === 'browser-action') {
+      if (!engine && typeof boundTaskMetadata?.engine === 'string') {
+        engine = boundTaskMetadata.engine as BrowserEngine;
+      }
+      if (!query && typeof boundTaskMetadata?.query === 'string') {
+        query = boundTaskMetadata.query;
+      }
+    }
 
     if ((!engine || !query) && this.isBrowserFollowUp(input)) {
       const recent = this.findRecentBrowserContext(this.runtime.getConversationMessages());
@@ -155,6 +209,18 @@ export class BrowserActionHandler implements DirectActionHandler {
     return '';
   }
 
+  private isExplicitBrowserSearchRequest(input: string, intent?: ResolvedIntent): boolean {
+    const trimmed = input.trim();
+    const slotEngine = typeof intent?.slots.engine === 'string' ? intent.slots.engine.trim().toLowerCase() : '';
+    const hasExplicitEngine = /google|谷歌|百度|豆包|doubao/i.test(trimmed)
+      || slotEngine === 'google'
+      || slotEngine === 'baidu'
+      || slotEngine === 'doubao';
+    const hasBrowserSearchVerb = /(?:打开|访问|进入|浏览|跳转到).*(?:google|谷歌|百度|豆包|doubao|搜索页|搜索页面|官网|网站|网页)|(?:在)?(?:google|谷歌|百度|豆包|doubao)(?:上)?(?:搜索|查找|查询|提问|发问)|(?:用|通过).*(?:google|谷歌|百度|豆包|doubao).*(?:搜索|查找|查询)|(?:google|谷歌|百度|豆包|doubao).*(?:输入|搜索|查找|查询)/i.test(trimmed);
+
+    return hasExplicitEngine && hasBrowserSearchVerb;
+  }
+
   private resolveUrlFromEngine(engine: BrowserEngine | ''): string {
     if (engine === 'google') {
       return 'https://www.google.com';
@@ -175,6 +241,37 @@ export class BrowserActionHandler implements DirectActionHandler {
     return /(?:刚才|刚刚|上面|上一条|前面|这次|继续|重新|还是|仍然|你).{0,20}(?:没有|没).{0,12}(?:输入|填入|搜索|查找)/i.test(input)
       || /(?:继续|重新).{0,8}(?:输入|搜索|查找).{0,8}(?:关键词|关键字)/i.test(input)
       || /(?:没有|没).{0,8}(?:输入|填入).{0,8}(?:关键词|关键字)/i.test(input);
+  }
+
+  private isSmartBrowserTask(input: string): boolean {
+    return /(自动操作浏览器|浏览器代理|智能浏览器|自动浏览网页)/i.test(input)
+      || /(?:用|通过).{0,6}浏览器.{0,20}(?:完成|处理|执行|搞定)/i.test(input)
+      || /(?:在|去).{0,12}(?:网页|网站|页面).{0,30}(?:完成|处理|执行|操作)/i.test(input)
+      || this.isCompositeBrowserInteractionTask(input);
+  }
+
+  private isCompositeBrowserInteractionTask(input: string): boolean {
+    const hasNavigationIntent = /^(?:帮我|请|麻烦)?(?:打开|访问|进入|浏览|跳转到)/i.test(input)
+      || /(?:打开|访问|进入|浏览|跳转到).*(?:网页|网站|页面|首页|官网|链接|url|URL|浏览器|标签页)/i.test(input);
+    const hasBrowserTarget = Boolean(this.resolveUrl(input))
+      || /(?:网页|网站|页面|首页|官网|链接|url|URL|浏览器|标签页)/i.test(input);
+
+    if (!hasBrowserTarget) {
+      return false;
+    }
+
+    const advancedActionMatches = input.match(/点击|点开|滚动|下拉|上滑|输入|填写|选择|勾选|提交|登录|截图|提取|抓取|复制|展开|关闭|切换|等待/gi) || [];
+    const hasSequentialFlow = /然后|再|接着|之后|继续|并且|同时|并|完成后|后再|后继续|打开.+(?:点击|点开|滚动|下拉|上滑|输入|填写|选择|勾选|提交|登录|截图|提取|抓取|复制|展开|关闭|切换|等待)/i.test(input);
+    const hasAdvancedAction = advancedActionMatches.length >= 1;
+    const hasMultipleAdvancedActions = advancedActionMatches.length >= 2;
+
+    return hasMultipleAdvancedActions
+      || (hasAdvancedAction && hasSequentialFlow)
+      || (hasNavigationIntent && hasAdvancedAction);
+  }
+
+  private extractStartUrl(input: string): string | null {
+    return input.match(/https?:\/\/[^\s]+/i)?.[0] || null;
   }
 
   private findRecentBrowserContext(messages: Message[]): BrowserSearchContext {
@@ -205,30 +302,6 @@ export class BrowserActionHandler implements DirectActionHandler {
       return directUrl;
     }
 
-    if (/github/i.test(input)) {
-      return 'https://github.com';
-    }
-
-    if (/gitlab/i.test(input)) {
-      return 'https://gitlab.com';
-    }
-
-    if (/google|谷歌/i.test(input)) {
-      return 'https://www.google.com';
-    }
-
-    if (/百度/i.test(input)) {
-      return 'https://www.baidu.com';
-    }
-
-    if (/豆包|doubao/i.test(input)) {
-      return 'https://www.doubao.com/chat/';
-    }
-
-    if (/(飞书|lark)/i.test(input)) {
-      return 'https://www.feishu.cn';
-    }
-
-    return null;
+    return resolveKnownWebsiteUrl(input);
   }
 }

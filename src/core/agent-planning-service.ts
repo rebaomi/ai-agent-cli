@@ -2,6 +2,7 @@ import type { LLMProviderInterface } from '../llm/types.js';
 import type { Plan, Planner } from './planner.js';
 import type { PendingInteraction } from './agent-interaction-service.js';
 import type { IntentResolver } from './intent-resolver.js';
+import { resolveKnownWebsiteUrl } from './site-aliases.js';
 
 export interface AgentPlanningServiceOptions {
   llm: Pick<LLMProviderInterface, 'generate'>;
@@ -29,16 +30,15 @@ export class AgentPlanningService {
       return false;
     }
 
-    const simpleGreetings = [
-      '你好', '您好', '嗨', 'hi', 'hello', 'hey',
-      '早上好', '下午好', '晚上好', '在吗', '在不在',
-    ];
-
-    if (trimmedInput.length <= 12 && simpleGreetings.some(greeting => inputLower === greeting || inputLower.startsWith(`${greeting}呀`) || inputLower.startsWith(`${greeting}啊`))) {
+    if (this.isSimpleGreeting(trimmedInput)) {
       return false;
     }
 
     if (this.isCompositeLarkDeliveryTask(trimmedInput)) {
+      return true;
+    }
+
+    if (this.isGenerationThenDeliveryTask(trimmedInput)) {
       return true;
     }
 
@@ -92,6 +92,19 @@ export class AgentPlanningService {
     } catch {
       return matchCount >= 2;
     }
+  }
+
+  buildAmbiguousShortInputPrompt(input: string): string | null {
+    const trimmedInput = input.trim();
+    if (!this.isAmbiguousShortInput(trimmedInput)) {
+      return null;
+    }
+
+    return [
+      '你的输入有点短，我还不能准确判断你要我做什么。',
+      '如果你说的是“cli”，你可以直接告诉我：是想了解 CLI 是什么，还是想查看这个仓库的 CLI 实现，或者想执行某个 CLI 命令。',
+      '直接补一句完整需求就行，我会按你的意思继续。',
+    ].join('\n');
   }
 
   isGenericPlan(plan: Plan, input: string): boolean {
@@ -183,8 +196,17 @@ export class AgentPlanningService {
       return false;
     }
 
+    if (this.isGenerationThenDeliveryTask(input)) {
+      return false;
+    }
+
+    if (/^(?:帮我|请|麻烦)?(?:打开|访问|进入|浏览|跳转到)/i.test(input) && !!resolveKnownWebsiteUrl(input)) {
+      return true;
+    }
+
     if (/(google|谷歌|百度).*(搜索|查找|查询|输入).*(关键词|关键字)?/i.test(input)
-      || /(打开|访问|进入|浏览|跳转到).*(google|谷歌|百度).*(搜索|搜索页|首页|网页|网站)/i.test(input)) {
+      || /(打开|访问|进入|浏览|跳转到).*(google|谷歌|百度).*(搜索|搜索页|首页|网页|网站)/i.test(input)
+      || /(打开|访问|进入|浏览|跳转到).*(网易\s*buff|\bbuff\b)/i.test(input)) {
       return true;
     }
 
@@ -202,7 +224,7 @@ export class AgentPlanningService {
       /^(?:@tool)\b/i,
       /^(?:请)?(?:帮我)?(?:读取|查看|打开|列出|搜索|查找|grep|find)\b/i,
       /(?:obsidian|vault|笔记|笔记库).*(?:读取|查看|打开|列出|搜索|查找|总结|整理|写入|保存|追加|更新|修改|新建|创建)/i,
-      /(?:打开|访问|进入|浏览|跳转到).*(?:网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|飞书|lark)/i,
+      /(?:打开|访问|进入|浏览|跳转到).*(?:网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|网易\s*buff|\bbuff\b|飞书|lark)/i,
       /(?:google|谷歌|百度).*(?:搜索|查找|查询|输入).*(?:关键词|关键字)?/i,
       /(?:保存|导出|转成|转换成|转换为|生成|输出|整理成|整理为|写成).*(?:pdf|word|docx|ppt|pptx|xlsx|excel|飞书|lark)/i,
       /(?:发送|发(?:到|给|我)?|推送).*(?:飞书|lark|附件|文档|word|docx|ppt|pptx|pdf)/i,
@@ -219,7 +241,52 @@ export class AgentPlanningService {
       return false;
     }
 
-    return /[\\/]|\.[a-z0-9]{1,8}\b|pdf\b|word\b|docx\b|ppt\b|pptx\b|xlsx\b|excel\b|飞书|lark|obsidian|vault|笔记|笔记库|目录|文件|关键词|关键字|内容|命令|新闻|上面的|刚刚|刚才|网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度/i.test(input);
+    return /[\\/]|\.[a-z0-9]{1,8}\b|pdf\b|word\b|docx\b|ppt\b|pptx\b|xlsx\b|excel\b|飞书|lark|obsidian|vault|笔记|笔记库|目录|文件|关键词|关键字|内容|命令|新闻|上面的|刚刚|刚才|网页|网站|首页|页面|官网|github|gitlab|google|谷歌|百度|网易\s*buff|\bbuff\b/i.test(input);
+  }
+
+  private isGenerationThenDeliveryTask(input: string): boolean {
+    const hasGenerationIntent = /(生成|撰写|写一份|写个|总结|整理|归纳|分析|改写|润色|翻译)/i.test(input);
+    const hasDeliveryIntent = /(导出|保存|输出|写入|发送|发到|发给|推送)/i.test(input);
+    const hasExistingArtifactReference = /(刚刚|刚才|上面|上一个|已有|现有|这个结果|该结果|这份内容|正文|附件|内容发我|把它发我)/i.test(input);
+
+    return hasGenerationIntent && hasDeliveryIntent && !hasExistingArtifactReference;
+  }
+
+  private isAmbiguousShortInput(input: string): boolean {
+    const trimmedInput = input.trim();
+    if (!trimmedInput || trimmedInput.length > 12) {
+      return false;
+    }
+
+    if (this.isSimpleGreeting(trimmedInput)) {
+      return false;
+    }
+
+    if (this.isCompositeLarkDeliveryTask(trimmedInput) || this.isLikelyDirectTask(trimmedInput)) {
+      return false;
+    }
+
+    if (/(什么|啥|怎么|如何|为啥|为什么|介绍|解释|说明|help|what|how|why|explain|intro|show)/i.test(trimmedInput)) {
+      return false;
+    }
+
+    if (/(打开|查看|读取|搜索|查找|列出|生成|发送|导出|保存|转换|创建|修复|修改|重构|排查|read|open|search|find|list|create|fix|edit|run)/i.test(trimmedInput)) {
+      return false;
+    }
+
+    return /^[\p{L}\p{N}_\-\s]{1,12}$/u.test(trimmedInput);
+  }
+
+  private isSimpleGreeting(input: string): boolean {
+    const trimmedInput = input.trim();
+    const inputLower = trimmedInput.toLowerCase();
+    const simpleGreetings = [
+      '你好', '您好', '嗨', 'hi', 'hello', 'hey',
+      '早上好', '下午好', '晚上好', '在吗', '在不在',
+    ];
+
+    return trimmedInput.length <= 12
+      && simpleGreetings.some(greeting => inputLower === greeting || inputLower.startsWith(`${greeting}呀`) || inputLower.startsWith(`${greeting}啊`));
   }
 
   private buildPlanningInput(input: string): string {

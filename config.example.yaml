@@ -26,6 +26,8 @@ llm:
       baseUrl: http://localhost:11434
       model: qwen3.5:9b
       temperature: 0.7
+      downloadAttachments: true
+      receiveDir: ~/.ai-agent-cli/feishuReceive
 ```
 
 ### DeepSeek 配置
@@ -140,10 +142,115 @@ hybrid:
   simpleConversationMaxChars: 6000
   preferRemoteForToolMessages: true
 
+directAction:
+  conversationMode:
+    enabled: true
+    preambleThreshold: 2
+
+functionMode: workflow
+
+functionRouting:
+  preferWorkflow: true
+  allowAutoSwitchFromChatToWorkflow: true
+  announceRouteDecisions: true
+  socialChatKeywords:
+    - 你好
+    - 您好
+    - hi
+  knowledgeChatKeywords:
+    - 你是谁
+    - 解释一下
+    - what is
+  workflowSwitchKeywords:
+    - switch workflow
+    - 切换workflow
+    - 切换到工作流
+
+browserAgent:
+  enabled: true
+  mode: smart
+  browser: chrome
+  headless: true
+  timeoutMs: 15000
+  # 加载浏览器扩展时会自动切到 persistent context，并强制使用 Playwright Chromium 通道。
+  # 推荐搭配 headless: false 使用，例如放 Tampermonkey 解压目录。
+  extensionPaths: []
+  # userDataDir 可持久化扩展状态、登录态和脚本本地存储。
+  # userDataDir: ~/.ai-agent-cli/browser-profile
+  initScriptPaths: []
+  initScripts: []
+  pageScriptPaths: []
+  pageScripts: []
+  userscripts:
+    paths: []
+    inline: []
+    runAt: document-end
+    enabled: true
+  workflowDir: browser-workflows
+  autoMatchWorkflows: true
+  preferredLocalProvider: ollama
+  fallbackProvider: default
+  ollamaHealthCheckUrl: http://localhost:11434/api/tags
+  ollamaHealthCacheMs: 15000
+  plannerModel: qwen3.5:7b
+  extractorModel: qwen3.5:3b
+  visionProvider: default
+  # expectResult 不匹配时的处理策略：
+  # record-only: 仅记录到 action 输出/日志；warn: 继续执行并显式警告；hard-fail: 立即中断当前运行。
+  expectResultMismatchStrategy: warn
+  maxSteps: 20
+  maxActionsPerPlan: 3
+  observe:
+    useScreenshotByDefault: false
+    forceScreenshotAfterFailures: 2
+    fullPageScreenshot: false
+    maxDomNodes: 120
+    maxTextChars: 4000
+  optimization:
+    enableStateCache: true
+    enableDiffObservation: true
+    enableRuleFastPath: true
+    enableActionBatching: true
+  safety:
+    enabled: true
+    blockFinancialActions: true
+    blockPrivacyActions: true
+    blockIllegalActions: true
+    allowKeywords:
+      global: []
+      financial: []
+      privacy: []
+      illegal: []
+    blockKeywords:
+      global: []
+      financial:
+        - confirm payment
+      privacy:
+        - sms code
+      illegal: []
+    domainPolicies:
+      - name: trusted-order-review
+        match:
+          - example.com
+          - checkout.example.com
+        allowKeywords:
+          financial:
+            - order preview
+            - review order
+        blockKeywords:
+          financial:
+            - pay now
+            - confirm payment
+  debug:
+    saveTrace: true
+    saveScreenshotsOnFailure: true
+
 ollama:
   enabled: true
   baseUrl: http://localhost:11434
   model: qwen3.5:9b
+  visionModel: minicpm-v
+  visionMaxImages: 12
 
 deepseek:
   enabled: true
@@ -260,11 +367,11 @@ artifactOutputDir: C:/Users/your-name/.ai-agent-cli/outputs
 # documentOutputDir: C:/Users/your-name/Documents/coolAI
 
 # 单轮最多执行多少次工具调用。不是模型供应商限制，是 CLI 本地控制阈值。
-maxToolCallsPerTurn: 10
+maxToolCallsPerTurn: 20
 # 达到单轮上限后，CLI 是否自动开启下一轮继续执行。
 autoContinueOnToolLimit: true
 # 自动续跑的最大轮数。总工具预算约等于 maxToolCallsPerTurn * (1 + maxContinuationTurns)
-maxContinuationTurns: 3
+maxContinuationTurns: 5
 
 sandbox:
   enabled: true

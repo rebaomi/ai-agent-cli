@@ -59,13 +59,13 @@ export class IntentResolver {
         { role: 'system', content: INTENT_RESOLUTION_PROMPT },
         { role: 'user', content: input },
       ]);
-      return this.parseIntentResponse(response);
+      return this.parseIntentResponse(response, input);
     } catch {
       return null;
     }
   }
 
-  private parseIntentResponse(response: string): ResolvedIntent | null {
+  private parseIntentResponse(response: string, originalInput: string): ResolvedIntent | null {
     const jsonMatch = response.match(/```(?:json)?\s*([\s\S]*?)\s*```|(\{[\s\S]*\})/);
     const jsonText = (jsonMatch?.[1] ?? jsonMatch?.[2] ?? '').trim();
     if (!jsonText) {
@@ -87,7 +87,7 @@ export class IntentResolver {
         return null;
       }
 
-      return {
+      const resolvedIntent: ResolvedIntent = {
         name: normalizedName,
         confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
           ? Math.max(0, Math.min(1, parsed.confidence))
@@ -95,6 +95,12 @@ export class IntentResolver {
         slots: parsed.slots && typeof parsed.slots === 'object' ? parsed.slots : {},
         source: 'llm',
       };
+
+      if (resolvedIntent.name === 'browser.search' && !this.isExplicitBrowserSearchRequest(originalInput, resolvedIntent.slots)) {
+        return this.createUnknownIntent();
+      }
+
+      return resolvedIntent;
     } catch {
       return null;
     }
@@ -154,6 +160,15 @@ export class IntentResolver {
     }
 
     return null;
+  }
+
+  private isExplicitBrowserSearchRequest(input: string, slots: Record<string, string | boolean>): boolean {
+    const trimmed = input.trim();
+    const hasExplicitEngine = /(google|谷歌|百度|豆包|doubao)/i.test(trimmed)
+      || typeof slots.engine === 'string' && /^(google|baidu|doubao)$/i.test(slots.engine);
+    const hasBrowserSearchVerb = /(?:打开|访问|进入|浏览|跳转到).*(?:google|谷歌|百度|豆包|doubao|搜索页|搜索页面|官网|网站|网页)|(?:在)?(?:google|谷歌|百度|豆包|doubao)(?:上)?(?:搜索|查找|查询|提问|发问)|(?:用|通过).*(?:google|谷歌|百度|豆包|doubao).*(?:搜索|查找|查询)|(?:google|谷歌|百度|豆包|doubao).*(?:输入|搜索|查找|查询)/i.test(trimmed);
+
+    return hasExplicitEngine && hasBrowserSearchVerb;
   }
 
   private detectObsidianNoteIntent(input: string): ResolvedIntent | null {

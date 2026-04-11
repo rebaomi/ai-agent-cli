@@ -34,22 +34,37 @@ import { createCronManager, CronManager } from '../core/cron-manager.js';
 import { createMemoryProvider, type MemoryProvider } from '../core/memory-provider.js';
 import { progressTracker } from '../utils/progress.js';
 import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
+import { normalizeDisplayText } from '../utils/text-repair.js';
 import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
 import { extractObsidianVaultPath } from '../core/obsidian-config.js';
 import { LarkRelayAgent, type LarkRelayMessage, type LarkRelayStatus } from '../lark/relay-agent.js';
-import type { LarkRelayConfig } from '../types/index.js';
+import type { AgentInteractionMode, FunctionMode, LarkRelayConfig } from '../types/index.js';
 import { BackgroundDaemonManager, type BackgroundDaemonStatus } from '../core/background-daemon.js';
 import { APP_VERSION, buildCliLogo, getFullHelpText, getQuickHelpText, isFullHelpShortcut, isQuickHelpShortcut } from './cli-shell-text.js';
 import { TerminalConfigEditor } from './config-editor.js';
 import { SplitScreenRenderer } from './split-screen.js';
 import { runBackgroundDaemonService } from './daemon-service.js';
 import * as readline from 'readline';
+import { BrowserWorkflowService } from '../browser-agent/workflows/browser-workflow-service.js';
+import { buildBrowserWorkflowQuickFixDrafts } from '../browser-agent/workflows/browser-workflow-quick-fix.js';
+import { buildTaskContextJsonPayload, createAgentCheckpoint, createAgentGraphState, deriveCheckpointFromUnifiedAgentState } from '../core/agent-graph-state.js';
+import { createOllamaVisionService } from '../core/ollama-vision-service.js';
+import { SessionTaskStackManager } from '../core/session-task-stack-manager.js';
+import type { AgentGraphState, AgentTaskBindingSnapshot } from '../types/index.js';
+import { ChatRouter } from '../core/chat-router.js';
+import { TaskExecutorService } from '../core/task-executor-service.js';
 
 const logo = buildCliLogo();
 
 interface CLIOptions {
   ensureBackgroundDaemon?: boolean;
   runLocalCronScheduler?: boolean;
+}
+
+interface PendingLarkInlineReply {
+  chatId?: string;
+  senderId?: string;
+  resolve: (answer: string) => void;
 }
 
 export class CLI {
@@ -59,7 +74,8 @@ export class CLI {
     '/config', '/c', '/model', '/m', '/workspace', '/w',
     '/reset', '/r', '/new', '/sessions', '/load', '/mcp',
     '/lsp', '/skill', '/skills', '/org', '/team', '/cat',
-    '/progress', '/p', '/memory', '/templates', '/profile', '/news', '/relay', '/browser', '/mode', '/split',
+    '/progress', '/p', '/task-context', '/memory', '/templates', '/profile', '/news', '/relay', '/browser', '/mode', '/function', '/agent-mode', '/split',
+    '/vision',
     '/wipe', '/perm', '/permission', '/cron', '/daemon',
   ];
 
@@ -98,6 +114,7 @@ export class CLI {
   private appBaseDir: string;
   private inputHistoryPath: string;
   private newsOutputDir: string;
+  private sessionTaskStackDir: string;
   private larkRelay?: LarkRelayAgent;
   private inputQueue: Promise<void> = Promise.resolve();
   private readonly options: Required<CLIOptions>;
@@ -105,6 +122,13 @@ export class CLI {
   private stopBackgroundDaemonOnExit = false;
   private currentInputMode: 'cli' | 'feishu' = 'cli';
   private splitScreen?: SplitScreenRenderer;
+  private lastProcessLogMessage = '';
+  private readonly sessionTaskStack = new SessionTaskStackManager();
+  private readonly chatRouter = new ChatRouter();
+  private pendingDirectActionPreamble?: string;
+  private lastGraphState?: AgentGraphState;
+  private activeLarkReplyTarget?: LarkRelayMessage;
+  private pendingLarkInlineReply?: PendingLarkInlineReply;
 
   constructor(options: CLIOptions = {}) {
     this.options = {
@@ -118,6 +142,7 @@ export class CLI {
     this.appBaseDir = configManager.get('appBaseDir') || path.join(os.homedir(), '.ai-agent-cli');
     this.inputHistoryPath = path.join(this.appBaseDir, 'input-history.json');
     this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
+    this.sessionTaskStackDir = path.join(this.appBaseDir, 'runtime', 'session-task-stack');
     this.backgroundDaemon = new BackgroundDaemonManager(this.appBaseDir);
   }
 
@@ -136,6 +161,7 @@ export class CLI {
     if (discardedPinnedSessionId) {
       printInfo(`检测到跨天旧会话，已自动新建会话: ${discardedPinnedSessionId} -> ${this.memoryManager.getCurrentSessionId()}`);
     }
+    await this.loadPersistedSessionTaskStack();
 
     await this.loadInputHistory();
 
@@ -293,6 +319,7 @@ export class CLI {
       getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
       memoryProvider: this.memoryProvider,
       intentResolver: this.intentResolver,
+      onConversationPreamble: (message) => this.showDirectActionPreamble(message),
     });
 
     if (config.lsp && config.lsp.length > 0) {
@@ -335,6 +362,7 @@ export class CLI {
 
     await this.restartLarkRelay(config);
 
+    printInfo(`当前模式: input=${this.currentInputMode}, function=${this.getFunctionMode()}`);
     console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
   }
 
@@ -343,9 +371,11 @@ export class CLI {
     this.permissionHandlerSetup = true;
 
     this.permissionMgr.onPermissionRequest(async (request) => {
-      console.log(this.permissionMgr!.showPermissionRequest(request));
+      const prompt = this.permissionMgr!.showPermissionRequest(request);
+      console.log(prompt);
+      await this.sendPermissionPromptToActiveLarkTarget(prompt);
 
-      const answer = await this.promptInline('> ');
+      const answer = await this.requestInlineApprovalAnswer();
       const result = this.permissionMgr!.parsePermissionAnswer(answer);
 
       if (result.granted) {
@@ -377,8 +407,9 @@ export class CLI {
   }
 
   private prompt(): Promise<string> {
+    const promptLabel = this.getPromptLabel();
     if (this.splitScreen?.isActive()) {
-      return this.splitScreen.prompt('> ').then((answer) => {
+      return this.splitScreen.prompt(promptLabel).then((answer) => {
         const trimmed = answer.trim();
         if (trimmed.length > 0) {
           this.recordHistory(trimmed);
@@ -399,7 +430,7 @@ export class CLI {
       const historyEnabledRl = rl as unknown as { history: string[] };
       historyEnabledRl.history = this.getReadlineHistory();
       rl.on('close', () => {});
-      rl.question(chalk.blue('> '), (answer) => {
+      rl.question(chalk.blue(promptLabel), (answer) => {
         rl.close();
 
         const trimmed = answer.trim();
@@ -410,6 +441,10 @@ export class CLI {
         resolve(trimmed);
       });
     });
+  }
+
+  private getPromptLabel(): string {
+    return `[${this.currentInputMode}|${this.getFunctionMode()}] > `;
   }
 
   private completeInput(line: string): [string[], string] {
@@ -439,6 +474,8 @@ export class CLI {
       '/config': ['/config', '/config edit', '/config update', '/config reload'],
       '/c': ['/c', '/c edit', '/c update', '/c reload'],
       '/mode': ['/mode', '/mode status', '/mode switch cli', '/mode switch feishu'],
+      '/function': ['/function', '/function status', '/function switch workflow', '/function switch chat'],
+      '/agent-mode': ['/agent-mode', '/agent-mode status', '/agent-mode switch workflow', '/agent-mode switch chat'],
       '/split': ['/split', '/split on', '/split off', '/split of', '/split status'],
       '/relay': ['/relay status', '/relay start', '/relay stop', '/relay reconnect'],
       '/model': ['/model', '/model switch', ...providers.map(provider => `/model switch ${provider}`)],
@@ -462,6 +499,7 @@ export class CLI {
         '/permission audit', '/permission trust', '/permission allow', '/permission deny', '/permission auto', '/permission ask',
       ],
       '/browser': ['/browser open https://example.com', '/browser run https://example.com', '/browser run https://example.com @actions.json --headed', '/browser run https://example.com @actions.json --browser edge', '/browser help'],
+      '/vision': ['/vision analyze ./images', '/vision analyze ./images ./captures 请总结这些图片内容', '/vision analyze ./a.png ./b.png --model minicpm-v --limit 8', '/vision help'],
       '/cron': ['/cron list', '/cron create', '/cron create-news', '/cron create-news-lark', '/cron create-weather-lark', '/cron create-morning-feishu', '/cron create-morning-feishu-group', '/cron start', '/cron stop', '/cron run', '/cron delete', '/cron run-due'],
       '/daemon': ['/daemon status', '/daemon start', '/daemon stop', '/daemon restart'],
       '/news': ['/news hot', '/news search', '/news morning', '/news evening', '/news save hot', '/news save search', '/news save morning', '/news save evening', '/news push morning --chat-id oc_xxx', '/news push hot --chat-id oc_xxx --limit 5', '/news output-dir', '/news help'],
@@ -549,49 +587,18 @@ export class CLI {
         return;
       }
 
-      if (this.awaitingOnboardingInput) {
-        await this.handleOnboardingInput(trimmed);
-        return;
-      }
-
-      const confirmationStatus = this.agent?.getConfirmationStatus();
-      if (confirmationStatus?.pending) {
-        if (this.agent?.shouldTreatPendingInputAsNewRequest(trimmed)) {
-          this.agent.clearPendingInteraction();
-          printInfo('检测到这是一个新的独立请求，已跳过上一条待补充状态。');
-          await this.handleMessage(trimmed);
+      const previousLarkReplyTarget = this.activeLarkReplyTarget;
+      this.activeLarkReplyTarget = source === 'lark' ? relayMessage : undefined;
+      try {
+        if (this.awaitingOnboardingInput) {
+          await this.handleOnboardingInput(trimmed);
           return;
         }
 
-        const normalizedInput = trimmed.toLowerCase();
-        const isConfirmed = normalizedInput === '是' || normalizedInput === 'yes' || normalizedInput === 'y';
-        const isRejected = normalizedInput === '否' || normalizedInput === 'no' || normalizedInput === 'n';
-        let result: string | undefined;
-
-        if (confirmationStatus.type === 'plan_execution' && (isConfirmed || isRejected)) {
-          console.log(chalk.cyan(isConfirmed ? '✅ 确认执行计划...' : '❌ 取消执行'));
-          result = await this.agent?.confirmAction(isConfirmed);
-          if (isRejected) {
-            this.failTrackedTask('用户取消执行计划');
-          }
-        } else {
-          console.log(chalk.cyan('\n↪ 继续处理待补充信息...'));
-          result = await this.agent?.respondToPendingInput(trimmed);
-        }
-
-        if (this.agent) {
-          this.memoryManager.setMessages(this.agent.getMessages());
-          await this.memoryProvider?.syncSession(this.agent.getMessages());
-        }
-        if (result) {
-          console.log(chalk.green('\nAssistant: '));
-          await this.streamResponse(result);
-          console.log();
-        }
-        return;
+        await this.handleMessage(trimmed);
+      } finally {
+        this.activeLarkReplyTarget = previousLarkReplyTarget;
       }
-
-      await this.handleMessage(trimmed);
     });
 
     this.inputQueue = task.catch(() => {});
@@ -628,11 +635,17 @@ export class CLI {
       printWarning(`[Lark Relay] ${error.message}`);
     });
     this.larkRelay.on('message', (message: LarkRelayMessage) => {
-      const forwardedText = message.content.trim();
-      if (!forwardedText) {
-        return;
-      }
-      void this.enqueueInput(forwardedText, 'lark', message, relayConfig.allowCommands === true);
+      void (async () => {
+        const enrichedMessage = await this.larkRelay?.materializeMessageResources(message) || message;
+        const forwardedText = enrichedMessage.content.trim();
+        if (!forwardedText) {
+          return;
+        }
+        if (this.consumePendingLarkInlineReply(forwardedText, enrichedMessage)) {
+          return;
+        }
+        await this.enqueueInput(forwardedText, 'lark', enrichedMessage, relayConfig.allowCommands === true);
+      })();
     });
 
     try {
@@ -688,6 +701,28 @@ export class CLI {
     }
   }
 
+  private async handleFunctionCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase() || 'status';
+
+    switch (subcommand) {
+      case 'status':
+        this.showFunctionModeStatus();
+        break;
+      case 'switch': {
+        const target = args[1]?.toLowerCase();
+        if (target !== 'workflow' && target !== 'chat') {
+          printInfo('用法: /function status | /function switch <workflow|chat>');
+          return;
+        }
+        await this.switchFunctionMode(target);
+        break;
+      }
+      default:
+        printInfo('用法: /function status | /function switch <workflow|chat>');
+        break;
+    }
+  }
+
   private async handleSplitCommand(args: string[]): Promise<void> {
     const subcommand = args[0]?.toLowerCase() || 'status';
 
@@ -735,12 +770,32 @@ export class CLI {
   }
 
   private writeProcessLog(message: string): void {
+    const repaired = normalizeDisplayText(message);
+    const normalized = repaired.trim();
+    if (!normalized || normalized === this.lastProcessLogMessage) {
+      return;
+    }
+    this.lastProcessLogMessage = normalized;
+
     if (this.splitScreen?.isActive()) {
-      this.splitScreen.appendRight(message);
+      this.splitScreen.appendRight(repaired);
       return;
     }
 
-    console.log(message);
+    console.log(repaired);
+  }
+
+  private formatProcessEventContent(content: string | undefined, fallback: string): string {
+    const normalized = normalizeDisplayText(content || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return fallback;
+    }
+
+    if (/^generating response/i.test(normalized)) {
+      return '正在生成响应';
+    }
+
+    return normalized;
   }
 
   private async showInputModeStatus(): Promise<void> {
@@ -754,6 +809,26 @@ export class CLI {
     if (relayStatus.externalOccupancy) {
       printWarning('[Mode] 检测到外部 event +subscribe 实例占用当前飞书长连接。');
     }
+    console.log();
+  }
+
+  private showFunctionModeStatus(): void {
+    const mode = this.getFunctionMode();
+    const routingConfig = configManager.get('functionRouting');
+    console.log(chalk.bold('\nFunction Mode\n'));
+    console.log(`Current: ${mode}`);
+    console.log(`Route: ${mode === 'workflow'
+      ? 'workflow-first orchestration / direct action / checkpoint resume'
+      : 'chat-first interaction with optional auto-switch back to workflow'}`);
+    if (mode === 'workflow') {
+      console.log('Behavior: default workflow mode; task execution is prioritized.');
+    }
+    if (mode === 'chat') {
+      console.log('Behavior: explicit chat mode; when configured, saying you want workflow will auto-switch back.');
+    }
+    console.log(`Prefer Workflow: ${routingConfig?.preferWorkflow ? 'yes' : 'no'}`);
+    console.log(`Chat -> Workflow Auto Switch: ${routingConfig?.allowAutoSwitchFromChatToWorkflow ? 'yes' : 'no'}`);
+    console.log(`Pending Workflow State: ${this.sessionTaskStack.getCheckpoint() ? 'yes' : 'no'}`);
     console.log();
   }
 
@@ -782,6 +857,73 @@ export class CLI {
     }
 
     printSuccess('已切换到 feishu 模式：Agent 现在接收手机端飞书消息，命令行仅接收 / 命令。');
+  }
+
+  private async switchFunctionMode(target: FunctionMode, options: { resetTaskState?: boolean; announce?: boolean } = {}): Promise<void> {
+    const current = this.getFunctionMode();
+    if (current === target) {
+      printInfo(`当前已经是 ${target} 模式。`);
+      return;
+    }
+
+    const resetTaskState = options.resetTaskState ?? true;
+    const announce = options.announce ?? true;
+    const hadPendingInteraction = Boolean(this.agent?.getConfirmationStatus()?.pending);
+    if (resetTaskState && hadPendingInteraction && this.agent) {
+      this.agent.clearPendingInteraction();
+    }
+
+    if (resetTaskState) {
+      this.sessionTaskStack.clear();
+      this.lastGraphState = undefined;
+      await this.persistSessionTaskStack();
+    }
+
+    configManager.set('functionMode', target);
+    configManager.set('agentInteractionMode', target === 'chat' ? 'chat' : 'task');
+    await configManager.savePartial('functionMode', target);
+
+    if (announce) {
+      printSuccess(`已切换到 ${target} 模式。`);
+      if (target === 'chat') {
+        printInfo('chat 模式会优先走对话路径；如果你明确说要切回 workflow，会自动切回去。');
+      } else {
+        printInfo('workflow 是默认模式，会优先走 direct action、checkpoint 和计划执行链路。');
+        printInfo('进入计划后仍会先请求确认，再开始执行，避免误判时擅自开跑。');
+      }
+      if (resetTaskState && hadPendingInteraction) {
+        printInfo('已清理未完成的待确认/待恢复任务状态，避免跨模式串线。');
+      }
+    }
+  }
+
+  private normalizeLegacyAgentModeArgs(args: string[]): string[] {
+    if (args[0]?.toLowerCase() !== 'switch') {
+      return args;
+    }
+
+    const target = args[1]?.toLowerCase();
+    if (target === 'chat') {
+      return ['switch', 'chat'];
+    }
+    if (target === 'task' || target === 'auto') {
+      return ['switch', 'workflow'];
+    }
+    return args;
+  }
+
+  private getFunctionMode(): FunctionMode {
+    const mode = configManager.get('functionMode');
+    if (mode === 'chat' || mode === 'workflow') {
+      return mode;
+    }
+
+    const legacyMode = configManager.get('agentInteractionMode');
+    return legacyMode === 'chat' ? 'chat' : 'workflow';
+  }
+
+  private getAgentInteractionMode(): AgentInteractionMode {
+    return this.getFunctionMode() === 'chat' ? 'chat' : 'task';
   }
 
   private buildModeRelayConfig(config: ReturnType<typeof configManager.getAgentConfig>): LarkRelayConfig {
@@ -1018,6 +1160,55 @@ export class CLI {
     });
   }
 
+  private async requestInlineApprovalAnswer(): Promise<string> {
+    const relayTarget = this.activeLarkReplyTarget;
+    if (this.currentInputMode === 'feishu' && relayTarget?.chatId) {
+      return new Promise((resolve) => {
+        this.pendingLarkInlineReply = {
+          chatId: relayTarget.chatId,
+          senderId: relayTarget.senderId,
+          resolve: (answer: string) => {
+            this.pendingLarkInlineReply = undefined;
+            resolve(answer);
+          },
+        };
+      });
+    }
+
+    return this.promptInline('> ');
+  }
+
+  private consumePendingLarkInlineReply(answer: string, message: LarkRelayMessage): boolean {
+    const pendingReply = this.pendingLarkInlineReply;
+    if (!pendingReply) {
+      return false;
+    }
+
+    if (pendingReply.chatId && message.chatId && pendingReply.chatId !== message.chatId) {
+      return false;
+    }
+
+    if (pendingReply.senderId && message.senderId && pendingReply.senderId !== message.senderId) {
+      return false;
+    }
+
+    pendingReply.resolve(answer);
+    return true;
+  }
+
+  private async sendPermissionPromptToActiveLarkTarget(prompt: string): Promise<void> {
+    const normalizedPrompt = this.stripAnsiText(prompt).trim();
+    if (!normalizedPrompt) {
+      return;
+    }
+
+    await this.sendAssistantReplyToActiveLarkTarget(normalizedPrompt);
+  }
+
+  private stripAnsiText(text: string): string {
+    return text.replace(/\u001B\[[0-9;]*m/g, '');
+  }
+
   private async handleCommand(input: string): Promise<void> {
     const [command, ...args] = input.slice(1).split(/\s+/);
     if (!command) return;
@@ -1064,6 +1255,12 @@ export class CLI {
       case 'mode':
         await this.handleModeCommand(args);
         break;
+      case 'function':
+        await this.handleFunctionCommand(args);
+        break;
+      case 'agent-mode':
+        await this.handleFunctionCommand(this.normalizeLegacyAgentModeArgs(args));
+        break;
       case 'split':
         await this.handleSplitCommand(args);
         break;
@@ -1093,6 +1290,9 @@ export class CLI {
       case 'r':
         this.agent?.clearMessages();
         this.memoryManager.clearHistory();
+        this.sessionTaskStack.clear();
+        this.lastGraphState = undefined;
+        void this.persistSessionTaskStack();
         printSuccess('Conversation reset.');
         break;
       case 'new':
@@ -1125,6 +1325,9 @@ export class CLI {
       case 'p':
         this.showProgress();
         break;
+      case 'task-context':
+        this.showTaskContext(args);
+        break;
       case 'memory':
         this.handleMemoryCommand(args);
         break;
@@ -1150,6 +1353,9 @@ export class CLI {
       case 'browser':
         await this.handleBrowserCommand(args);
         break;
+      case 'vision':
+        await this.handleVisionCommand(args);
+        break;
       case 'news':
         await this.handleNewsCommand(args);
         break;
@@ -1170,38 +1376,12 @@ export class CLI {
         console.log(chalk.yellow('\n' + moderationResult.message + '\n'));
       }
       
-      this.moderator?.recordWarning(input);
+      this.moderator?.recordWarning(input, Boolean(moderationResult.message));
     }
 
     this.userProfile?.recordInteraction();
 
-    const directResult = await this.directActionRouter?.tryHandle(input);
-    if (directResult?.handled) {
-      if (this.agent) {
-        this.agent.appendMessages([
-          { role: 'user', content: input },
-          { role: 'assistant', content: directResult.output || '(无输出)' },
-        ]);
-        this.memoryManager.setMessages(this.agent.getMessages());
-        await this.memoryProvider?.syncSession(this.agent.getMessages());
-      }
-
-      await this.archiveDirectActionResult(input, directResult);
-
-      console.log();
-      if (directResult.title) {
-        console.log(chalk.cyan(directResult.title));
-      }
-      if (directResult.isError) {
-        printError(directResult.output || 'Direct action failed');
-      } else {
-        console.log(chalk.green('\nAssistant: '));
-        await this.streamResponse(directResult.output || '(无输出)');
-      }
-      console.log();
-      return;
-    }
-
+    const taskBinding = this.sessionTaskStack.resolveInput(input);
     if (this.organizationMode && this.organization) {
       await this.handleOrganizationMessage(input);
       return;
@@ -1223,15 +1403,16 @@ export class CLI {
     this.agent.setEventHandler((event: AgentEvent) => {
       switch (event.type) {
         case 'thinking':
-          this.writeProcessLog('Thinking...');
+          this.writeProcessLog(`· ${this.formatProcessEventContent(event.content, 'Thinking...')}`);
           break;
         case 'tool_call':
-          this.writeProcessLog(`🔧 ${event.content}`);
+          this.writeProcessLog(`🔧 ${this.formatProcessEventContent(event.content, '调用工具')}`);
           break;
         case 'tool_result':
           this.writeProcessLog('[工具结果]');
           if (event.toolResult?.is_error) {
-            this.writeProcessLog(`✗ ${this.getToolResultDisplayText(event.toolResult) || 'Tool execution failed'}`);
+            const marker = this.isBrowserSafetyToolResult(event.toolResult) ? '⚠' : '✗';
+            this.writeProcessLog(`${marker} ${this.getToolResultDisplayText(event.toolResult) || 'Tool execution failed'}`);
           } else {
             const output = this.getToolResultDisplayText(event.toolResult);
             if (output.length > 0) {
@@ -1245,9 +1426,18 @@ export class CLI {
           break;
         case 'plan_summary':
           this.trackPlannedTask(event);
+          this.writeProcessLog(`📋 ${this.formatProcessEventContent(event.content, '已生成计划')}`);
           break;
         case 'plan_progress':
           this.updateTrackedTaskFromPlanEvent(event);
+          if (event.planProgress) {
+            const verb = event.planProgress.status === 'started'
+              ? '开始'
+              : event.planProgress.status === 'completed'
+                ? '完成'
+                : '失败';
+            this.writeProcessLog(`🪜 [${verb}] ${event.planProgress.stepDescription}`);
+          }
           break;
         case 'response':
           this.completeTrackedTaskIfNeeded(event.content);
@@ -1276,52 +1466,314 @@ export class CLI {
     });
 
     try {
-      const config = configManager.getAgentConfig();
-      const recallLimit = configManager.get('memory')?.recallLimit || 6;
-      const memoryContext = await this.memoryProvider?.buildContext(input, recallLimit);
-      this.agent.setRuntimeMemoryContext(memoryContext || '');
-
-      let response = await this.agent.chat(input);
-      const autoContinueOnToolLimit = config.autoContinueOnToolLimit ?? true;
-      const maxContinuationTurns = config.maxContinuationTurns ?? 3;
-      let continuationTurns = 0;
-
-      while (autoContinueOnToolLimit && this.agent.needsContinuation() && continuationTurns < maxContinuationTurns) {
-        continuationTurns++;
-        printInfo(`当前响应达到单轮工具上限，自动继续第 ${continuationTurns}/${maxContinuationTurns} 轮...`);
-        const continuedResponse = await this.agent.continueResponse();
-        if (continuedResponse.trim()) {
-          response = response.trim()
-            ? `${response.trim()}\n${continuedResponse.trim()}`
-            : continuedResponse.trim();
-        }
+      const functionMode = this.getFunctionMode();
+      if (functionMode === 'chat') {
+        await this.handleChatModeMessage(input, taskBinding);
+      } else {
+        await this.handleTaskModeMessage(input, taskBinding);
       }
-
-      if (this.agent.needsContinuation()) {
-        printWarning('当前任务在自动续跑后仍未完成。可直接回复“继续”，或调大 maxToolCallsPerTurn / maxContinuationTurns。');
-      }
-
-      this.memoryManager.setMessages(this.agent.getMessages());
-      await this.memoryProvider?.syncSession(this.agent.getMessages());
-      this.streamingOutput.clear();
-      this.printHybridRouteSummary();
-      console.log(chalk.green('\nAssistant: '));
-      await this.streamResponse(response);
     } catch (error) {
+      this.sessionTaskStack.recordTask({
+        channel: 'agent',
+        title: input.trim(),
+        input,
+        effectiveInput: taskBinding.effectiveInput,
+        category: 'agent',
+        status: 'failed',
+        metadata: {
+          ...(taskBinding.isFollowUp && taskBinding.boundTask
+            ? { boundTaskId: taskBinding.boundTask.id, boundTaskTitle: taskBinding.boundTask.title }
+            : {}),
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      this.setTaskCheckpoint('finalize', 'failed', taskBinding.effectiveInput, error instanceof Error ? error.message : String(error), {
+        route: 'agent',
+      });
+      this.lastGraphState = undefined;
+      await this.persistSessionTaskStack();
       printError('Failed to get response: ' + (error instanceof Error ? error.message : String(error)));
     }
     
     console.log();
   }
 
-  private async streamResponse(text: string): Promise<void> {
+  private async handleChatModeMessage(input: string, taskBinding: ReturnType<SessionTaskStackManager['resolveInput']>): Promise<void> {
+    const agent = this.agent;
+    if (!agent) {
+      throw new Error('Agent not initialized.');
+    }
+
+    const config = configManager.getAgentConfig();
+    const trimmed = input.trim();
+    const functionSwitch = this.parseFunctionSwitchRequest(trimmed);
+    if (functionSwitch?.target === 'workflow' && config.functionRouting?.allowAutoSwitchFromChatToWorkflow !== false) {
+      await this.switchFunctionMode('workflow', { resetTaskState: false, announce: false });
+      if (functionSwitch.remainingInput) {
+        printInfo('检测到你要切回 workflow，已自动切换并继续按任务执行。');
+        const nextBinding = this.sessionTaskStack.resolveInput(functionSwitch.remainingInput);
+        await this.handleTaskModeMessage(functionSwitch.remainingInput, nextBinding);
+      } else {
+        printSuccess('已自动切换到 workflow 模式。');
+      }
+      return;
+    }
+
+    const confirmationStatus = agent.getConfirmationStatus();
+
+    if (confirmationStatus.pending) {
+      if (agent.shouldTreatPendingInputAsNewRequest(trimmed)) {
+        agent.clearPendingInteraction();
+        printInfo('检测到这是一个新的独立请求，已跳过上一条待补充状态。');
+      } else {
+        const normalizedInput = trimmed.toLowerCase();
+        const isConfirmed = normalizedInput === '是' || normalizedInput === 'yes' || normalizedInput === 'y';
+        const isRejected = normalizedInput === '否' || normalizedInput === 'no' || normalizedInput === 'n';
+        let result: string | undefined;
+
+        if (confirmationStatus.type === 'plan_execution' && (isConfirmed || isRejected)) {
+          printInfo(isConfirmed ? '确认执行计划...' : '取消执行计划');
+          result = await agent.confirmAction(isConfirmed);
+          if (isRejected) {
+            this.failTrackedTask('用户取消执行计划');
+          }
+        } else {
+          printInfo('继续处理待补充信息...');
+          result = await agent.respondToPendingInput(trimmed);
+        }
+
+        this.memoryManager.setMessages(agent.getMessages());
+        await this.memoryProvider?.syncSession(agent.getMessages());
+        if (result) {
+          console.log(chalk.green('\nAssistant: '));
+          await this.streamResponse(result);
+          await this.sendAssistantReplyToActiveLarkTarget(result);
+        }
+        await this.sendPendingInteractionPromptToActiveLarkTarget(result);
+        return;
+      }
+    }
+
+    const recallLimit = configManager.get('memory')?.recallLimit || 6;
+    const memoryContext = await this.memoryProvider?.buildContext(input, recallLimit);
+    agent.setRuntimeMemoryContext(memoryContext || '');
+
+    let response = await agent.chat(input);
+    const autoContinueOnToolLimit = config.autoContinueOnToolLimit ?? true;
+    const maxContinuationTurns = config.maxContinuationTurns ?? 3;
+    let continuationTurns = 0;
+
+    while (autoContinueOnToolLimit && agent.needsContinuation() && continuationTurns < maxContinuationTurns) {
+      continuationTurns++;
+      printInfo(`当前响应达到单轮工具上限，自动继续第 ${continuationTurns}/${maxContinuationTurns} 轮...`);
+      const continuedResponse = await agent.continueResponse();
+      if (continuedResponse.trim()) {
+        response = response.trim() ? `${response.trim()}\n${continuedResponse.trim()}` : continuedResponse.trim();
+      }
+    }
+
+    if (agent.needsContinuation()) {
+      printWarning('当前任务在自动续跑后仍未完成。可直接回复“继续”，或切到 task 模式获得完整 workflow 控制。');
+    }
+
+    this.memoryManager.setMessages(agent.getMessages());
+    await this.memoryProvider?.syncSession(agent.getMessages());
+    this.streamingOutput?.clear();
+    this.printHybridRouteSummary();
+    console.log(chalk.green('\nAssistant: '));
+    await this.streamResponse(response || '(无输出)');
+    await this.sendAssistantReplyToActiveLarkTarget(response || '(无输出)');
+    await this.sendPendingInteractionPromptToActiveLarkTarget(response || '(无输出)');
+  }
+
+  private async handleAutoModeMessage(input: string, taskBinding: ReturnType<SessionTaskStackManager['resolveInput']>): Promise<void> {
+    const agent = this.agent;
+    if (!agent) {
+      throw new Error('Agent not initialized.');
+    }
+
+    const decision = await this.chatRouter.route({
+      input,
+      taskBinding,
+      checkpoint: this.sessionTaskStack.getCheckpoint(),
+      agent,
+      policy: configManager.get('functionRouting'),
+    });
+
+    this.reportAutoRouteDecision(decision);
+
+    if (decision.target === 'task') {
+      if (decision.reason === 'workflow_request' || decision.reason === 'complex_task') {
+        printInfo('这个需求稍复杂，我先整理步骤并推进执行，过程中会持续和你同步。');
+      }
+      await this.handleTaskModeMessage(input, taskBinding);
+      return;
+    }
+
+    await this.handleChatModeMessage(input, taskBinding);
+  }
+
+  private async handleTaskModeMessage(input: string, taskBinding: ReturnType<SessionTaskStackManager['resolveInput']>): Promise<void> {
+    const agent = this.agent;
+    if (!agent) {
+      throw new Error('Agent not initialized.');
+    }
+
+    const config = configManager.getAgentConfig();
+    const executor = new TaskExecutorService({
+      agent,
+      directActionRouter: this.directActionRouter,
+      permissionManager: this.permissionMgr,
+      autoContinueOnToolLimit: config.autoContinueOnToolLimit ?? true,
+      maxContinuationTurns: config.maxContinuationTurns ?? 3,
+      memoryProvider: this.memoryProvider,
+      recallLimit: configManager.get('memory')?.recallLimit || 6,
+      onStateChange: async (graphState) => {
+        await this.captureGraphState(graphState);
+      },
+    });
+
+    this.pendingDirectActionPreamble = undefined;
+    const result = await executor.executeTurn(
+      input,
+      this.toAgentTaskBindingSnapshot(taskBinding),
+      this.sessionTaskStack.getCheckpoint(),
+    );
+
+    if (result.executionContext.shouldAnnounceWorkflow && result.executionContext.mode !== 'pending_interaction') {
+      printInfo(result.executionContext.summary);
+    }
+    this.reportTaskExecutionPolicy(result.executionPolicy);
+
+    for (const notice of result.notices) {
+      if (notice.level === 'warning') {
+        printWarning(notice.message);
+      } else {
+        printInfo(notice.message);
+      }
+    }
+
+    if (result.route === 'direct_action' && result.directAction?.handled) {
+      const directActionMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [{ role: 'user', content: input }];
+      if (this.pendingDirectActionPreamble) {
+        directActionMessages.push({ role: 'assistant', content: this.pendingDirectActionPreamble });
+      }
+      directActionMessages.push({ role: 'assistant', content: result.output || '(无输出)' });
+      agent.appendMessages(directActionMessages);
+      this.memoryManager.setMessages(agent.getMessages());
+      await this.memoryProvider?.syncSession(agent.getMessages());
+
+      if (result.taskRecord) {
+        this.sessionTaskStack.recordTask(result.taskRecord);
+      }
+      await this.captureGraphState(result.graphState);
+      await this.persistSessionTaskStack();
+      await this.archiveDirectActionResult(input, result.directAction);
+
+      if (result.directAction.title) {
+        console.log(chalk.cyan(result.directAction.title));
+      }
+      if (result.directAction.isError) {
+        printError(result.output || 'Direct action failed');
+      } else {
+        console.log(chalk.green('\nAssistant: '));
+        await this.streamResponse(result.output || '(无输出)');
+        await this.sendAssistantReplyToActiveLarkTarget(result.output || '(无输出)');
+      }
+      await this.sendPendingInteractionPromptToActiveLarkTarget(result.output || '(无输出)');
+      return;
+    }
+
+    this.memoryManager.setMessages(agent.getMessages());
+    await this.memoryProvider?.syncSession(agent.getMessages());
+    if (result.taskRecord) {
+      this.sessionTaskStack.recordTask(result.taskRecord);
+    }
+    await this.captureGraphState(result.graphState);
+    await this.persistSessionTaskStack();
+    this.streamingOutput?.clear();
+    this.printHybridRouteSummary();
+    if (result.output) {
+      console.log(chalk.green('\nAssistant: '));
+      await this.streamResponse(result.output);
+      await this.sendAssistantReplyToActiveLarkTarget(result.output);
+    }
+    await this.sendPendingInteractionPromptToActiveLarkTarget(result.output);
+  }
+
+  private reportAutoRouteDecision(decision: { target: 'chat' | 'task'; reason: string; intent?: string }): void {
+    if (configManager.get('functionRouting')?.announceRouteDecisions === false || decision.reason === 'social_chat') {
+      return;
+    }
+
+    const detail = `[Router] auto -> ${decision.target} | reason=${decision.reason}${decision.intent ? ` | intent=${decision.intent}` : ''}`;
     if (this.splitScreen?.isActive()) {
-      this.splitScreen.appendLeft(text);
+      this.writeProcessLog(detail);
+      return;
+    }
+
+    printInfo(detail);
+  }
+
+  private reportTaskExecutionPolicy(policy: {
+    toolBudget: { toolCallCount: number; maxToolCallsPerTurn: number; maxIterations: number; lastStopReason: string };
+    permissionStrategy: string;
+    checkpointResumeHint?: string;
+  }): void {
+    const detail = `[Workflow Policy] budget=${policy.toolBudget.toolCallCount}/${policy.toolBudget.maxToolCallsPerTurn} | iterations=${policy.toolBudget.maxIterations} | permissions=${policy.permissionStrategy}${policy.checkpointResumeHint ? ` | resume=${policy.checkpointResumeHint}` : ''}`;
+    if (this.splitScreen?.isActive()) {
+      this.writeProcessLog(detail);
+      return;
+    }
+
+    printInfo(detail);
+  }
+
+  private parseFunctionSwitchRequest(input: string): { target: FunctionMode; remainingInput?: string } | null {
+    const routing = configManager.get('functionRouting');
+    const normalized = input.trim();
+    if (!normalized) {
+      return null;
+    }
+
+    const workflowRemaining = this.matchModeSwitchPrefix(normalized, routing?.workflowSwitchKeywords || []);
+    if (workflowRemaining !== null) {
+      return { target: 'workflow', remainingInput: workflowRemaining || undefined };
+    }
+
+    const chatRemaining = this.matchModeSwitchPrefix(normalized, routing?.chatSwitchKeywords || []);
+    if (chatRemaining !== null) {
+      return { target: 'chat', remainingInput: chatRemaining || undefined };
+    }
+
+    return null;
+  }
+
+  private matchModeSwitchPrefix(input: string, keywords: string[]): string | null {
+    const normalized = input.trim();
+    const lowered = normalized.toLowerCase();
+
+    for (const keyword of keywords) {
+      const loweredKeyword = keyword.trim().toLowerCase();
+      if (!lowered.startsWith(loweredKeyword)) {
+        continue;
+      }
+
+      return normalized.slice(keyword.length).replace(/^[\s,:，。；;、-]+/, '').trim();
+    }
+
+    return null;
+  }
+
+  private async streamResponse(text: string): Promise<void> {
+    const normalizedText = normalizeDisplayText(text);
+    if (this.splitScreen?.isActive()) {
+      this.splitScreen.appendLeft(normalizedText);
       return;
     }
 
     const output = createStreamingOutput({ color: 'cyan', speed: 5 });
-    await output.stream(text);
+    await output.stream(normalizedText);
   }
 
   private printHybridRouteSummary(): void {
@@ -1440,14 +1892,60 @@ export class CLI {
 
   private getToolResultDisplayText(toolResult?: { output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }): string {
     if (!toolResult) return '';
-    if (toolResult.output) return toolResult.output;
+    if (toolResult.output) return normalizeDisplayText(toolResult.output);
     if (toolResult.content) {
-      return toolResult.content
+      return normalizeDisplayText(toolResult.content
         .filter(item => item.type === 'text' && typeof item.text === 'string')
         .map(item => item.text || '')
-        .join('\n');
+        .join('\n'));
     }
     return '';
+  }
+
+  private isBrowserSafetyToolResult(toolResult?: { is_error?: boolean; errorType?: string; statusCode?: string }): boolean {
+    return toolResult?.errorType === 'browser_safety_abort' || toolResult?.statusCode === 'BROWSER_SAFETY_ABORTED';
+  }
+
+  private formatBrowserAgentResult(toolResult?: { output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }): { status?: string; text: string } {
+    const output = this.getToolResultDisplayText(toolResult);
+    if (!output) return { text: '' };
+
+    try {
+      const parsed = JSON.parse(output) as {
+        status?: string;
+        finalMessage?: string;
+        safety?: { category?: string; stage?: string; matchedPolicy?: string; matchedTerms?: string[] };
+        appliedWorkflows?: string[];
+      };
+
+      const lines: string[] = [];
+      if (parsed.status) {
+        lines.push(`status: ${parsed.status}`);
+      }
+      if (parsed.safety?.category) {
+        lines.push(`category: ${parsed.safety.category}`);
+      }
+      if (parsed.safety?.stage) {
+        lines.push(`stage: ${parsed.safety.stage}`);
+      }
+      if (parsed.safety?.matchedPolicy) {
+        lines.push(`policy: ${parsed.safety.matchedPolicy}`);
+      }
+      if (parsed.safety?.matchedTerms?.length) {
+        lines.push(`matched: ${parsed.safety.matchedTerms.join(', ')}`);
+      }
+      if (parsed.appliedWorkflows?.length) {
+        lines.push(`workflows: ${parsed.appliedWorkflows.join(', ')}`);
+      }
+      if (parsed.finalMessage) {
+        lines.push('message:');
+        lines.push(parsed.finalMessage);
+      }
+
+      return { status: parsed.status, text: lines.length > 0 ? lines.join('\n') : output };
+    } catch {
+      return { text: output };
+    }
   }
 
   private formatCronRunResult(toolResult?: { output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }): string {
@@ -1544,6 +2042,7 @@ export class CLI {
     this.appBaseDir = config.appBaseDir || path.join(os.homedir(), '.ai-agent-cli');
     this.inputHistoryPath = path.join(this.appBaseDir, 'input-history.json');
     this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
+    this.sessionTaskStackDir = path.join(this.appBaseDir, 'runtime', 'session-task-stack');
     this.backgroundDaemon = new BackgroundDaemonManager(this.appBaseDir);
   }
 
@@ -1765,6 +2264,7 @@ export class CLI {
       this.streamingOutput?.clear();
       console.log(chalk.green('\n--- Result ---\n'));
       await this.streamResponse(response);
+      await this.sendAssistantReplyToActiveLarkTarget(response);
     } catch (error) {
       printError('Organization processing failed: ' + (error instanceof Error ? error.message : String(error)));
     }
@@ -1835,32 +2335,203 @@ export class CLI {
   }
 
   private showProgress(): void {
+    console.log(chalk.bold('\n📊 任务进度:\n'));
+
     if (!this.enhancedMemory) {
-      printInfo('Enhanced memory not initialized');
+      console.log(chalk.gray('增强记忆尚未初始化，无法显示结构化进行中任务。'));
+    } else {
+      const activeTasks = this.enhancedMemory.getActiveTasks();
+      if (activeTasks.length === 0) {
+        console.log(chalk.gray('暂无进行中的任务'));
+      } else {
+        for (const task of activeTasks) {
+          const statusColor = task.status === 'in_progress' ? chalk.yellow : 
+                            task.status === 'completed' ? chalk.green : chalk.gray;
+          console.log(chalk.cyan(`  ${task.description}`));
+          console.log(`  进度: ${statusColor(task.progress + '%')}`);
+          console.log(`  状态: ${statusColor(task.status)}`);
+          if (task.currentStep) {
+            console.log(`  当前: ${task.currentStep}`);
+          }
+          if (task.completedSteps.length > 0) {
+            console.log(chalk.gray(`  已完成: ${task.completedSteps.join(', ')}`));
+          }
+          console.log();
+        }
+      }
+    }
+
+    this.printTaskContextSummary(false);
+  }
+
+  private showTaskContext(args: string[] = []): void {
+    const mode = args[0]?.toLowerCase();
+    if (mode === '--json' || mode === 'json') {
+      const snapshot = this.sessionTaskStack.getContextSnapshot(10);
+      const agentState = this.agent?.getUnifiedStateSnapshot(undefined, snapshot.checkpoint);
+      const graphState = this.buildCurrentGraphState(agentState);
+      console.log(JSON.stringify(buildTaskContextJsonPayload(snapshot, graphState, agentState), null, 2));
       return;
     }
 
-    const activeTasks = this.enhancedMemory.getActiveTasks();
-    console.log(chalk.bold('\n📊 任务进度:\n'));
+    if (mode === 'inspect') {
+      this.printTaskContextInspect();
+      return;
+    }
 
-    if (activeTasks.length === 0) {
-      console.log(chalk.gray('暂无进行中的任务'));
+    this.printTaskContextSummary(true);
+  }
+
+  private printTaskContextSummary(includeHeader: boolean): void {
+    const snapshot = this.sessionTaskStack.getContextSnapshot(5);
+    if (includeHeader) {
+      console.log(chalk.bold('\n🧭 任务上下文:\n'));
     } else {
-      for (const task of activeTasks) {
-        const statusColor = task.status === 'in_progress' ? chalk.yellow : 
-                          task.status === 'completed' ? chalk.green : chalk.gray;
-        console.log(chalk.cyan(`  ${task.description}`));
-        console.log(`  进度: ${statusColor(task.progress + '%')}`);
-        console.log(`  状态: ${statusColor(task.status)}`);
-        if (task.currentStep) {
-          console.log(`  当前: ${task.currentStep}`);
-        }
-        if (task.completedSteps.length > 0) {
-          console.log(chalk.gray(`  已完成: ${task.completedSteps.join(', ')}`));
-        }
-        console.log();
+      console.log(chalk.bold('\n🧭 任务栈上下文:\n'));
+    }
+
+    if (!snapshot.activeTask) {
+      console.log(chalk.gray('当前还没有记录任务。'));
+      return;
+    }
+
+    const activeTask = snapshot.activeTask;
+    console.log(chalk.cyan('当前活跃目标'));
+    console.log(`  ${activeTask.title}`);
+    console.log(chalk.gray(`  channel=${activeTask.channel}, status=${activeTask.status}, category=${activeTask.category || activeTask.handlerName || 'unknown'}`));
+
+    const activeBinding = snapshot.recentBindings.find(binding => binding.sourceTask.id === activeTask.id);
+    if (activeBinding) {
+      console.log(chalk.gray(`  绑定来源: ${activeBinding.targetTask?.title || activeBinding.targetTaskTitle || activeBinding.targetTaskId}`));
+    }
+
+    if (snapshot.bindableTask) {
+      console.log(chalk.cyan('\n当前默认跟进锚点'));
+      console.log(`  ${snapshot.bindableTask.title}`);
+      console.log(chalk.gray(`  channel=${snapshot.bindableTask.channel}, status=${snapshot.bindableTask.status}`));
+    }
+
+    if (snapshot.checkpoint) {
+      console.log(chalk.cyan('\n当前 checkpoint'));
+      console.log(`  ${snapshot.checkpoint.node} | ${snapshot.checkpoint.status}`);
+      if (snapshot.checkpoint.summary) {
+        console.log(chalk.gray(`  ${snapshot.checkpoint.summary}`));
       }
     }
+
+    if (snapshot.recentBindings.length > 0) {
+      console.log(chalk.cyan('\n最近绑定关系'));
+      for (const binding of snapshot.recentBindings) {
+        console.log(`  ${binding.sourceTask.title}`);
+        console.log(chalk.gray(`    ↳ ${binding.targetTask?.title || binding.targetTaskTitle || binding.targetTaskId}`));
+      }
+    }
+
+    console.log(chalk.cyan('\n最近任务'));
+    for (const task of snapshot.recentTasks) {
+      console.log(`  - ${task.title}`);
+      console.log(chalk.gray(`    ${task.channel} | ${task.status} | ${task.category || task.handlerName || 'unknown'}`));
+    }
+  }
+
+  private printTaskContextInspect(): void {
+    const snapshot = this.sessionTaskStack.getContextSnapshot(10);
+    console.log(chalk.bold('\n🧭 任务上下文 Inspect:\n'));
+
+    if (snapshot.recentTasks.length === 0) {
+      console.log(chalk.gray('当前还没有记录任务。'));
+      return;
+    }
+
+    snapshot.recentTasks.forEach((task, index) => {
+      console.log(chalk.cyan(`${index + 1}. ${task.title}`));
+      console.log(chalk.gray(`  id=${task.id}`));
+      console.log(chalk.gray(`  channel=${task.channel}, status=${task.status}, category=${task.category || task.handlerName || 'unknown'}`));
+      console.log(chalk.gray(`  input=${task.input}`));
+      if (task.effectiveInput && task.effectiveInput !== task.input) {
+        console.log(chalk.gray(`  effectiveInput=${task.effectiveInput}`));
+      }
+      if (task.metadata && Object.keys(task.metadata).length > 0) {
+        console.log(chalk.gray(`  metadata=${JSON.stringify(task.metadata)}`));
+      }
+      console.log(chalk.gray(`  createdAt=${task.createdAt}`));
+      console.log();
+    });
+
+    if (snapshot.checkpoint) {
+      console.log(chalk.cyan('checkpoint'));
+      console.log(chalk.gray(`  node=${snapshot.checkpoint.node}`));
+      console.log(chalk.gray(`  status=${snapshot.checkpoint.status}`));
+      console.log(chalk.gray(`  updatedAt=${snapshot.checkpoint.updatedAt}`));
+      if (snapshot.checkpoint.summary) {
+        console.log(chalk.gray(`  summary=${snapshot.checkpoint.summary}`));
+      }
+      if (snapshot.checkpoint.input) {
+        console.log(chalk.gray(`  input=${snapshot.checkpoint.input}`));
+      }
+      if (snapshot.checkpoint.metadata && Object.keys(snapshot.checkpoint.metadata).length > 0) {
+        console.log(chalk.gray(`  metadata=${JSON.stringify(snapshot.checkpoint.metadata)}`));
+      }
+      console.log();
+    }
+  }
+
+  private getSessionTaskStackPath(sessionId = this.memoryManager.getCurrentSessionId()): string {
+    return path.join(this.sessionTaskStackDir, `${sessionId}.json`);
+  }
+
+  private async loadPersistedSessionTaskStack(sessionId = this.memoryManager.getCurrentSessionId()): Promise<void> {
+    await this.sessionTaskStack.loadFromFile(this.getSessionTaskStackPath(sessionId));
+  }
+
+  private async persistSessionTaskStack(sessionId = this.memoryManager.getCurrentSessionId()): Promise<void> {
+    await this.sessionTaskStack.saveToFile(this.getSessionTaskStackPath(sessionId));
+  }
+
+  private async captureGraphState(graphState?: AgentGraphState): Promise<void> {
+    this.lastGraphState = graphState;
+    this.sessionTaskStack.setCheckpoint(graphState?.checkpoint);
+    await this.persistSessionTaskStack();
+  }
+
+  private buildCurrentGraphState(agentState?: ReturnType<Agent['getUnifiedStateSnapshot']>): AgentGraphState | undefined {
+    if (this.lastGraphState) {
+      return this.lastGraphState;
+    }
+
+    if (!agentState) {
+      return undefined;
+    }
+
+    const checkpoint = this.sessionTaskStack.getCheckpoint() ?? deriveCheckpointFromUnifiedAgentState(agentState);
+    return createAgentGraphState({
+      mode: checkpoint.node === 'resume' || checkpoint.node === 'pause_for_input' ? 'resume' : 'fresh',
+      route: checkpoint.metadata?.route === 'direct_action' ? 'direct_action' : 'agent',
+      originalInput: agentState.lastUserInput,
+      effectiveInput: agentState.lastUserInput,
+      checkpoint,
+      agentState,
+    });
+  }
+
+  private setTaskCheckpoint(
+    node: 'direct_action' | 'clarify' | 'plan' | 'execute_step' | 'pause_for_input' | 'resume' | 'finalize',
+    status: 'running' | 'waiting' | 'completed' | 'failed',
+    input?: string,
+    summary?: string,
+    metadata?: Record<string, unknown>,
+  ): void {
+    this.sessionTaskStack.setCheckpoint(createAgentCheckpoint(node, status, input, summary, metadata));
+    this.lastGraphState = undefined;
+    void this.persistSessionTaskStack();
+  }
+
+  private toAgentTaskBindingSnapshot(taskBinding: { isFollowUp: boolean; effectiveInput: string; boundTask?: AgentTaskBindingSnapshot['boundTask'] }): AgentTaskBindingSnapshot {
+    return {
+      isFollowUp: taskBinding.isFollowUp,
+      effectiveInput: taskBinding.effectiveInput,
+      boundTask: taskBinding.boundTask,
+    };
   }
 
   private handleMemoryCommand(args: string[]): void {
@@ -2374,6 +3045,9 @@ ${chalk.gray('权限组:')}
     const oldSessionId = this.memoryManager.getCurrentSessionId();
     this.memoryManager.newSession();
     this.agent?.clearMessages();
+    this.sessionTaskStack.clear();
+    this.lastGraphState = undefined;
+    void this.persistSessionTaskStack();
     
     console.log(chalk.bold('\n📝 新会话已创建\n'));
     console.log(`旧会话: ${chalk.gray(oldSessionId)}`);
@@ -2409,6 +3083,9 @@ ${chalk.gray('权限组:')}
       this.syncProfileToEnhancedMemory();
       this.memoryManager.clearHistory();
       this.agent?.clearMessages();
+      this.sessionTaskStack.clear();
+      this.lastGraphState = undefined;
+      await this.persistSessionTaskStack();
       this.isFirstInteraction = false;
       this.awaitingOnboardingInput = false;
       printSuccess('所有用户数据已清除');
@@ -2466,10 +3143,56 @@ ${chalk.gray('权限组:')}
     const success = await this.memoryManager.loadSession(sessionId);
     if (success) {
       this.agent?.setMessages(this.memoryManager.getMessages());
+      await this.loadPersistedSessionTaskStack(sessionId);
+      this.lastGraphState = undefined;
       printSuccess('Loaded session: ' + sessionId);
     } else {
       printError('Session not found: ' + sessionId);
     }
+  }
+
+  private async showDirectActionPreamble(message: string): Promise<void> {
+    if (this.getFunctionMode() === 'workflow') {
+      this.pendingDirectActionPreamble = undefined;
+      return;
+    }
+
+    this.pendingDirectActionPreamble = message;
+    console.log(chalk.green('\nAssistant: '));
+    await this.streamResponse(message);
+    console.log();
+  }
+
+  private async sendAssistantReplyToActiveLarkTarget(text: string): Promise<void> {
+    const relayMessage = this.activeLarkReplyTarget;
+    const builtInTools = this.builtInTools;
+    const normalizedText = text.trim();
+
+    if (!relayMessage?.chatId || !builtInTools || !normalizedText) {
+      return;
+    }
+
+    try {
+      await builtInTools.executeTool('send_lark_message', {
+        chatId: relayMessage.chatId,
+        text: normalizedText,
+      });
+    } catch (error) {
+      printWarning(`[Lark Relay] 回传最终结果失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async sendPendingInteractionPromptToActiveLarkTarget(alreadySentText?: string): Promise<void> {
+    const prompt = this.agent?.getPendingInteractionDetails()?.prompt?.trim();
+    if (!prompt) {
+      return;
+    }
+
+    if (typeof alreadySentText === 'string' && alreadySentText.trim() === prompt) {
+      return;
+    }
+
+    await this.sendAssistantReplyToActiveLarkTarget(prompt);
   }
 
   private createLLMClient(config: any): LLMProviderInterface {
@@ -2692,7 +3415,11 @@ ${chalk.gray('权限组:')}
           });
 
           if (result.is_error) {
-            printError(this.getToolResultDisplayText(result) || 'Failed to automate browser');
+            if (this.isBrowserSafetyToolResult(result)) {
+              printWarning(this.getToolResultDisplayText(result) || 'Browser automation stopped by safety guard');
+            } else {
+              printError(this.getToolResultDisplayText(result) || 'Failed to automate browser');
+            }
           } else {
             printSuccess(`Browser automation finished: ${url}`);
             console.log(this.formatBrowserAutomationResult(result));
@@ -2700,6 +3427,74 @@ ${chalk.gray('权限组:')}
         } catch (error) {
           printError(error instanceof Error ? error.message : String(error));
         }
+        break;
+      }
+      case 'agent':
+      case 'smart': {
+        const taskTokens: string[] = [];
+        let startUrl: string | undefined;
+        let maxSteps: number | undefined;
+        let workflow: string | undefined;
+
+        for (let index = 1; index < args.length; index += 1) {
+          const token = args[index];
+          if (!token) {
+            continue;
+          }
+
+          if (token === '--url') {
+            startUrl = args[index + 1];
+            index += 1;
+            continue;
+          }
+
+          if (token === '--max-steps') {
+            const nextValue = Number(args[index + 1]);
+            if (!Number.isFinite(nextValue) || nextValue <= 0) {
+              printError('Invalid --max-steps value');
+              return;
+            }
+            maxSteps = nextValue;
+            index += 1;
+            continue;
+          }
+
+          if (token === '--workflow') {
+            workflow = args[index + 1];
+            index += 1;
+            continue;
+          }
+
+          taskTokens.push(token);
+        }
+
+        const goal = taskTokens.join(' ').trim();
+        if (!goal) {
+          printError('Usage: /browser agent <goal> [--url <startUrl>] [--max-steps <n>] [--workflow <file>]');
+          return;
+        }
+
+        const result = await this.builtInTools.executeTool('browser_agent_run', {
+          goal,
+          startUrl,
+          maxSteps,
+          workflow,
+        });
+
+        const browserAgentResult = this.formatBrowserAgentResult(result);
+
+        if (result.is_error) {
+          printError(browserAgentResult.text || 'Failed to run browser agent');
+        } else if (browserAgentResult.status === 'safety_blocked') {
+          printWarning(browserAgentResult.text || 'Browser agent stopped by safety guard');
+        } else {
+          printSuccess('Browser agent started');
+          console.log(browserAgentResult.text);
+        }
+        break;
+      }
+      case 'workflow': {
+        await this.handleBrowserWorkflowCommand(args.slice(1));
         break;
       }
       case 'help':
@@ -2713,14 +3508,502 @@ ${chalk.cyan('/browser open')} <url>
 ${chalk.cyan('/browser run')} <url> [actionsJson|@actions.json] [--headed] [--timeout <ms>] [--browser <chrome|edge|chromium>]
   默认用 Chrome，通过 Playwright 打开网页并执行动作
 
+${chalk.cyan('/browser agent')} <goal> [--url <startUrl>] [--max-steps <n>] [--workflow <file>]
+  运行智能浏览器代理，支持读取 browser-workflows 目录下的 Markdown 流程文件来简化特定网页任务
+
+${chalk.cyan('/browser workflow list')}
+  列出当前 browser-workflows 目录中的所有 Markdown 流程文件
+
+${chalk.cyan('/browser workflow inspect')} <file>
+  查看某个 Markdown 流程文件解析后的结构，包括 match、steps、preferred selectors、fallback actions、done conditions
+
+${chalk.cyan('/browser workflow lint')} [file]
+  校验 workflow schema，并输出 error/warning，避免手写 Markdown 静默失效
+  加上 --json 可输出稳定 machine-readable 结构
+  加上 --quick-fix 可输出基于 suggestion 的 quick fix 草案
+
+${chalk.cyan('/browser workflow new')} <name> [--url <startUrl>] [--match <pattern1,pattern2>]
+  生成新的 browser workflow Markdown 模板，便于后续定制站点流程
+
 ${chalk.gray('动作示例:')}
   [{"type":"click","selector":"text=登录"},{"type":"fill","selector":"input[name=q]","value":"AI Agent CLI"},{"type":"press","selector":"input[name=q]","key":"Enter"},{"type":"wait_for_selector","selector":"#search"},{"type":"extract_text","selector":"body"},{"type":"screenshot","path":"browser/search.png"}]
+  [{"type":"evaluate_script","script":"window.scrollTo(0, document.body.scrollHeight)","expectResult":{"type":"void"}},{"type":"call_userscript_api","api":"UserscriptBridge.collectResults","args":["AI Agent CLI"],"expectResult":{"type":"array","shape":"{ title: string; url: string }","description":"search results"}},{"type":"toggle_userscript_mode","enabled":false}]
 
 ${chalk.gray('更稳妥的用法:')}
   /browser run https://example.com @actions.json --headed
+  /browser agent 帮我打开招聘网站并总结前 3 个前端岗位 --url https://example.com
+  /browser agent summary current page --workflow browser-workflows/example-summary.md
+  /browser workflow list
+  /browser workflow inspect browser-workflows/example-summary.md
+  /browser workflow lint browser-workflows/example-summary.md
+  /browser workflow new boss-zhipin-search --url https://www.zhipin.com --match zhipin.com
 `);
         break;
     }
+  }
+
+  private async handleVisionCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase();
+    switch (subcommand) {
+      case 'analyze': {
+        let parsedInput: { targets: string[]; prompt?: string; model?: string; limit?: number } | null;
+        try {
+          parsedInput = this.parseVisionAnalyzeArgs(args.slice(1));
+        } catch (error) {
+          printError(error instanceof Error ? error.message : String(error));
+          return;
+        }
+        if (!parsedInput) {
+          printError('Usage: /vision analyze <fileOrDir> [moreFilesOrDirs...] [prompt...] [--model <name>] [--limit <n>]');
+          return;
+        }
+        const { targets, prompt, model, limit } = parsedInput;
+
+        const config = configManager.getAgentConfig();
+        if (!config.ollama?.enabled) {
+          printError('Ollama 未启用，无法使用 /vision。');
+          return;
+        }
+
+        const visionService = createOllamaVisionService({
+          workspace: this.workspace,
+          appBaseDir: this.appBaseDir,
+          artifactOutputDir: config.artifactOutputDir,
+          documentOutputDir: config.documentOutputDir,
+          ollamaConfig: config.ollama,
+        });
+
+        try {
+          printInfo(`使用 ${model || config.ollama.visionModel || 'minicpm-v'} 分析图片目标...`);
+          const result = await visionService.analyzeTargets({
+            targets,
+            prompt,
+            model,
+            maxImages: limit,
+          });
+
+          if (this.agent) {
+            this.agent.appendMessages([
+              {
+                role: 'user',
+                content: `请分析图片目标 ${result.resolvedTargets.join(', ')}\n文件数: ${result.imageCount}\n要求: ${result.prompt}`,
+              },
+              {
+                role: 'assistant',
+                content: result.response,
+              },
+            ]);
+            this.memoryManager.setMessages(this.agent.getMessages());
+            await this.memoryProvider?.syncSession(this.agent.getMessages());
+          }
+
+          console.log(chalk.bold('\n🖼️ 图片分析结果\n'));
+          console.log(chalk.gray(`模型: ${result.model}`));
+          console.log(chalk.gray(`目标: ${result.resolvedTargets.join(', ')}`));
+          console.log(chalk.gray(`图片数: ${result.imageCount}`));
+          console.log(chalk.green('\nAssistant: '));
+          await this.streamResponse(result.response);
+          console.log();
+        } catch (error) {
+          printError(error instanceof Error ? error.message : String(error));
+        }
+        break;
+      }
+      case 'help':
+      default:
+        console.log(`
+${chalk.bold('Vision Commands:')}
+
+${chalk.cyan('/vision analyze')} <fileOrDir> [moreFilesOrDirs...] [prompt...] [--model <name>] [--limit <n>]
+  使用 Ollama 多模态模型分析一个或多个文件/目录中的图片，默认走 ollama.visionModel 或 minicpm-v
+
+${chalk.gray('示例:')}
+  /vision analyze ./screenshots
+  /vision analyze ./screenshots ./captures 请检查这些页面截图里的报错和异常状态
+  /vision analyze ./captures/home.png ./captures/error.png --model minicpm-v --limit 8
+`);
+        break;
+    }
+  }
+
+  private parseVisionAnalyzeArgs(args: string[]): { targets: string[]; prompt?: string; model?: string; limit?: number } | null {
+    const targets: string[] = [];
+    const promptTokens: string[] = [];
+    let model: string | undefined;
+    let limit: number | undefined;
+    let promptStarted = false;
+
+    for (let index = 0; index < args.length; index += 1) {
+      const token = args[index];
+      if (!token) {
+        continue;
+      }
+
+      if (token === '--model') {
+        model = args[index + 1];
+        index += 1;
+        continue;
+      }
+
+      if (token === '--limit') {
+        const parsed = Number(args[index + 1]);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          throw new Error('Invalid --limit value');
+        }
+        limit = parsed;
+        index += 1;
+        continue;
+      }
+
+      if (!promptStarted && this.isLikelyVisionTarget(token)) {
+        targets.push(token);
+        continue;
+      }
+
+      promptStarted = true;
+      promptTokens.push(token);
+    }
+
+    if (targets.length === 0) {
+      return null;
+    }
+
+    return {
+      targets,
+      prompt: promptTokens.join(' ').trim() || undefined,
+      model,
+      limit,
+    };
+  }
+
+  private isLikelyVisionTarget(token: string): boolean {
+    return /^[a-z]:[\\/]/i.test(token)
+      || /^(?:\.{1,2}[\\/]|[\\/])/.test(token)
+      || /[\\/]/.test(token)
+      || /\.(?:png|jpg|jpeg|webp|gif|bmp)$/i.test(token);
+  }
+
+  private async handleBrowserWorkflowCommand(args: string[]): Promise<void> {
+    const subcommand = args[0]?.toLowerCase();
+    const service = this.createBrowserWorkflowService();
+
+    switch (subcommand) {
+      case 'list': {
+        const resolution = await service.listWorkflows();
+        console.log(chalk.bold(`\nBrowser Workflows (${resolution.workflowDir})\n`));
+        if (resolution.workflows.length === 0) {
+          console.log(chalk.gray('No browser workflows found.'));
+          if (resolution.lintResults && resolution.lintResults.length > 0) {
+            this.printBrowserWorkflowLintSummary(resolution.lintResults);
+          }
+          return;
+        }
+
+        for (const workflow of resolution.workflows) {
+          const lint = resolution.lintResults?.find(item => item.filePath === workflow.sourcePath);
+          const errorCount = lint?.issues.filter(issue => issue.severity === 'error').length || 0;
+          const warningCount = lint?.issues.filter(issue => issue.severity === 'warning').length || 0;
+          console.log(`${chalk.cyan(workflow.name)} ${chalk.gray(`priority=${workflow.priority}`)}`);
+          console.log(chalk.gray(`  file: ${workflow.sourcePath}`));
+          if (workflow.startUrl) {
+            console.log(chalk.gray(`  startUrl: ${workflow.startUrl}`));
+          }
+          if (workflow.matchPatterns.length > 0) {
+            console.log(chalk.gray(`  match: ${workflow.matchPatterns.join(', ')}`));
+          }
+          console.log(chalk.gray(`  steps=${workflow.steps.length}, selectors=${Object.keys(workflow.preferredSelectors).length}, fallbacks=${Object.keys(workflow.fallbackActions).length}, done=${workflow.doneConditions.length}, phaseOverrides=${Object.keys(workflow.phaseConfigurations).length}`));
+          if (errorCount > 0 || warningCount > 0) {
+            console.log(chalk.gray(`  lint: errors=${errorCount}, warnings=${warningCount}`));
+          }
+          console.log(chalk.gray(`  ${workflow.description}`));
+        }
+        const invalidReports = (resolution.lintResults || []).filter(item => !item.valid && !resolution.workflows.some(workflow => workflow.sourcePath === item.filePath));
+        if (invalidReports.length > 0) {
+          console.log(chalk.yellow('\nInvalid workflow files:'));
+          this.printBrowserWorkflowLintSummary(invalidReports);
+        }
+        return;
+      }
+      case 'inspect': {
+        const target = args[1];
+        if (!target) {
+          printError('Usage: /browser workflow inspect <file>');
+          return;
+        }
+
+        const workflow = await service.inspectWorkflow(target);
+        console.log(chalk.bold(`\nBrowser Workflow: ${workflow.name}\n`));
+        console.log(chalk.gray(`file: ${workflow.sourcePath}`));
+        console.log(chalk.gray(`description: ${workflow.description}`));
+        if (workflow.startUrl) {
+          console.log(chalk.gray(`startUrl: ${workflow.startUrl}`));
+        }
+        if (workflow.matchPatterns.length > 0) {
+          console.log(chalk.gray(`match: ${workflow.matchPatterns.join(', ')}`));
+        }
+        if (workflow.whenToUse) {
+          console.log(`\n${chalk.bold('When to Use')}`);
+          console.log(workflow.whenToUse);
+        }
+        this.printBrowserWorkflowListSection('Steps', workflow.steps);
+        this.printBrowserWorkflowListSection('Hints', workflow.hints);
+        this.printBrowserWorkflowListSection('Success', workflow.successCriteria);
+        this.printBrowserWorkflowMapSection('Selector Slots', workflow.selectorSlots);
+        this.printBrowserWorkflowMapSection('Preferred Selectors', workflow.preferredSelectors);
+        this.printBrowserWorkflowMapSection('Fallback Actions', workflow.fallbackActions);
+        this.printBrowserWorkflowListSection('Done Conditions', workflow.doneConditions);
+        this.printBrowserWorkflowPhaseSections(workflow.phaseConfigurations);
+        if (typeof workflow.maxRetries === 'number') {
+          console.log(`\n${chalk.bold('Max Retries')}`);
+          console.log(String(workflow.maxRetries));
+        }
+        this.printBrowserWorkflowLintResult(await service.lintWorkflow(target));
+        return;
+      }
+      case 'lint': {
+        const jsonMode = args.includes('--json');
+        const quickFixMode = args.includes('--quick-fix') || args.includes('--fix');
+        const target = args.find((item, index) => index > 0 && item !== '--json' && item !== '--quick-fix' && item !== '--fix');
+        if (target) {
+          const result = await service.lintWorkflow(target);
+          if (jsonMode) {
+            const payload = quickFixMode
+              ? { lint: result, quickFixes: buildBrowserWorkflowQuickFixDrafts([result]) }
+              : result;
+            console.log(JSON.stringify(payload, null, 2));
+          } else {
+            this.printBrowserWorkflowLintResult(result);
+            if (quickFixMode) {
+              this.printBrowserWorkflowQuickFixDrafts(buildBrowserWorkflowQuickFixDrafts([result]));
+            }
+          }
+          return;
+        }
+
+        const summary = await service.lintWorkflows();
+        if (jsonMode) {
+          const payload = quickFixMode
+            ? { lint: summary, quickFixes: buildBrowserWorkflowQuickFixDrafts(summary.results) }
+            : summary;
+          console.log(JSON.stringify(payload, null, 2));
+          return;
+        }
+
+        console.log(chalk.bold(`\nBrowser Workflow Lint (${summary.workflowDir})\n`));
+        if (summary.results.length === 0) {
+          console.log(chalk.gray('No browser workflows found.'));
+          return;
+        }
+        console.log(chalk.gray(`files=${summary.counts.files}, valid=${summary.counts.valid}, invalid=${summary.counts.invalid}, errors=${summary.counts.errors}, warnings=${summary.counts.warnings}`));
+        this.printBrowserWorkflowLintSummary(summary.results);
+        if (quickFixMode) {
+          this.printBrowserWorkflowQuickFixDrafts(buildBrowserWorkflowQuickFixDrafts(summary.results));
+        }
+        return;
+      }
+      case 'new': {
+        const target = args[1];
+        if (!target) {
+          printError('Usage: /browser workflow new <name> [--url <startUrl>] [--match <pattern1,pattern2>]');
+          return;
+        }
+
+        let startUrl: string | undefined;
+        let matchPatterns: string[] | undefined;
+
+        for (let index = 2; index < args.length; index += 1) {
+          const token = args[index];
+          if (!token) {
+            continue;
+          }
+
+          if (token === '--url') {
+            startUrl = args[index + 1];
+            index += 1;
+            continue;
+          }
+
+          if (token === '--match') {
+            matchPatterns = (args[index + 1] || '').split(',').map(item => item.trim()).filter(Boolean);
+            index += 1;
+          }
+        }
+
+        const created = await service.createWorkflowTemplate(target, {
+          startUrl,
+          match: matchPatterns,
+        });
+        printSuccess(`Browser workflow created: ${created.filePath}`);
+        return;
+      }
+      case undefined:
+      case 'help':
+      default:
+        console.log(`
+${chalk.bold('Browser Workflow Commands:')}
+
+${chalk.cyan('/browser workflow list')}
+  列出所有 browser workflow Markdown 文件
+
+${chalk.cyan('/browser workflow inspect')} <file>
+  查看某个 workflow 的解析结构
+
+${chalk.cyan('/browser workflow lint')} [file]
+  校验 workflow schema 并输出 lint 结果
+  加上 --json 输出 machine-readable JSON
+  加上 --quick-fix 输出 quick fix 草案
+
+${chalk.cyan('/browser workflow new')} <name> [--url <startUrl>] [--match <pattern1,pattern2>]
+  创建新的 workflow 模板文件
+`);
+        return;
+    }
+  }
+
+  private createBrowserWorkflowService(): BrowserWorkflowService {
+    const config = configManager.getAgentConfig();
+    return new BrowserWorkflowService({
+      workspace: this.workspace,
+      appBaseDir: config.appBaseDir,
+      workflowDir: config.browserAgent?.workflowDir,
+      autoMatch: config.browserAgent?.autoMatchWorkflows,
+    });
+  }
+
+  private printBrowserWorkflowListSection(title: string, items: string[]): void {
+    if (items.length === 0) {
+      return;
+    }
+
+    console.log(`\n${chalk.bold(title)}`);
+    for (const item of items) {
+      console.log(`- ${item}`);
+    }
+  }
+
+  private printBrowserWorkflowMapSection(title: string, values: Record<string, string[]>): void {
+    const entries = Object.entries(values);
+    if (entries.length === 0) {
+      return;
+    }
+
+    console.log(`\n${chalk.bold(title)}`);
+    for (const [key, items] of entries) {
+      console.log(`${key}:`);
+      for (const item of items) {
+        console.log(`- ${item}`);
+      }
+    }
+  }
+
+  private printBrowserWorkflowPhaseSections(values: Partial<Record<'unknown' | 'landing' | 'search-input' | 'search-results' | 'detail' | 'form', {
+    phase: string;
+    steps: string[];
+    hints: string[];
+    successCriteria: string[];
+    selectorSlots: Record<string, string[]>;
+    preferredSelectors: Record<string, string[]>;
+    fallbackActions: Record<string, string[]>;
+    doneConditions: string[];
+  }>>): void {
+    const entries = Object.entries(values);
+    if (entries.length === 0) {
+      return;
+    }
+
+    console.log(`\n${chalk.bold('Phase Overrides')}`);
+    for (const [phase, config] of entries) {
+      if (!config) {
+        continue;
+      }
+      console.log(chalk.cyan(`- ${phase}`));
+      if (config.steps.length > 0) {
+        console.log(chalk.gray('  steps:'));
+        for (const item of config.steps) {
+          console.log(`    - ${item}`);
+        }
+      }
+      if (config.hints.length > 0) {
+        console.log(chalk.gray('  hints:'));
+        for (const item of config.hints) {
+          console.log(`    - ${item}`);
+        }
+      }
+      if (config.successCriteria.length > 0) {
+        console.log(chalk.gray('  success:'));
+        for (const item of config.successCriteria) {
+          console.log(`    - ${item}`);
+        }
+      }
+      if (Object.keys(config.selectorSlots).length > 0) {
+        console.log(chalk.gray('  selectorSlots:'));
+        for (const [key, items] of Object.entries(config.selectorSlots)) {
+          console.log(`    ${key}: ${items.join(' | ')}`);
+        }
+      }
+      if (Object.keys(config.preferredSelectors).length > 0) {
+        console.log(chalk.gray('  preferredSelectors:'));
+        for (const [key, items] of Object.entries(config.preferredSelectors)) {
+          console.log(`    ${key}: ${items.join(' | ')}`);
+        }
+      }
+      if (Object.keys(config.fallbackActions).length > 0) {
+        console.log(chalk.gray('  fallbackActions:'));
+        for (const [key, items] of Object.entries(config.fallbackActions)) {
+          console.log(`    ${key}: ${items.join(' | ')}`);
+        }
+      }
+      if (config.doneConditions.length > 0) {
+        console.log(chalk.gray(`  doneConditions: ${config.doneConditions.join(' | ')}`));
+      }
+    }
+  }
+
+  private printBrowserWorkflowLintSummary(results: Array<{ filePath: string; workflowName?: string; valid: boolean; issueCounts?: { errors: number; warnings: number }; issues: Array<{ severity: 'error' | 'warning'; message: string; code: string; phase?: string; heading?: string; suggestion?: { summary: string } }> }>): void {
+    for (const result of results) {
+      const errorCount = result.issueCounts?.errors ?? result.issues.filter(issue => issue.severity === 'error').length;
+      const warningCount = result.issueCounts?.warnings ?? result.issues.filter(issue => issue.severity === 'warning').length;
+      const label = result.workflowName || path.basename(result.filePath);
+      const status = result.valid ? chalk.green('valid') : chalk.red('invalid');
+      console.log(`${status} ${chalk.cyan(label)} ${chalk.gray(result.filePath)}`);
+      console.log(chalk.gray(`  errors=${errorCount}, warnings=${warningCount}`));
+      for (const issue of result.issues) {
+        const marker = issue.severity === 'error' ? chalk.red('error') : chalk.yellow('warning');
+        const qualifiers = [issue.phase ? `phase=${issue.phase}` : '', issue.heading ? `heading=${issue.heading}` : ''].filter(Boolean).join(', ');
+        console.log(`  - ${marker} [${issue.code}] ${issue.message}${qualifiers ? chalk.gray(` (${qualifiers})`) : ''}`);
+        if (issue.suggestion?.summary) {
+          console.log(chalk.gray(`    fix: ${issue.suggestion.summary}`));
+        }
+      }
+    }
+  }
+
+  private printBrowserWorkflowLintResult(result: { filePath: string; workflowName?: string; valid: boolean; issueCounts?: { errors: number; warnings: number }; issues: Array<{ severity: 'error' | 'warning'; message: string; code: string; phase?: string; heading?: string; suggestion?: { summary: string } }> }): void {
+    console.log(chalk.bold(`\nWorkflow Lint: ${result.workflowName || path.basename(result.filePath)}\n`));
+    this.printBrowserWorkflowLintSummary([result]);
+  }
+
+  private printBrowserWorkflowQuickFixDrafts(drafts: Array<{ code: string; severity: 'error' | 'warning'; summary: string; example?: string; count: number; files: string[]; phase?: string; heading?: string }>): void {
+    console.log(chalk.bold('\nWorkflow Quick Fix Drafts\n'));
+    if (drafts.length === 0) {
+      console.log(chalk.gray('No quick-fix suggestions available.'));
+      return;
+    }
+
+    drafts.forEach((draft, index) => {
+      const marker = draft.severity === 'error' ? chalk.red('error') : chalk.yellow('warning');
+      const qualifiers = [draft.phase ? `phase=${draft.phase}` : '', draft.heading ? `heading=${draft.heading}` : ''].filter(Boolean).join(', ');
+      console.log(`${index + 1}. ${marker} [${draft.code}] x${draft.count} ${draft.summary}${qualifiers ? chalk.gray(` (${qualifiers})`) : ''}`);
+      if (draft.files.length > 0) {
+        console.log(chalk.gray(`   files: ${draft.files.join(', ')}`));
+      }
+      if (draft.example) {
+        console.log(chalk.gray('   example:'));
+        for (const line of draft.example.split(/\r?\n/)) {
+          console.log(chalk.gray(`     ${line}`));
+        }
+      }
+    });
   }
 
   private async handleNewsCommand(args: string[]): Promise<void> {
@@ -3025,12 +4308,16 @@ ${chalk.gray('/news push morning --save')}
     }
   }
 
-  private displayDirectToolResult(result: { is_error?: boolean; output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }, title: string): void {
+  private displayDirectToolResult(result: { is_error?: boolean; errorType?: string; statusCode?: string; output?: string; content?: Array<{ type: 'text' | 'image' | 'resource'; text?: string }> }, title: string): void {
     console.log();
     console.log(chalk.cyan(title));
     const output = this.getToolResultDisplayText(result);
     if (result.is_error) {
-      printError(output || `${title} 调用失败`);
+      if (this.isBrowserSafetyToolResult(result)) {
+        printWarning(output || `${title} 已因安全策略停止`);
+      } else {
+        printError(output || `${title} 调用失败`);
+      }
       console.log();
       return;
     }
@@ -3918,6 +5205,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       getConversationMessages: () => this.agent?.getMessages() || this.memoryManager.getMessages(),
       memoryProvider: this.memoryProvider,
       intentResolver: this.intentResolver,
+      onConversationPreamble: (message) => this.showDirectActionPreamble(message),
     });
 
     this.agent = createAgent({

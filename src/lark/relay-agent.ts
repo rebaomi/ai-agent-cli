@@ -5,6 +5,16 @@ import * as path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import type { LarkRelayConfig } from '../types/index.js';
 
+type LarkAttachmentType = 'image' | 'file';
+
+export interface LarkRelayAttachment {
+  key: string;
+  type: LarkAttachmentType;
+  fileName?: string;
+  localPath?: string;
+  error?: string;
+}
+
 export interface LarkRelayMessage {
   type: string;
   content: string;
@@ -13,6 +23,7 @@ export interface LarkRelayMessage {
   senderId?: string;
   chatType?: string;
   messageType?: string;
+  attachments?: LarkRelayAttachment[];
   raw: Record<string, unknown>;
 }
 
@@ -25,6 +36,8 @@ export interface NormalizedLarkRelayConfig {
   allowedChatIds: string[];
   allowedSenderIds: string[];
   allowCommands: boolean;
+  downloadAttachments: boolean;
+  receiveDir: string;
   cliBin: string;
 }
 
@@ -64,6 +77,10 @@ export function normalizeLarkRelayConfig(config?: LarkRelayConfig): NormalizedLa
     allowedChatIds: sanitizeList(config?.allowedChatIds),
     allowedSenderIds: sanitizeList(config?.allowedSenderIds),
     allowCommands: config?.allowCommands ?? false,
+    downloadAttachments: config?.downloadAttachments ?? true,
+    receiveDir: typeof config?.receiveDir === 'string' && config.receiveDir.trim().length > 0
+      ? config.receiveDir.trim()
+      : path.join(os.homedir(), '.ai-agent-cli', 'feishuReceive'),
     cliBin: typeof config?.cliBin === 'string' && config.cliBin.trim().length > 0
       ? config.cliBin.trim()
       : (process.env.LARK_CLI_BIN || (process.platform === 'win32' ? 'lark-cli.cmd' : 'lark-cli')),
@@ -115,9 +132,10 @@ export function parseLarkRelayMessageLine(line: string, relayConfig?: LarkRelayC
     asString(raw.chat_type),
     asString(((((raw.event as Record<string, unknown> | undefined)?.message as Record<string, unknown> | undefined)?.chat_type))),
   );
-  const content = extractMessageContent(raw).trim();
+  const payload = extractMessagePayload(raw, messageType || undefined);
+  const content = buildRelayContent(payload.text, payload.attachments).trim();
 
-  if (!content) {
+  if (!content && payload.attachments.length === 0) {
     return null;
   }
 
@@ -137,6 +155,7 @@ export function parseLarkRelayMessageLine(line: string, relayConfig?: LarkRelayC
     senderId: senderId || undefined,
     chatType: chatType || undefined,
     messageType: messageType || undefined,
+    attachments: payload.attachments.length > 0 ? payload.attachments : undefined,
     raw,
   };
 }
@@ -172,8 +191,39 @@ export class LarkRelayAgent extends EventEmitter {
       `events=${this.config.eventTypes.join(',')}`,
       `compact=${this.config.compact ? 'on' : 'off'}`,
       `quiet=${this.config.quiet ? 'on' : 'off'}`,
+      `attachments=${this.config.downloadAttachments ? 'download' : 'metadata-only'}`,
       filters.length > 0 ? `filter=${filters.join(';')}` : undefined,
     ].filter(Boolean).join(' | ');
+  }
+
+  async materializeMessageResources(message: LarkRelayMessage): Promise<LarkRelayMessage> {
+    if (!this.config.downloadAttachments || !message.attachments || message.attachments.length === 0) {
+      return message;
+    }
+
+    const materializedAttachments = await Promise.all(
+      message.attachments.map(async attachment => {
+        try {
+          const localPath = await this.downloadAttachment(message, attachment);
+          return {
+            ...attachment,
+            localPath,
+            error: undefined,
+          };
+        } catch (error) {
+          return {
+            ...attachment,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }),
+    );
+
+    return {
+      ...message,
+      attachments: materializedAttachments,
+      content: buildRelayContent(extractPrimaryText(message.content), materializedAttachments),
+    };
   }
 
   async getStatus(): Promise<LarkRelayStatus> {
@@ -577,6 +627,94 @@ export class LarkRelayAgent extends EventEmitter {
 
     return `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1')}"`;
   }
+
+  private async downloadAttachment(message: LarkRelayMessage, attachment: LarkRelayAttachment): Promise<string> {
+    if (!message.messageId) {
+      throw new Error('缺少 messageId，无法下载飞书附件');
+    }
+
+    const receiveDir = path.resolve(this.config.receiveDir);
+    const datedDir = path.join(receiveDir, formatDateFolder(new Date()));
+    await fs.mkdir(datedDir, { recursive: true });
+
+    const targetPath = await this.allocateAttachmentPath(datedDir, message, attachment);
+    const apiPath = `/open-apis/im/v1/messages/${message.messageId}/resources/${attachment.key}`;
+    const args = [
+      'api',
+      'GET',
+      apiPath,
+      '--params',
+      JSON.stringify({ type: attachment.type }),
+      '--as',
+      'bot',
+    ];
+
+    await this.downloadBinaryToFile(args, targetPath);
+    return targetPath;
+  }
+
+  private async allocateAttachmentPath(datedDir: string, message: LarkRelayMessage, attachment: LarkRelayAttachment): Promise<string> {
+    const preferredName = sanitizeAttachmentName(
+      attachment.fileName
+      || `${attachment.type}-${message.messageId || 'message'}-${attachment.key}${defaultAttachmentExtension(attachment)}`,
+    );
+    const parsed = path.parse(preferredName);
+    const baseName = parsed.name || 'attachment';
+    const ext = parsed.ext || defaultAttachmentExtension(attachment);
+
+    let candidate = path.join(datedDir, `${baseName}${ext}`);
+    let suffix = 1;
+    while (await fileExists(candidate)) {
+      candidate = path.join(datedDir, `${baseName}-${suffix}${ext}`);
+      suffix += 1;
+    }
+
+    return candidate;
+  }
+
+  private async downloadBinaryToFile(args: string[], outputPath: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const spawnSpec = this.buildSpawnSpec(this.config.cliBin, args);
+      const child = spawn(spawnSpec.command, spawnSpec.args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+        windowsHide: true,
+      });
+
+      let stderr = '';
+      let stdoutPreview = '';
+      const writeStream = require('node:fs').createWriteStream(outputPath);
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (stdoutPreview.length < 1024) {
+          stdoutPreview += chunk.toString('utf-8');
+        }
+      });
+
+      child.stdout?.pipe(writeStream);
+
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+
+      child.once('error', async (error) => {
+        writeStream.destroy();
+        await fs.rm(outputPath, { force: true }).catch(() => undefined);
+        reject(error);
+      });
+
+      child.once('close', async (code) => {
+        writeStream.end();
+        if ((code ?? 0) !== 0) {
+          await fs.rm(outputPath, { force: true }).catch(() => undefined);
+          reject(new Error(stderr.trim() || stdoutPreview.trim() || `lark-cli exited with code ${code ?? 0}`));
+          return;
+        }
+
+        resolve();
+      });
+    });
+  }
 }
 
 function sanitizeList(input?: string[], fallback: string[] = []): string[] {
@@ -595,26 +733,127 @@ function firstNonEmptyString(...values: string[]): string {
   return values.find(value => value.length > 0) || '';
 }
 
-function extractMessageContent(raw: Record<string, unknown>): string {
+function extractMessagePayload(raw: Record<string, unknown>, messageType?: string): { text: string; attachments: LarkRelayAttachment[] } {
   const compactContent = asString(raw.content);
   if (compactContent) {
-    return compactContent;
+    return {
+      text: compactContent,
+      attachments: [],
+    };
   }
 
   const nestedContent = asString((((raw.event as Record<string, unknown> | undefined)?.message as Record<string, unknown> | undefined)?.content));
   if (!nestedContent) {
-    return '';
+    return { text: '', attachments: [] };
   }
 
   try {
     const parsed = JSON.parse(nestedContent) as Record<string, unknown>;
-    return firstNonEmptyString(
+    const attachments = extractAttachments(parsed, messageType);
+    const text = firstNonEmptyString(
       asString(parsed.text),
       asString(parsed.title),
-      typeof parsed === 'object' ? JSON.stringify(parsed) : '',
+      attachments.length > 0 ? '' : (typeof parsed === 'object' ? JSON.stringify(parsed) : ''),
     );
+    return { text, attachments };
   } catch {
-    return nestedContent;
+    return { text: nestedContent, attachments: [] };
+  }
+}
+
+function extractAttachments(content: Record<string, unknown>, messageType?: string): LarkRelayAttachment[] {
+  const attachments: LarkRelayAttachment[] = [];
+  const normalizedMessageType = (messageType || '').toLowerCase();
+
+  const imageKey = asString(content.image_key);
+  if (imageKey) {
+    attachments.push({
+      key: imageKey,
+      type: 'image',
+      fileName: asString(content.file_name) || asString(content.image_name) || undefined,
+    });
+  }
+
+  const fileKey = asString(content.file_key);
+  if (fileKey) {
+    attachments.push({
+      key: fileKey,
+      type: normalizedMessageType === 'image' ? 'image' : 'file',
+      fileName: asString(content.file_name) || asString(content.name) || undefined,
+    });
+  }
+
+  return dedupeAttachments(attachments);
+}
+
+function buildRelayContent(text: string, attachments: Array<LarkRelayAttachment | { key: string; type: LarkAttachmentType; fileName?: string; localPath?: string; error?: string }>): string {
+  const lines: string[] = [];
+  const normalizedText = text.trim();
+  if (normalizedText) {
+    lines.push(normalizedText);
+  }
+
+  for (const attachment of attachments) {
+    const label = attachment.type === 'image' ? '图片' : '文件';
+    const displayName = attachment.fileName || attachment.key;
+    if (attachment.localPath) {
+      lines.push(`[飞书${label}] ${displayName}`);
+      lines.push(`本地路径: ${attachment.localPath}`);
+    } else if (attachment.error) {
+      lines.push(`[飞书${label}] ${displayName}`);
+      lines.push(`下载失败: ${attachment.error}`);
+    } else {
+      lines.push(`[飞书${label}] ${displayName}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function extractPrimaryText(content: string): string {
+  return content
+    .split(/\r?\n/)
+    .filter(line => !/^\[飞书(?:图片|文件)\]/.test(line) && !/^(本地路径|下载失败):\s*/.test(line))
+    .join('\n')
+    .trim();
+}
+
+function sanitizeAttachmentName(name: string): string {
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]+/g, '_').trim();
+  return cleaned || 'attachment';
+}
+
+function defaultAttachmentExtension(attachment: LarkRelayAttachment): string {
+  return attachment.type === 'image' ? '.png' : '.bin';
+}
+
+function formatDateFolder(date: Date): string {
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function dedupeAttachments(attachments: LarkRelayAttachment[]): LarkRelayAttachment[] {
+  const seen = new Set<string>();
+  const result: LarkRelayAttachment[] = [];
+  for (const attachment of attachments) {
+    const key = `${attachment.type}:${attachment.key}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(attachment);
+  }
+  return result;
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
   }
 }
 

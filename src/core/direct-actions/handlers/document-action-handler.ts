@@ -55,10 +55,11 @@ export class DocumentActionHandler implements DirectActionHandler {
 
     if (sourceFormat === targetFormat) {
       const outputPath = this.runtime.inferConversionOutputPath(input, fileBaseName, targetFormat);
-      return this.runtime.executeBuiltInTool('copy_file', {
+      const result = await this.runtime.executeBuiltInTool('copy_file', {
         source: sourcePath,
         destination: outputPath,
       }, '[Direct document copy]');
+      return { ...result, category: 'document-action' };
     }
 
     if (targetFormat === 'pptx' && !(sourceFormat === 'md' || sourceFormat === 'txt' || sourceFormat === 'csv' || sourceFormat === 'tsv')) {
@@ -112,10 +113,11 @@ export class DocumentActionHandler implements DirectActionHandler {
   ): Promise<DirectActionResult> {
     if (targetFormat === 'md' || targetFormat === 'txt') {
       const outputPath = this.runtime.inferConversionOutputPath(input, fileBaseName, targetFormat);
-      return this.runtime.executeBuiltInTool('write_file', {
+      const result = await this.runtime.executeBuiltInTool('write_file', {
         path: outputPath,
         content: sourceText,
       }, '[Direct file save]');
+      return { ...result, category: 'document-action' };
     }
 
     const toolName = this.runtime.resolveDocumentExportTool(targetFormat);
@@ -160,9 +162,9 @@ export class DocumentActionHandler implements DirectActionHandler {
       traceDirectActionStage('verify-export-start', `${targetFormat} -> ${outputPath}`);
       const verified = await this.runtime.verifyDocumentExportResult(result, outputPath, targetFormat, sourceText, title);
       traceDirectActionStage('verify-export-done', `${targetFormat} error=${verified.isError === true}`);
-      return verified;
+      return { ...verified, category: 'document-action' };
     }
 
-    return result;
+    return { ...result, category: 'document-action' };
   }
 }

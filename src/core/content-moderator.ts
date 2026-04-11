@@ -190,7 +190,11 @@ export class ContentModerator {
     return chalk.yellow('⚠️ 检测到不当内容，已被拦截。');
   }
 
-  recordWarning(content: string): void {
+  recordWarning(content: string, shouldTrack: boolean = false): void {
+    if (!shouldTrack || this.isBenignConfirmation(content)) {
+      return;
+    }
+
     const hash = this.simpleHash(content);
     const count = (this.warningHistory.get(hash) || 0) + 1;
     this.warningHistory.set(hash, count);
@@ -208,6 +212,11 @@ export class ContentModerator {
       hash = hash & hash;
     }
     return hash.toString();
+  }
+
+  private isBenignConfirmation(content: string): boolean {
+    const normalized = content.trim().toLowerCase();
+    return /^(是|否|好|好的|继续|继续执行|确认|取消|ok|okay|yes|no|y|n)$/i.test(normalized);
   }
 
   getWarningCount(): number {

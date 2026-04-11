@@ -6,6 +6,9 @@
 # ===========================================
 defaultProvider: ollama
 
+# Agent 交互模式：auto=默认无感切换，chat=偏连续对话，task=偏任务完成/工作流执行
+agentInteractionMode: auto
+
 # Ollama（本地模型）
 ollama:
   enabled: true
@@ -87,6 +90,86 @@ gemini:
   baseUrl: https://generativelanguage.googleapis.com/v1beta
   temperature: 0.7
 
+# 浏览器智能代理
+browserAgent:
+  enabled: true
+  mode: smart
+  browser: chrome
+  headless: true
+  timeoutMs: 15000
+  # 加载浏览器扩展时会自动切到 persistent context，并强制使用 Playwright Chromium 通道。
+  # 推荐搭配 headless: false 使用，例如放 Tampermonkey 解压目录。
+  extensionPaths: []
+  # userDataDir 可持久化扩展状态、登录态和脚本本地存储。
+  # userDataDir: ~/.ai-agent-cli/browser-profile
+  initScriptPaths: []
+  initScripts: []
+  pageScriptPaths: []
+  pageScripts: []
+  userscripts:
+    paths: []
+    inline: []
+    runAt: document-end
+    enabled: true
+  workflowDir: browser-workflows
+  autoMatchWorkflows: true
+  preferredLocalProvider: ollama
+  fallbackProvider: default
+  ollamaHealthCheckUrl: http://localhost:11434/api/tags
+  ollamaHealthCacheMs: 15000
+  plannerModel: qwen3.5:7b
+  extractorModel: qwen3.5:3b
+  visionProvider: default
+  # expectResult 不匹配时的处理策略：
+  # record-only: 仅记录到 action 输出/日志；warn: 继续执行并显式警告；hard-fail: 立即中断当前运行。
+  expectResultMismatchStrategy: warn
+  maxSteps: 20
+  maxActionsPerPlan: 3
+  observe:
+    useScreenshotByDefault: false
+    forceScreenshotAfterFailures: 2
+    fullPageScreenshot: false
+    maxDomNodes: 120
+    maxTextChars: 4000
+  optimization:
+    enableStateCache: true
+    enableDiffObservation: true
+    enableRuleFastPath: true
+    enableActionBatching: true
+  safety:
+    enabled: true
+    blockFinancialActions: true
+    blockPrivacyActions: true
+    blockIllegalActions: true
+    allowKeywords:
+      global: []
+      financial: []
+      privacy: []
+      illegal: []
+    blockKeywords:
+      global: []
+      financial:
+        - confirm payment
+      privacy:
+        - sms code
+      illegal: []
+    domainPolicies:
+      - name: trusted-order-review
+        match:
+          - example.com
+          - checkout.example.com
+        allowKeywords:
+          financial:
+            - order preview
+            - review order
+        blockKeywords:
+          financial:
+            - pay now
+            - confirm payment
+  debug:
+    saveTrace: true
+    saveScreenshotsOnFailure: true
+
 # ===========================================
 # 基础配置
 # ===========================================
@@ -97,6 +180,11 @@ maxToolCallsPerTurn: 10
 autoContinueOnToolLimit: true
 maxContinuationTurns: 3
 toolTimeout: 60000
+
+directAction:
+  conversationMode:
+    enabled: true
+    preambleThreshold: 2
 
 # ===========================================
 # 通知与飞书 Relay
@@ -121,6 +209,8 @@ notifications:
       compact: true
       quiet: true
       allowCommands: false
+      downloadAttachments: true
+      receiveDir: ~/.ai-agent-cli/feishuReceive
       # allowedChatIds:
       #   - oc_xxx
       # allowedSenderIds:
