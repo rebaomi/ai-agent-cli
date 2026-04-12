@@ -97,6 +97,7 @@ export interface SkillCandidateSearchResult extends SkillCandidate {
 export interface SkillLearningTodo {
   id: string;
   createdAt: string;
+  lastSeenAt?: string;
   sourceTask: string;
   issueSummary: string;
   suggestedSkill: string;
@@ -104,8 +105,74 @@ export interface SkillLearningTodo {
   nextActions: string[];
   tags?: string[];
   confidence?: number;
+  occurrenceCount?: number;
   draftedCandidateName?: string;
+  draftedCandidatePath?: string;
+  draftedCandidateConfidence?: number;
   draftedAt?: string;
+}
+
+export interface SkillLearningAutomationConfig {
+  autoDraftFromTodo: boolean;
+  autoDraftThreshold: number;
+  autoAdoptAfterApproval: boolean;
+  autoAdoptMinConfidence: number;
+  autoReviseAdoptedSkills: boolean;
+  autoReviseMinObservations: number;
+  autoReviseMinFailures: number;
+}
+
+export type SkillUsageTrigger = 'command' | 'tool' | 'message_hook';
+
+export interface SkillUsageObservation {
+  createdAt: string;
+  trigger: SkillUsageTrigger;
+  source: string;
+  success: boolean;
+  summary: string;
+}
+
+export interface SkillUsageSummary {
+  skillName: string;
+  totalRuns: number;
+  successCount: number;
+  failureCount: number;
+  updatedAt: string;
+  recentObservations: SkillUsageObservation[];
+  lastRevisionCandidateName?: string;
+  lastRevisionCandidatePath?: string;
+  lastRevisionDraftedAt?: string;
+  lastDraftObservationCount?: number;
+  lastDraftFailureCount?: number;
+}
+
+export interface SkillLearningRuntimeEvent {
+  type: 'skill_revision_drafted';
+  skillName: string;
+  trigger: SkillUsageTrigger;
+  source: string;
+  observationCount: number;
+  failureCount: number;
+  reasonSummary: string;
+  revisionCandidate: SkillCandidate;
+}
+
+export interface RevisionCandidateFeedbackSummary {
+  draftName: string;
+  sourceSkillName: string;
+  draftedAt: string;
+  draftedFromObservationCount: number;
+  draftedFromFailureCount: number;
+  postDraftRuns: number;
+  postDraftSuccesses: number;
+  postDraftFailures: number;
+  confidenceScore: number;
+  status: 'draft' | 'promotable' | 'stale' | 'adopted' | 'superseded';
+  reasonSummary: string;
+  lastEvaluatedAt: string;
+  latestSignals: SkillUsageObservation[];
+  adoptedAt?: string;
+  supersededBy?: string;
 }
 
 export interface SkillLearningTodoSearchResult extends SkillLearningTodo {
@@ -137,6 +204,16 @@ export class SkillManager {
   private candidatesDir: string;
   private learningTodoFile: string;
   private enabledSkills: Set<string> = new Set();
+  private runtimeEventListener?: (event: SkillLearningRuntimeEvent) => void | Promise<void>;
+  private learningAutomation: SkillLearningAutomationConfig = {
+    autoDraftFromTodo: true,
+    autoDraftThreshold: 2,
+    autoAdoptAfterApproval: true,
+    autoAdoptMinConfidence: 0.75,
+    autoReviseAdoptedSkills: true,
+    autoReviseMinObservations: 3,
+    autoReviseMinFailures: 2,
+  };
   private readonly manifestFiles = ['skill.json', 'SKILL.md', 'package.json'];
   private readonly legacySkillOverrides: Record<string, string> = {
     'minimax-docx': 'docx',
@@ -164,6 +241,8 @@ export class SkillManager {
 
   private async discoverSkills(): Promise<void> {
     const searchPaths: string[] = [];
+
+    searchPaths.push(this.skillsDir);
 
     const homeDir = process.env.HOME || process.env.USERPROFILE || '';
     if (homeDir) {
@@ -850,7 +929,26 @@ export class SkillManager {
     if (!cmd) throw new Error(`Command not found: ${name}`);
     
     if (cmd.handler) {
-      return cmd.handler(args, ctx);
+      try {
+        const output = await cmd.handler(args, ctx);
+        await this.recordSkillUsageObservation({
+          skillName: skill.name,
+          trigger: 'command',
+          source: name,
+          success: true,
+          summary: this.buildUsageSummaryPreview(output),
+        });
+        return output;
+      } catch (error) {
+        await this.recordSkillUsageObservation({
+          skillName: skill.name,
+          trigger: 'command',
+          source: name,
+          success: false,
+          summary: this.buildUsageSummaryPreview(error instanceof Error ? error.message : String(error)),
+        });
+        throw error;
+      }
     }
     throw new Error(`Command handler not implemented: ${name}`);
   }
@@ -863,7 +961,26 @@ export class SkillManager {
     if (!tool) throw new Error(`Tool not found: ${name}`);
     
     if (tool.handler) {
-      return tool.handler(args, ctx);
+      try {
+        const result = await tool.handler(args, ctx);
+        await this.recordSkillUsageObservation({
+          skillName: skill.name,
+          trigger: 'tool',
+          source: name,
+          success: result.isError !== true,
+          summary: this.buildUsageSummaryPreview(this.skillToolResultToText(result)),
+        });
+        return result;
+      } catch (error) {
+        await this.recordSkillUsageObservation({
+          skillName: skill.name,
+          trigger: 'tool',
+          source: name,
+          success: false,
+          summary: this.buildUsageSummaryPreview(error instanceof Error ? error.message : String(error)),
+        });
+        throw error;
+      }
     }
     throw new Error(`Tool handler not implemented: ${name}`);
   }
@@ -900,6 +1017,125 @@ export class SkillManager {
 
   getSkillCandidatesDir(): string {
     return this.candidatesDir;
+  }
+
+  setLearningAutomation(config?: Partial<SkillLearningAutomationConfig>): void {
+    this.learningAutomation = {
+      ...this.learningAutomation,
+      ...(config || {}),
+      autoDraftThreshold: Math.max(1, Math.floor(config?.autoDraftThreshold ?? this.learningAutomation.autoDraftThreshold)),
+      autoAdoptMinConfidence: this.normalizeLearningConfidence(config?.autoAdoptMinConfidence ?? this.learningAutomation.autoAdoptMinConfidence),
+      autoReviseMinObservations: Math.max(1, Math.floor(config?.autoReviseMinObservations ?? this.learningAutomation.autoReviseMinObservations)),
+      autoReviseMinFailures: Math.max(1, Math.floor(config?.autoReviseMinFailures ?? this.learningAutomation.autoReviseMinFailures)),
+    };
+  }
+
+  getLearningAutomation(): SkillLearningAutomationConfig {
+    return { ...this.learningAutomation };
+  }
+
+  setRuntimeEventListener(listener?: (event: SkillLearningRuntimeEvent) => void | Promise<void>): void {
+    this.runtimeEventListener = listener;
+  }
+
+  async getSkillUsageSummary(name: string): Promise<SkillUsageSummary | null> {
+    const skill = this.skills.get(name);
+    if (!skill) {
+      return null;
+    }
+
+    return this.readSkillUsageSummary(name);
+  }
+
+  async getRevisionCandidateFeedbackSummary(name: string): Promise<RevisionCandidateFeedbackSummary | null> {
+    return this.readRevisionCandidateFeedback(name);
+  }
+
+  async recordSkillUsageObservation(input: {
+    skillName: string;
+    trigger: SkillUsageTrigger;
+    source: string;
+    success: boolean;
+    summary: string;
+  }): Promise<{ revisionCandidate?: SkillCandidate }> {
+    const skill = this.skills.get(input.skillName);
+    if (!skill) {
+      return {};
+    }
+
+    const now = new Date().toISOString();
+    const summary = await this.readSkillUsageSummary(input.skillName);
+    const next: SkillUsageSummary = summary || {
+      skillName: input.skillName,
+      totalRuns: 0,
+      successCount: 0,
+      failureCount: 0,
+      updatedAt: now,
+      recentObservations: [],
+    };
+
+    next.totalRuns += 1;
+    next.successCount += input.success ? 1 : 0;
+    next.failureCount += input.success ? 0 : 1;
+    next.updatedAt = now;
+    next.recentObservations = [
+      ...next.recentObservations,
+      {
+        createdAt: now,
+        trigger: input.trigger,
+        source: input.source,
+        success: input.success,
+        summary: this.buildUsageSummaryPreview(input.summary),
+      },
+    ].slice(-12);
+    const currentObservation = next.recentObservations[next.recentObservations.length - 1]!;
+
+    const activeRevisionFeedback = next.lastRevisionCandidateName
+      ? await this.updateRevisionCandidateFeedback(next.lastRevisionCandidateName, currentObservation)
+      : null;
+
+    let revisionCandidate: SkillCandidate | undefined;
+    if (await this.shouldAutoReviseSkill(next, activeRevisionFeedback)) {
+      const reasonSummary = this.buildSkillRevisionReasonSummary(next);
+      const previousRevisionCandidateName = next.lastRevisionCandidateName;
+      revisionCandidate = await this.createRevisionCandidateFromSkillUsage(skill, next);
+      if (previousRevisionCandidateName) {
+        await this.markRevisionCandidateSuperseded(previousRevisionCandidateName, revisionCandidate.name);
+      }
+      next.lastRevisionCandidateName = revisionCandidate.name;
+      next.lastRevisionCandidatePath = revisionCandidate.path;
+      next.lastRevisionDraftedAt = revisionCandidate.createdAt;
+      next.lastDraftObservationCount = next.totalRuns;
+      next.lastDraftFailureCount = next.failureCount;
+      await this.writeRevisionCandidateFeedback({
+        draftName: revisionCandidate.name,
+        sourceSkillName: skill.name,
+        draftedAt: revisionCandidate.createdAt,
+        draftedFromObservationCount: next.totalRuns,
+        draftedFromFailureCount: next.failureCount,
+        postDraftRuns: 0,
+        postDraftSuccesses: 0,
+        postDraftFailures: 0,
+        confidenceScore: revisionCandidate.confidence ?? 0.6,
+        status: 'draft',
+        reasonSummary,
+        lastEvaluatedAt: revisionCandidate.createdAt,
+        latestSignals: [],
+      });
+      await this.emitRuntimeEvent({
+        type: 'skill_revision_drafted',
+        skillName: skill.name,
+        trigger: input.trigger,
+        source: input.source,
+        observationCount: next.totalRuns,
+        failureCount: next.failureCount,
+        reasonSummary,
+        revisionCandidate,
+      });
+    }
+
+    await this.writeSkillUsageSummary(next);
+    return revisionCandidate ? { revisionCandidate } : {};
   }
 
   async maybeCreateCandidateFromExecution(input: SkillLearningInput): Promise<SkillCandidate | null> {
@@ -1033,6 +1269,14 @@ export class SkillManager {
 
       return parsed
         .filter((item): item is SkillLearningTodo => !!item && typeof item.id === 'string' && typeof item.sourceTask === 'string')
+        .map(item => ({
+          ...item,
+          occurrenceCount: typeof item.occurrenceCount === 'number' && Number.isFinite(item.occurrenceCount)
+            ? Math.max(1, Math.floor(item.occurrenceCount))
+            : 1,
+          lastSeenAt: typeof item.lastSeenAt === 'string' ? item.lastSeenAt : item.createdAt,
+          draftedCandidateConfidence: this.normalizeCandidateConfidence(item.draftedCandidateConfidence),
+        }))
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     } catch {
       return [];
@@ -1059,19 +1303,58 @@ export class SkillManager {
   async addLearningTodo(input: Omit<SkillLearningTodo, 'id' | 'createdAt'>): Promise<SkillLearningTodo> {
     await this.ensureLearningTodoStore();
     const existing = await this.listLearningTodos();
-    const todo: SkillLearningTodo = {
-      id: `todo_${Date.now()}`,
-      createdAt: new Date().toISOString(),
-      sourceTask: input.sourceTask,
-      issueSummary: input.issueSummary,
-      suggestedSkill: input.suggestedSkill,
-      blockers: input.blockers,
-      nextActions: input.nextActions,
-      tags: input.tags,
-      confidence: input.confidence,
-    };
-    const deduped = [todo, ...existing.filter(item => !(item.sourceTask === todo.sourceTask && item.suggestedSkill === todo.suggestedSkill))];
-    await fs.writeFile(this.learningTodoFile, JSON.stringify(deduped, null, 2), 'utf-8');
+    const now = new Date().toISOString();
+    const duplicateIndex = existing.findIndex(item => item.sourceTask === input.sourceTask && item.suggestedSkill === input.suggestedSkill);
+
+    let todo: SkillLearningTodo;
+    let updated: SkillLearningTodo[];
+
+    if (duplicateIndex >= 0) {
+      const duplicate = existing[duplicateIndex]!;
+      todo = {
+        ...duplicate,
+        issueSummary: input.issueSummary,
+        blockers: input.blockers,
+        nextActions: input.nextActions,
+        tags: input.tags,
+        confidence: input.confidence,
+        occurrenceCount: Math.max(1, (duplicate.occurrenceCount || 1) + 1),
+        lastSeenAt: now,
+      };
+      updated = [
+        todo,
+        ...existing.filter((_, index) => index !== duplicateIndex),
+      ];
+    } else {
+      todo = {
+        id: `todo_${Date.now()}`,
+        createdAt: now,
+        lastSeenAt: now,
+        sourceTask: input.sourceTask,
+        issueSummary: input.issueSummary,
+        suggestedSkill: input.suggestedSkill,
+        blockers: input.blockers,
+        nextActions: input.nextActions,
+        tags: input.tags,
+        confidence: input.confidence,
+        occurrenceCount: 1,
+      };
+      updated = [todo, ...existing];
+    }
+
+    if (this.shouldAutoDraftTodo(todo)) {
+      const drafted = await this.createCandidateFromTodo(todo.id);
+      todo = {
+        ...todo,
+        draftedCandidateName: drafted.name,
+        draftedCandidatePath: drafted.path,
+        draftedCandidateConfidence: drafted.confidence,
+        draftedAt: drafted.createdAt,
+      };
+      updated = updated.map(item => item.id === todo.id ? todo : item);
+    }
+
+    await fs.writeFile(this.learningTodoFile, JSON.stringify(updated, null, 2), 'utf-8');
     return todo;
   }
 
@@ -1121,6 +1404,7 @@ export class SkillManager {
     const targetDir = join(this.skillsDir, name);
 
     await fs.access(join(candidateDir, 'SKILL.md'));
+    await this.markRevisionCandidateAdopted(name);
     await fs.rm(targetDir, { recursive: true, force: true });
     await this.copyDirectory(candidateDir, targetDir);
     await this.loadSkill(name, targetDir);
@@ -1421,7 +1705,8 @@ export class SkillManager {
     const overlapScore = hitCount / queryTerms.length;
     const exactBonus = haystack.includes(query.toLowerCase().trim()) ? 0.25 : 0;
     const confidenceBonus = (todo.confidence || 0) * 0.12;
-    return Math.min(1, overlapScore + exactBonus + confidenceBonus);
+    const occurrenceBonus = Math.min(0.12, ((todo.occurrenceCount || 1) - 1) * 0.04);
+    return Math.min(1, overlapScore + exactBonus + confidenceBonus + occurrenceBonus);
   }
 
   private resolveLearningTodoReference(reference: string, todos: SkillLearningTodo[]): SkillLearningTodo | null {
@@ -1434,6 +1719,358 @@ export class SkillManager {
       || todos.find(todo => todo.suggestedSkill.toLowerCase() === normalized)
       || todos.find(todo => todo.draftedCandidateName?.toLowerCase() === normalized)
       || null;
+  }
+
+  private shouldAutoDraftTodo(todo: SkillLearningTodo): boolean {
+    if (!this.learningAutomation.autoDraftFromTodo) {
+      return false;
+    }
+
+    if (todo.draftedCandidateName) {
+      return false;
+    }
+
+    return (todo.occurrenceCount || 1) >= this.learningAutomation.autoDraftThreshold;
+  }
+
+  shouldAutoAdoptCandidate(candidate: { confidence?: number }): boolean {
+    if (!this.learningAutomation.autoAdoptAfterApproval) {
+      return false;
+    }
+
+    const confidence = this.normalizeCandidateConfidence(candidate.confidence);
+    if (confidence === undefined) {
+      return false;
+    }
+
+    return confidence >= this.learningAutomation.autoAdoptMinConfidence;
+  }
+
+  private async shouldAutoReviseSkill(
+    summary: SkillUsageSummary,
+    activeRevisionFeedback?: RevisionCandidateFeedbackSummary | null,
+  ): Promise<boolean> {
+    if (!this.learningAutomation.autoReviseAdoptedSkills) {
+      return false;
+    }
+
+    if (activeRevisionFeedback && (activeRevisionFeedback.status === 'draft' || activeRevisionFeedback.status === 'promotable')) {
+      return false;
+    }
+
+    const observationsSinceLastDraft = summary.totalRuns - (summary.lastDraftObservationCount || 0);
+    const failuresSinceLastDraft = summary.failureCount - (summary.lastDraftFailureCount || 0);
+    if (failuresSinceLastDraft >= this.learningAutomation.autoReviseMinFailures) {
+      return true;
+    }
+
+    return observationsSinceLastDraft >= this.learningAutomation.autoReviseMinObservations;
+  }
+
+  private buildSkillRevisionReasonSummary(summary: SkillUsageSummary): string {
+    const observationsSinceLastDraft = summary.totalRuns - (summary.lastDraftObservationCount || 0);
+    const failuresSinceLastDraft = summary.failureCount - (summary.lastDraftFailureCount || 0);
+    const recentSignals = summary.recentObservations
+      .slice(-3)
+      .map((item) => `${item.success ? 'success' : 'failure'}:${item.summary}`)
+      .join(' | ');
+    const parts = [
+      `自上次草稿后累计 ${observationsSinceLastDraft} 次使用，失败 ${failuresSinceLastDraft} 次。`,
+    ];
+
+    if (recentSignals) {
+      parts.push(`最近信号: ${recentSignals}`);
+    }
+
+    return parts.join(' ');
+  }
+
+  private async emitRuntimeEvent(event: SkillLearningRuntimeEvent): Promise<void> {
+    if (!this.runtimeEventListener) {
+      return;
+    }
+
+    try {
+      await this.runtimeEventListener(event);
+    } catch (error) {
+      if (this.shouldLogDiscovery) {
+        console.warn(`Skill runtime event listener failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  private async createRevisionCandidateFromSkillUsage(skill: Skill, usage: SkillUsageSummary): Promise<SkillCandidate> {
+    const candidateName = await this.allocateCandidateName(`${skill.name}-revision`);
+    const createdAt = new Date().toISOString();
+    const candidateDir = join(this.candidatesDir, candidateName);
+    const skillMdPath = join(candidateDir, 'SKILL.md');
+    const installedSkillPath = join(this.skillsDir, skill.name, 'SKILL.md');
+
+    let currentSkillContent = skill.skillContent || '';
+    try {
+      currentSkillContent = await fs.readFile(installedSkillPath, 'utf-8');
+    } catch {}
+
+    const parsed = currentSkillContent
+      ? this.parseSkillCandidateDocument(currentSkillContent, skill.name)
+      : {
+          name: skill.name,
+          description: skill.description,
+          sourceTask: `Use adopted skill ${skill.name}`,
+          confidence: undefined,
+          qualitySummary: undefined,
+          tags: ['skill-revision'],
+          whenToUse: `Use when ${skill.name} applies.`,
+          procedureSteps: [],
+          verification: [],
+        };
+    const confidence = this.normalizeCandidateConfidence(Math.min(0.95, 0.52 + usage.totalRuns * 0.08 + usage.failureCount * 0.05));
+    const qualitySummary = `Revision draft from ${usage.totalRuns} observed uses (${usage.successCount} success / ${usage.failureCount} failure).`;
+    const description = `Revision draft for adopted skill ${skill.name} based on real usage feedback.`;
+    const recentObservations = usage.recentObservations.slice(-6);
+    const procedureLines = parsed.procedureSteps.length > 0
+      ? parsed.procedureSteps.map((step, index) => `${index + 1}. ${step}`)
+      : [
+          '1. 重放最近真实使用场景，确认 skill 当前步骤仍然成立。',
+          '2. 根据最近观测到的成功与失败信号，补齐边界条件、参数约束和异常处理。',
+          '3. 回归验证 skill 在最近高频场景下能稳定复用。',
+        ];
+    const verificationLines = parsed.verification.length > 0
+      ? parsed.verification.map(item => `- ${item}`)
+      : ['- 回放最近失败场景，确认问题已经被覆盖。', '- 再跑一次典型成功场景，确认没有引入回归。'];
+    const content = [
+      '---',
+      `name: ${candidateName}`,
+      `description: ${description}`,
+      'version: 0.1.0',
+      `sourceTask: ${JSON.stringify(`Revise adopted skill ${skill.name} from real usage feedback`)}`,
+      `createdAt: ${createdAt}`,
+      `sourceSkill: ${skill.name}`,
+      confidence !== undefined ? `confidence: ${confidence.toFixed(2)}` : undefined,
+      `qualitySummary: ${JSON.stringify(qualitySummary)}`,
+      `tags: ${this.normalizeCandidateTags([...(parsed.tags || []), 'revision', 'usage-feedback']).join(', ')}`,
+      '---',
+      '',
+      `# ${candidateName}`,
+      '',
+      '## Status',
+      'This draft was auto-generated from real usage feedback of an adopted skill. Review it before replacing or re-adopting the live skill.',
+      '',
+      '## Assessment',
+      qualitySummary,
+      '',
+      '## When to Use',
+      parsed.whenToUse || `Use when revising ${skill.name} for similar requests.`,
+      '',
+      '## Procedure',
+      procedureLines.join('\n'),
+      '',
+      '## Verification',
+      verificationLines.join('\n'),
+      '',
+      '## Usage Feedback Snapshot',
+      `- Skill: ${skill.name}`,
+      `- Total runs: ${usage.totalRuns}`,
+      `- Success count: ${usage.successCount}`,
+      `- Failure count: ${usage.failureCount}`,
+      ...(recentObservations.length > 0
+        ? ['', 'Recent observations:', ...recentObservations.map((item, index) => `- ${index + 1}. [${item.success ? 'success' : 'failure'}|${item.trigger}] ${item.source}: ${item.summary}`)]
+        : []),
+      '',
+      '## Current Skill Snapshot',
+      `Original skill: ${skill.name}`,
+      `Current description: ${parsed.description || skill.description}`,
+      parsed.qualitySummary ? `Current quality summary: ${parsed.qualitySummary}` : undefined,
+      '',
+    ].filter((line): line is string => typeof line === 'string').join('\n');
+
+    await fs.mkdir(candidateDir, { recursive: true });
+    await fs.writeFile(skillMdPath, content, 'utf-8');
+
+    return {
+      name: candidateName,
+      description,
+      path: skillMdPath,
+      createdAt,
+      sourceTask: `Revise adopted skill ${skill.name}`,
+      confidence,
+      qualitySummary,
+      tags: this.normalizeCandidateTags([...(parsed.tags || []), 'revision', 'usage-feedback']),
+    };
+  }
+
+  private async updateRevisionCandidateFeedback(name: string, observation: SkillUsageObservation): Promise<RevisionCandidateFeedbackSummary | null> {
+    const existing = await this.readRevisionCandidateFeedback(name);
+    if (!existing || existing.status === 'adopted' || existing.status === 'superseded') {
+      return existing;
+    }
+
+    existing.postDraftRuns += 1;
+    existing.postDraftSuccesses += observation.success ? 1 : 0;
+    existing.postDraftFailures += observation.success ? 0 : 1;
+    existing.lastEvaluatedAt = observation.createdAt;
+    existing.latestSignals = [...existing.latestSignals, observation].slice(-8);
+    const adjustedScore = existing.confidenceScore + (observation.success ? -0.04 : 0.08);
+    existing.confidenceScore = Math.max(0, Math.min(1, Number(adjustedScore.toFixed(2))));
+    existing.status = this.computeRevisionCandidateStatus(existing);
+    await this.writeRevisionCandidateFeedback(existing);
+    return existing;
+  }
+
+  private computeRevisionCandidateStatus(summary: RevisionCandidateFeedbackSummary): RevisionCandidateFeedbackSummary['status'] {
+    if (summary.adoptedAt) {
+      return 'adopted';
+    }
+
+    if (summary.supersededBy) {
+      return 'superseded';
+    }
+
+    if (summary.postDraftFailures >= 2 || summary.confidenceScore >= 0.82) {
+      return 'promotable';
+    }
+
+    if (summary.postDraftRuns >= 3 && summary.postDraftFailures === 0 && summary.postDraftSuccesses >= 3 && summary.confidenceScore <= 0.48) {
+      return 'stale';
+    }
+
+    return 'draft';
+  }
+
+  private async markRevisionCandidateAdopted(name: string): Promise<void> {
+    const existing = await this.readRevisionCandidateFeedback(name);
+    if (!existing) {
+      return;
+    }
+
+    existing.adoptedAt = new Date().toISOString();
+    existing.confidenceScore = Math.max(existing.confidenceScore, 0.9);
+    existing.lastEvaluatedAt = existing.adoptedAt;
+    existing.status = 'adopted';
+    await this.writeRevisionCandidateFeedback(existing);
+  }
+
+  private async markRevisionCandidateSuperseded(name: string, supersededBy?: string): Promise<void> {
+    const existing = await this.readRevisionCandidateFeedback(name);
+    if (!existing || existing.status === 'adopted') {
+      return;
+    }
+
+    existing.supersededBy = supersededBy;
+    existing.lastEvaluatedAt = new Date().toISOString();
+    existing.status = 'superseded';
+    await this.writeRevisionCandidateFeedback(existing);
+  }
+
+  private async readRevisionCandidateFeedback(name: string): Promise<RevisionCandidateFeedbackSummary | null> {
+    try {
+      const raw = JSON.parse(await fs.readFile(this.getRevisionCandidateFeedbackFile(name), 'utf-8')) as Partial<RevisionCandidateFeedbackSummary>;
+      return {
+        draftName: typeof raw.draftName === 'string' ? raw.draftName : name,
+        sourceSkillName: typeof raw.sourceSkillName === 'string' ? raw.sourceSkillName : '',
+        draftedAt: typeof raw.draftedAt === 'string' ? raw.draftedAt : new Date().toISOString(),
+        draftedFromObservationCount: Math.max(0, Math.floor(raw.draftedFromObservationCount || 0)),
+        draftedFromFailureCount: Math.max(0, Math.floor(raw.draftedFromFailureCount || 0)),
+        postDraftRuns: Math.max(0, Math.floor(raw.postDraftRuns || 0)),
+        postDraftSuccesses: Math.max(0, Math.floor(raw.postDraftSuccesses || 0)),
+        postDraftFailures: Math.max(0, Math.floor(raw.postDraftFailures || 0)),
+        confidenceScore: this.normalizeLearningConfidence(typeof raw.confidenceScore === 'number' ? raw.confidenceScore : 0.6),
+        status: raw.status === 'promotable' || raw.status === 'stale' || raw.status === 'adopted' || raw.status === 'superseded' ? raw.status : 'draft',
+        reasonSummary: typeof raw.reasonSummary === 'string' ? raw.reasonSummary : '',
+        lastEvaluatedAt: typeof raw.lastEvaluatedAt === 'string' ? raw.lastEvaluatedAt : (typeof raw.draftedAt === 'string' ? raw.draftedAt : new Date().toISOString()),
+        latestSignals: Array.isArray(raw.latestSignals)
+          ? raw.latestSignals
+            .filter((item): item is SkillUsageObservation => !!item && typeof item === 'object')
+            .map((item) => ({
+              createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
+              trigger: item.trigger === 'command' || item.trigger === 'tool' || item.trigger === 'message_hook' ? item.trigger : 'tool',
+              source: typeof item.source === 'string' ? item.source : 'unknown',
+              success: item.success !== false,
+              summary: typeof item.summary === 'string' ? item.summary : '',
+            }))
+            .slice(-8)
+          : [],
+        adoptedAt: typeof raw.adoptedAt === 'string' ? raw.adoptedAt : undefined,
+        supersededBy: typeof raw.supersededBy === 'string' ? raw.supersededBy : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeRevisionCandidateFeedback(summary: RevisionCandidateFeedbackSummary): Promise<void> {
+    const candidateDir = join(this.candidatesDir, summary.draftName);
+    await fs.mkdir(candidateDir, { recursive: true });
+    await fs.writeFile(this.getRevisionCandidateFeedbackFile(summary.draftName), JSON.stringify(summary, null, 2), 'utf-8');
+  }
+
+  private getRevisionCandidateFeedbackFile(name: string): string {
+    return join(this.candidatesDir, name, '.revision-feedback.json');
+  }
+
+  private async readSkillUsageSummary(name: string): Promise<SkillUsageSummary | null> {
+    try {
+      const raw = JSON.parse(await fs.readFile(this.getSkillUsageFile(name), 'utf-8')) as Partial<SkillUsageSummary>;
+      return {
+        skillName: typeof raw.skillName === 'string' ? raw.skillName : name,
+        totalRuns: Math.max(0, Math.floor(raw.totalRuns || 0)),
+        successCount: Math.max(0, Math.floor(raw.successCount || 0)),
+        failureCount: Math.max(0, Math.floor(raw.failureCount || 0)),
+        updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString(),
+        recentObservations: Array.isArray(raw.recentObservations)
+          ? raw.recentObservations
+            .filter((item): item is SkillUsageObservation => !!item && typeof item === 'object')
+            .map((item) => ({
+              createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
+              trigger: item.trigger === 'command' || item.trigger === 'tool' || item.trigger === 'message_hook' ? item.trigger : 'tool',
+              source: typeof item.source === 'string' ? item.source : 'unknown',
+              success: item.success !== false,
+              summary: typeof item.summary === 'string' ? item.summary : '',
+            }))
+            .slice(-12)
+          : [],
+        lastRevisionCandidateName: typeof raw.lastRevisionCandidateName === 'string' ? raw.lastRevisionCandidateName : undefined,
+        lastRevisionCandidatePath: typeof raw.lastRevisionCandidatePath === 'string' ? raw.lastRevisionCandidatePath : undefined,
+        lastRevisionDraftedAt: typeof raw.lastRevisionDraftedAt === 'string' ? raw.lastRevisionDraftedAt : undefined,
+        lastDraftObservationCount: Math.max(0, Math.floor(raw.lastDraftObservationCount || 0)),
+        lastDraftFailureCount: Math.max(0, Math.floor(raw.lastDraftFailureCount || 0)),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeSkillUsageSummary(summary: SkillUsageSummary): Promise<void> {
+    await fs.mkdir(join(this.skillsDir, summary.skillName), { recursive: true });
+    await fs.writeFile(this.getSkillUsageFile(summary.skillName), JSON.stringify(summary, null, 2), 'utf-8');
+  }
+
+  private getSkillUsageFile(name: string): string {
+    return join(this.skillsDir, name, '.skill-usage.json');
+  }
+
+  private skillToolResultToText(result: Pick<SkillToolResult, 'content'>): string {
+    return result.content
+      .filter(item => item.type === 'text' && typeof item.text === 'string')
+      .map(item => item.text)
+      .join('\n');
+  }
+
+  private buildUsageSummaryPreview(input: string): string {
+    const normalized = input.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return '(无输出)';
+    }
+
+    return normalized.length > 220 ? `${normalized.slice(0, 217).trimEnd()}...` : normalized;
+  }
+
+  private normalizeLearningConfidence(value: number): number {
+    if (!Number.isFinite(value)) {
+      return 0.75;
+    }
+
+    return Math.min(1, Math.max(0, value));
   }
 
   private extractRelevanceTerms(input: string): string[] {

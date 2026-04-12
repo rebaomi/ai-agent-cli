@@ -33,6 +33,8 @@ export class StreamingOutput {
   private speed: number;
   private showCursor: boolean;
   private isStreaming: boolean = false;
+  private readonly pauseTokens = new Set<string>();
+  private pauseWaiter?: { promise: Promise<void>; resolve: () => void };
 
   constructor(options: StreamOptions = {}) {
     this.prefix = options.prefix || '';
@@ -47,11 +49,14 @@ export class StreamingOutput {
     this.isStreaming = true;
     this.buffer += text;
 
-    if (this.prefix) {
-      process.stdout.write(chalk[this.color](this.prefix));
-    }
+    let prefixWritten = false;
 
     for (const char of text) {
+      await this.waitIfPaused();
+      if (!prefixWritten && this.prefix) {
+        process.stdout.write(chalk[this.color](this.prefix));
+        prefixWritten = true;
+      }
       process.stdout.write(char);
       if (this.speed > 0 && !'\n\r'.includes(char)) {
         await this.sleep(this.speed);
@@ -73,8 +78,45 @@ export class StreamingOutput {
     process.stdout.write('\r\x1b[K');
   }
 
+  pause(token: string): void {
+    this.pauseTokens.add(token);
+    if (!this.pauseWaiter) {
+      let resolve!: () => void;
+      const promise = new Promise<void>((resume) => {
+        resolve = resume;
+      });
+      this.pauseWaiter = { promise, resolve };
+    }
+  }
+
+  resume(token: string): void {
+    this.pauseTokens.delete(token);
+    if (this.pauseTokens.size === 0 && this.pauseWaiter) {
+      const waiter = this.pauseWaiter;
+      this.pauseWaiter = undefined;
+      waiter.resolve();
+    }
+  }
+
+  isPaused(): boolean {
+    return this.pauseTokens.size > 0;
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private async waitIfPaused(): Promise<void> {
+    while (this.pauseTokens.size > 0) {
+      if (!this.pauseWaiter) {
+        let resolve!: () => void;
+        const promise = new Promise<void>((resume) => {
+          resolve = resume;
+        });
+        this.pauseWaiter = { promise, resolve };
+      }
+      await this.pauseWaiter.promise;
+    }
   }
 
   isActive(): boolean {

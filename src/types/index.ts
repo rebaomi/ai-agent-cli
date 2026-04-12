@@ -130,11 +130,20 @@ export interface AgentTaskBindingSnapshot {
 }
 
 export interface AgentPendingInteractionSnapshot {
-  type: 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume' | 'direct_action_execution';
+  type: 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume' | 'direct_action_execution' | 'tool_execution' | 'skill_adoption';
   prompt?: string;
   originalTask?: string;
   hasPlan: boolean;
   hasResumeState: boolean;
+}
+
+export interface AgentReActStepSnapshot {
+  phase: 'thought' | 'action' | 'observation' | 'reflection' | 'completed' | 'paused' | 'failed';
+  iteration: number;
+  usedPlannedTools: boolean;
+  observationCount: number;
+  lastThought?: string;
+  lastInstruction?: string;
 }
 
 export interface AgentPlanResumeSnapshot {
@@ -143,6 +152,7 @@ export interface AgentPlanResumeSnapshot {
   blockedStepDescription: string;
   blockedReason: string;
   resultCount: number;
+  reactStep?: AgentReActStepSnapshot;
 }
 
 export interface AgentToolBudgetSnapshot {
@@ -383,26 +393,78 @@ export interface NotificationsConfig {
 
 export interface WorkflowCheckpointConfig {
   enabled?: boolean;
+  level?: 'minimal' | 'balanced' | 'paranoid';
   planApproval?: boolean;
   continuationApproval?: boolean;
   outboundApproval?: boolean;
   riskyDirectActionApproval?: boolean;
+  riskyStepApproval?: boolean;
+  stepExecutionApproval?: boolean;
+  stepResultApproval?: boolean;
   announceCheckpoints?: boolean;
 }
 
 export type OutputChannelLevel = 'debug' | 'info' | 'warning' | 'error';
+export type OutputVerbosity = 'quiet' | 'normal' | 'verbose';
 
 export interface OutputChannelConfig {
   enabled?: boolean;
   minLevel?: OutputChannelLevel;
 }
 
+export interface OutputTargetChannelConfig {
+  target?: 'stdout' | 'stderr' | 'file';
+  logFile?: string;
+  file?: string;
+  silentInProduction?: boolean;
+  enabledInProduction?: boolean;
+}
+
+export interface AgentCatOutputReminderConfig {
+  enabled?: boolean;
+  interval?: string | number;
+}
+
+export interface AgentCatOutputConfig {
+  mode?: 'terminal' | 'desktop' | 'off';
+  displayInTerminal?: boolean;
+  useDesktopNotification?: boolean;
+  reminders?: {
+    water?: AgentCatOutputReminderConfig;
+    rest?: AgentCatOutputReminderConfig;
+    walk?: AgentCatOutputReminderConfig;
+  };
+}
+
 export interface OutputConfig {
+  mode?: 'development' | 'production';
+  verbosity?: OutputVerbosity;
   pauseOnPermissionPrompt?: boolean;
   separateChannels?: boolean;
+  systemToStderr?: boolean;
+  silentSystemInProduction?: boolean;
+  debugToFile?: boolean;
+  systemLogFile?: string;
+  debugLogFile?: string;
   process?: OutputChannelConfig;
   notification?: OutputChannelConfig;
   permission?: OutputChannelConfig;
+  channels?: {
+    main?: OutputTargetChannelConfig;
+    system?: OutputTargetChannelConfig;
+    debug?: OutputTargetChannelConfig;
+  };
+  agentcat?: AgentCatOutputConfig;
+}
+
+export interface SkillLearningConfig {
+  autoDraftFromTodo?: boolean;
+  autoDraftThreshold?: number;
+  autoAdoptAfterApproval?: boolean;
+  autoAdoptMinConfidence?: number;
+  autoReviseAdoptedSkills?: boolean;
+  autoReviseMinObservations?: number;
+  autoReviseMinFailures?: number;
 }
 
 export interface AgentConfig {
@@ -438,6 +500,14 @@ export interface AgentConfig {
   notifications?: NotificationsConfig;
   checkpoints?: WorkflowCheckpointConfig;
   output?: OutputConfig;
+  skillLearning?: SkillLearningConfig;
+  setupWizard?: {
+    completed?: boolean;
+    completedAt?: string;
+    outputMode?: OutputVerbosity;
+    agentcatMode?: 'terminal' | 'desktop' | 'off';
+    checkpointLevel?: 'minimal' | 'balanced' | 'paranoid';
+  };
 }
 
 export interface MCPConfig {

@@ -1,11 +1,17 @@
 import chalk from 'chalk';
 import { EventEmitter } from 'events';
+import notifier from 'node-notifier';
+import { TerminalManager } from '../output/terminal-manager.js';
 
 export interface ReminderConfig {
   enabled: boolean;
+  waterEnabled: boolean;
   waterIntervalMinutes: number;
+  eyeRestEnabled: boolean;
   eyeRestIntervalMinutes: number;
+  walkEnabled: boolean;
   walkIntervalMinutes: number;
+  mealEnabled: boolean;
   mealTimes: string[];
 }
 
@@ -15,6 +21,11 @@ export interface Reminder {
   message: string;
   timestamp: number;
   dismissed: boolean;
+}
+
+export interface AgentCatNotificationConfig {
+  displayInTerminal?: boolean;
+  useDesktopNotification?: boolean;
 }
 
 export class AgentCat extends EventEmitter {
@@ -27,6 +38,8 @@ export class AgentCat extends EventEmitter {
   private lastWalkTime: number = Date.now();
   private isActive: boolean = false;
   private interactionCount: number = 0;
+  private readonly terminal?: TerminalManager;
+  private readonly notificationConfig: AgentCatNotificationConfig;
 
   private catFaces = {
     happy: '(=^・^=)',
@@ -78,14 +91,23 @@ export class AgentCat extends EventEmitter {
     ],
   };
 
-  constructor(config?: Partial<ReminderConfig>) {
+  constructor(config?: Partial<ReminderConfig>, terminal?: TerminalManager, notificationConfig?: AgentCatNotificationConfig) {
     super();
     this.name = 'AgentCat';
+    this.terminal = terminal;
+    this.notificationConfig = {
+      displayInTerminal: notificationConfig?.displayInTerminal ?? true,
+      useDesktopNotification: notificationConfig?.useDesktopNotification ?? false,
+    };
     this.config = {
       enabled: true,
+      waterEnabled: true,
       waterIntervalMinutes: 30,
+      eyeRestEnabled: true,
       eyeRestIntervalMinutes: 20,
+      walkEnabled: true,
       walkIntervalMinutes: 60,
+      mealEnabled: true,
       mealTimes: ['08:00', '12:00', '18:00'],
       ...config,
     };
@@ -95,13 +117,21 @@ export class AgentCat extends EventEmitter {
     if (this.isActive) return;
     this.isActive = true;
     
-    console.log(chalk.cyan(`${this.catFaces.happy} ${this.name} 已启动！`));
-    console.log(chalk.gray('  正在监控您的健康状态~\n'));
+    this.writeSystem(`${this.catFaces.happy} ${this.name} 已启动！`, 'info');
+    this.writeSystem('  正在监控您的健康状态~', 'info');
 
-    this.startWaterReminder();
-    this.startEyeRestReminder();
-    this.startWalkReminder();
-    this.startMealReminder();
+    if (this.config.waterEnabled) {
+      this.startWaterReminder();
+    }
+    if (this.config.eyeRestEnabled) {
+      this.startEyeRestReminder();
+    }
+    if (this.config.walkEnabled) {
+      this.startWalkReminder();
+    }
+    if (this.config.mealEnabled) {
+      this.startMealReminder();
+    }
     
     this.emit('started');
   }
@@ -113,7 +143,7 @@ export class AgentCat extends EventEmitter {
     }
     this.reminders.clear();
     
-    console.log(chalk.gray(`${this.catFaces.sleepy} ${this.name} 进入休眠模式~\n`));
+    this.writeSystem(`${this.catFaces.sleepy} ${this.name} 进入休眠模式~`, 'info');
     this.emit('stopped');
   }
 
@@ -205,7 +235,7 @@ export class AgentCat extends EventEmitter {
       dismissed: false,
     };
 
-    console.log(chalk.cyan(`\n${face} 提醒: ${message}\n`));
+    void this.sendReminder(reminder, face);
     this.emit('reminder', reminder);
   }
 
@@ -214,21 +244,21 @@ export class AgentCat extends EventEmitter {
       case 'water':
         this.lastWaterTime = Date.now();
         this.mood = 'happy';
-        console.log(chalk.green(`${this.catFaces.happy} 谢谢主人喝水！`));
+        this.writeSystem(`${this.catFaces.happy} 谢谢主人喝水！`, 'info');
         break;
       case 'eye_rest':
         this.lastEyeRestTime = Date.now();
         this.mood = 'energetic';
-        console.log(chalk.green(`${this.catFaces.energetic} 眼睛休息好了吗？`));
+        this.writeSystem(`${this.catFaces.energetic} 眼睛休息好了吗？`, 'info');
         break;
       case 'walk':
         this.lastWalkTime = Date.now();
         this.mood = 'happy';
-        console.log(chalk.green(`${this.catFaces.happy} 运动真棒！`));
+        this.writeSystem(`${this.catFaces.happy} 运动真棒！`, 'info');
         break;
       case 'meal':
         this.mood = 'happy';
-        console.log(chalk.green(`${this.catFaces.happy} 吃饱饱~`));
+        this.writeSystem(`${this.catFaces.happy} 吃饱饱~`, 'info');
         break;
     }
     
@@ -301,8 +331,63 @@ ${chalk.bold('AgentCat 命令:')}
   ${chalk.cyan('/cat start')}       开启提醒
 `);
   }
+
+  private async sendReminder(reminder: Reminder, face: string): Promise<void> {
+    const terminalMessage = `${face} 提醒: ${reminder.message}`;
+    if (this.notificationConfig.useDesktopNotification) {
+      try {
+        await this.sendDesktopNotification(reminder.message);
+      } catch {
+        this.writeSystem(terminalMessage, 'warning');
+      }
+      return;
+    }
+
+    this.writeSystem(terminalMessage, 'info');
+  }
+
+  private async sendDesktopNotification(message: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      notifier.notify(
+        {
+          title: 'AgentCat 提醒',
+          message,
+          wait: false,
+        },
+        (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        },
+      );
+    });
+
+    if (this.notificationConfig.displayInTerminal) {
+      this.writeSystem(`已发送桌面提醒: ${message}`, 'info');
+    }
+  }
+
+  private writeSystem(message: string, level: 'info' | 'warning' | 'error'): void {
+    if (this.terminal) {
+      this.terminal.system(message, {
+        level,
+        category: 'agentcat',
+        silent: this.notificationConfig.displayInTerminal === false,
+      });
+      return;
+    }
+
+    const printer = level === 'error' ? chalk.red : level === 'warning' ? chalk.yellow : chalk.cyan;
+    console.log(printer(message));
+  }
 }
 
-export function createAgentCat(config?: Partial<ReminderConfig>): AgentCat {
-  return new AgentCat(config);
+export function createAgentCat(
+  config?: Partial<ReminderConfig>,
+  terminal?: TerminalManager,
+  notificationConfig?: AgentCatNotificationConfig,
+): AgentCat {
+  return new AgentCat(config, terminal, notificationConfig);
 }

@@ -35,6 +35,13 @@ export class ResponseTurnProcessor {
       prepareFallbackContent: 'Using tool...',
     });
 
+    if (coordinated.paused) {
+      return {
+        response: coordinated.output || coordinated.cleanResponse,
+        continueLoop: false,
+      };
+    }
+
     if (coordinated.handled) {
       return { response: fullResponse, continueLoop: true };
     }
@@ -63,6 +70,13 @@ export class ResponseTurnProcessor {
         omitIfEmpty: true,
       },
     });
+
+    if (coordinated.paused) {
+      return {
+        response: coordinated.output || coordinated.cleanResponse,
+        continueLoop: false,
+      };
+    }
 
     if (coordinated.handled) {
       return { response: fullResponse, continueLoop: true };

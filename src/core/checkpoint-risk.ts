@@ -1,4 +1,5 @@
-import type { Plan } from './planner.js';
+import type { Plan, PlanStep } from './planner.js';
+import type { ToolCall } from '../types/index.js';
 
 export type CheckpointRiskKind =
   | 'command_execute'
@@ -31,6 +32,20 @@ export interface DirectActionRiskSummary {
   handlerName: string;
   category: string;
   level: 'low' | 'medium' | 'high';
+  items: CheckpointRiskItem[];
+  hasOutboundDelivery: boolean;
+  hasRiskyActions: boolean;
+}
+
+export interface StepCheckpointRiskSummary {
+  stepId: string;
+  stepDescription: string;
+  items: CheckpointRiskItem[];
+  hasOutboundDelivery: boolean;
+  hasRiskyActions: boolean;
+}
+
+export interface ToolCheckpointRiskSummary {
   items: CheckpointRiskItem[];
   hasOutboundDelivery: boolean;
   hasRiskyActions: boolean;
@@ -242,4 +257,103 @@ function isHighRiskBrowserRequest(input: string): boolean {
 
 function truncateDetail(value: string): string {
   return value.length > 120 ? `${value.slice(0, 117)}...` : value;
+}
+
+export function summarizeStepCheckpointRisks(step: PlanStep): StepCheckpointRiskSummary {
+  const items = (step.toolCalls || [])
+    .map((toolCall) => classifyToolRisk(toolCall.name, toolCall.args, step.id))
+    .filter((item): item is CheckpointRiskItem => !!item);
+
+  return {
+    stepId: step.id,
+    stepDescription: step.description,
+    items,
+    hasOutboundDelivery: items.some((item) => item.kind === 'outbound_delivery'),
+    hasRiskyActions: items.some((item) => item.level === 'high' || item.kind === 'command_execute' || item.kind === 'browser_automation' || item.kind === 'external_workflow'),
+  };
+}
+
+export function buildStepCheckpointPrompt(step: PlanStep, summary: StepCheckpointRiskSummary, stepIndex: number, totalSteps: number): string {
+  const lines = [
+    '## 待确认的计划步骤',
+    '',
+    `当前步骤: ${stepIndex + 1}/${totalSteps}`,
+    `步骤描述: ${step.description}`,
+  ];
+
+  if (summary.items.length > 0) {
+    lines.push('', '**本步骤会执行的风险动作**:');
+    for (const item of summary.items) {
+      lines.push(`- ${item.title}: ${item.detail}`);
+    }
+  }
+
+  lines.push('', '请确认是否执行该步骤（回复“是”或“否”）。回复“否”会跳过当前步骤并继续后续步骤。');
+  return lines.join('\n');
+}
+
+export function buildStepResultCheckpointPrompt(
+  step: PlanStep,
+  summary: StepCheckpointRiskSummary,
+  stepIndex: number,
+  totalSteps: number,
+  stepResult: string,
+): string {
+  const lines = [
+    '## 待验收的步骤结果',
+    '',
+    `当前步骤: ${stepIndex + 1}/${totalSteps}`,
+    `步骤描述: ${step.description}`,
+  ];
+
+  if (summary.items.length > 0) {
+    lines.push('', '**本步骤涉及的风险动作**:');
+    for (const item of summary.items) {
+      lines.push(`- ${item.title}: ${item.detail}`);
+    }
+  }
+
+  lines.push('', '**当前步骤结果预览**:');
+  lines.push(truncateDetail(stepResult || '(无输出)'));
+  lines.push('', '请确认是否验收当前结果（回复“是”或“否”）。如果你要改路径、改目标、改命令或补充验收要求，也可以直接继续说，我会带着这些修改重做当前步骤。');
+  return lines.join('\n');
+}
+
+export function summarizeToolCallCheckpointRisks(toolCalls: ToolCall[]): ToolCheckpointRiskSummary {
+  const items = toolCalls
+    .map((toolCall) => classifyToolRisk(toolCall.function.name, parseToolCallArgs(toolCall)))
+    .filter((item): item is CheckpointRiskItem => !!item);
+
+  return {
+    items,
+    hasOutboundDelivery: items.some((item) => item.kind === 'outbound_delivery'),
+    hasRiskyActions: items.some((item) => item.level === 'high' || item.kind === 'command_execute' || item.kind === 'browser_automation' || item.kind === 'external_workflow'),
+  };
+}
+
+export function buildToolCheckpointPrompt(originalInput: string, summary: ToolCheckpointRiskSummary): string {
+  const lines = [
+    '## 待确认的预测工具执行',
+    '',
+    `原请求: ${originalInput}`,
+  ];
+
+  if (summary.items.length > 0) {
+    lines.push('', '**本轮预测到的风险工具动作**:');
+    for (const item of summary.items) {
+      lines.push(`- ${item.title}: ${item.detail}`);
+    }
+  }
+
+  lines.push('', '请确认是否执行这些工具（回复“是”或“否”）。如果你要改路径、改目标、改命令或补充约束，也可以直接继续说，我会先按你的修改重算这轮动作。');
+  return lines.join('\n');
+}
+
+function parseToolCallArgs(toolCall: ToolCall): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(toolCall.function.arguments || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
 }

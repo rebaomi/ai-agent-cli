@@ -27,6 +27,7 @@ ${chalk.bold('Quick Commands:')}
   ${chalk.cyan('/split')}    ${chalk.gray('Toggle split view for output/process panes')}
   ${chalk.cyan('/relay')}    ${chalk.gray('Show/reconnect Lark relay')}
   ${chalk.cyan('/config')}   ${chalk.gray('Show/reload/edit config')}
+  ${chalk.cyan('/perf')}     ${chalk.gray('Show runtime performance summary / recent / reset')}
   ${chalk.cyan('/model')}    ${chalk.gray('Show/change model')}
   ${chalk.cyan('/progress')} ${chalk.gray('Show active progress and task bindings')}
   ${chalk.cyan('/task-context')} ${chalk.gray('Show task stack; supports --json and inspect')}
@@ -50,8 +51,12 @@ ${chalk.cyan('/history, /hi')}      Show command history
 ${chalk.cyan('/tools, /t')}        List available tools
 ${chalk.cyan('/config, /c')}       Show current configuration
 ${chalk.cyan('/config edit')}       Open terminal editor for config file (/save, /q)
+${chalk.cyan('/config setup')}      Re-run interactive setup wizard
 ${chalk.cyan('/config update')}     Reload config from file and refresh runtime
 ${chalk.cyan('/config reload')}     Alias of /config update
+${chalk.cyan('/perf, /perf status')} Show current performance monitor summary
+${chalk.cyan('/perf recent')}        Show recent response-time events
+${chalk.cyan('/perf reset')}         Reset collected performance metrics
 ${chalk.cyan('/mode status')}       Show current input mode and relay status
 ${chalk.cyan('/mode switch')} <name> Switch active input source (cli or feishu)
 ${chalk.cyan('/function status')}    Show current function mode (workflow or chat)

@@ -254,10 +254,14 @@ const agentInteractionModeSchema = z.enum(['auto', 'chat', 'task']);
 
 const workflowCheckpointSchema = z.object({
   enabled: z.boolean().default(true),
+  level: z.enum(['minimal', 'balanced', 'paranoid']).default('balanced'),
   planApproval: z.boolean().default(true),
   continuationApproval: z.boolean().default(false),
   outboundApproval: z.boolean().default(true),
   riskyDirectActionApproval: z.boolean().default(true),
+  riskyStepApproval: z.boolean().default(true),
+  stepExecutionApproval: z.boolean().default(true),
+  stepResultApproval: z.boolean().default(false),
   announceCheckpoints: z.boolean().default(true),
 });
 
@@ -268,9 +272,62 @@ const outputChannelSchema = z.object({
   minLevel: outputChannelLevelSchema.default('info'),
 });
 
+const outputTargetChannelSchema = z.object({
+  target: z.enum(['stdout', 'stderr', 'file']).default('stdout'),
+  logFile: z.string().optional(),
+  file: z.string().optional(),
+  silentInProduction: z.boolean().default(true),
+  enabledInProduction: z.boolean().default(false),
+});
+
+const agentcatOutputReminderSchema = z.object({
+  enabled: z.boolean().default(true),
+  interval: z.union([z.string(), z.number()]).optional(),
+});
+
+const agentcatOutputSchema = z.object({
+  mode: z.enum(['terminal', 'desktop', 'off']).default('terminal'),
+  displayInTerminal: z.boolean().default(true),
+  useDesktopNotification: z.boolean().default(false),
+  reminders: z.object({
+    water: agentcatOutputReminderSchema.default({
+      enabled: true,
+      interval: '30m',
+    }),
+    rest: agentcatOutputReminderSchema.default({
+      enabled: true,
+      interval: '20m',
+    }),
+    walk: agentcatOutputReminderSchema.default({
+      enabled: true,
+      interval: '60m',
+    }),
+  }).default({
+    water: {
+      enabled: true,
+      interval: '30m',
+    },
+    rest: {
+      enabled: true,
+      interval: '20m',
+    },
+    walk: {
+      enabled: true,
+      interval: '60m',
+    },
+  }),
+});
+
 const outputSchema = z.object({
+  mode: z.enum(['development', 'production']).default('development'),
+  verbosity: z.enum(['quiet', 'normal', 'verbose']).default('normal'),
   pauseOnPermissionPrompt: z.boolean().default(true),
   separateChannels: z.boolean().default(true),
+  systemToStderr: z.boolean().default(true),
+  silentSystemInProduction: z.boolean().default(true),
+  debugToFile: z.boolean().default(true),
+  systemLogFile: z.string().optional(),
+  debugLogFile: z.string().optional(),
   process: outputChannelSchema.default({
     enabled: true,
     minLevel: 'info',
@@ -282,6 +339,57 @@ const outputSchema = z.object({
   permission: outputChannelSchema.default({
     enabled: true,
     minLevel: 'info',
+  }),
+  channels: z.object({
+    main: outputTargetChannelSchema.default({
+      target: 'stdout',
+      silentInProduction: false,
+      enabledInProduction: true,
+    }),
+    system: outputTargetChannelSchema.default({
+      target: 'stderr',
+      silentInProduction: true,
+      enabledInProduction: true,
+    }),
+    debug: outputTargetChannelSchema.default({
+      target: 'file',
+      silentInProduction: true,
+      enabledInProduction: false,
+    }),
+  }).default({
+    main: {
+      target: 'stdout',
+      silentInProduction: false,
+      enabledInProduction: true,
+    },
+    system: {
+      target: 'stderr',
+      silentInProduction: true,
+      enabledInProduction: true,
+    },
+    debug: {
+      target: 'file',
+      silentInProduction: true,
+      enabledInProduction: false,
+    },
+  }),
+  agentcat: agentcatOutputSchema.default({
+    displayInTerminal: true,
+    useDesktopNotification: false,
+    reminders: {
+      water: {
+        enabled: true,
+        interval: '30m',
+      },
+      rest: {
+        enabled: true,
+        interval: '20m',
+      },
+      walk: {
+        enabled: true,
+        interval: '60m',
+      },
+    },
   }),
 });
 
@@ -337,6 +445,16 @@ const notificationsSchema = z.object({
   }).optional(),
 }).optional();
 
+const skillLearningSchema = z.object({
+  autoDraftFromTodo: z.boolean().default(true),
+  autoDraftThreshold: z.number().int().min(1).max(10).default(2),
+  autoAdoptAfterApproval: z.boolean().default(true),
+  autoAdoptMinConfidence: z.number().min(0).max(1).default(0.75),
+  autoReviseAdoptedSkills: z.boolean().default(true),
+  autoReviseMinObservations: z.number().int().min(1).max(20).default(3),
+  autoReviseMinFailures: z.number().int().min(1).max(20).default(2),
+});
+
 const configSchema = z.object({
   defaultProvider: z.string().default('ollama'),
   ollama: providerSchema.merge(z.object({ baseUrl: z.string().default('http://localhost:11434') })),
@@ -380,15 +498,24 @@ const configSchema = z.object({
   notifications: notificationsSchema,
   checkpoints: workflowCheckpointSchema.default({
     enabled: true,
+    level: 'balanced',
     planApproval: true,
     continuationApproval: true,
     outboundApproval: true,
     riskyDirectActionApproval: true,
+    riskyStepApproval: true,
+    stepExecutionApproval: true,
+    stepResultApproval: false,
     announceCheckpoints: true,
   }),
   output: outputSchema.default({
+    mode: 'development',
+    verbosity: 'normal',
     pauseOnPermissionPrompt: true,
     separateChannels: true,
+    systemToStderr: true,
+    silentSystemInProduction: true,
+    debugToFile: true,
     process: {
       enabled: true,
       minLevel: 'info',
@@ -401,7 +528,59 @@ const configSchema = z.object({
       enabled: true,
       minLevel: 'info',
     },
+    channels: {
+      main: {
+        target: 'stdout',
+        silentInProduction: false,
+        enabledInProduction: true,
+      },
+      system: {
+        target: 'stderr',
+        silentInProduction: true,
+        enabledInProduction: true,
+      },
+      debug: {
+        target: 'file',
+        silentInProduction: true,
+        enabledInProduction: false,
+      },
+    },
+    agentcat: {
+      mode: 'terminal',
+      displayInTerminal: true,
+      useDesktopNotification: false,
+      reminders: {
+        water: {
+          enabled: true,
+          interval: '30m',
+        },
+        rest: {
+          enabled: true,
+          interval: '20m',
+        },
+        walk: {
+          enabled: true,
+          interval: '60m',
+        },
+      },
+    },
   }),
+  skillLearning: skillLearningSchema.default({
+    autoDraftFromTodo: true,
+    autoDraftThreshold: 2,
+    autoAdoptAfterApproval: true,
+    autoAdoptMinConfidence: 0.75,
+    autoReviseAdoptedSkills: true,
+    autoReviseMinObservations: 3,
+    autoReviseMinFailures: 2,
+  }),
+  setupWizard: z.object({
+    completed: z.boolean().default(false),
+    completedAt: z.string().optional(),
+    outputMode: z.enum(['quiet', 'normal', 'verbose']).optional(),
+    agentcatMode: z.enum(['terminal', 'desktop', 'off']).optional(),
+    checkpointLevel: z.enum(['minimal', 'balanced', 'paranoid']).optional(),
+  }).optional(),
 });
 
 export type ConfigSchema = z.infer<typeof configSchema>;
@@ -427,15 +606,24 @@ const defaultConfig: ConfigSchema = {
   toolTimeout: 60000,
   checkpoints: {
     enabled: true,
+    level: 'balanced',
     planApproval: true,
     continuationApproval: true,
     outboundApproval: true,
     riskyDirectActionApproval: true,
+    riskyStepApproval: true,
+    stepExecutionApproval: true,
+    stepResultApproval: false,
     announceCheckpoints: true,
   },
   output: {
+    mode: 'development',
+    verbosity: 'normal',
     pauseOnPermissionPrompt: true,
     separateChannels: true,
+    systemToStderr: true,
+    silentSystemInProduction: true,
+    debugToFile: true,
     process: {
       enabled: true,
       minLevel: 'info',
@@ -448,6 +636,54 @@ const defaultConfig: ConfigSchema = {
       enabled: true,
       minLevel: 'info',
     },
+    channels: {
+      main: {
+        target: 'stdout',
+        silentInProduction: false,
+        enabledInProduction: true,
+      },
+      system: {
+        target: 'stderr',
+        silentInProduction: true,
+        enabledInProduction: true,
+      },
+      debug: {
+        target: 'file',
+        silentInProduction: true,
+        enabledInProduction: false,
+      },
+    },
+    agentcat: {
+      mode: 'terminal',
+      displayInTerminal: true,
+      useDesktopNotification: false,
+      reminders: {
+        water: {
+          enabled: true,
+          interval: '30m',
+        },
+        rest: {
+          enabled: true,
+          interval: '20m',
+        },
+        walk: {
+          enabled: true,
+          interval: '60m',
+        },
+      },
+    },
+  },
+  skillLearning: {
+    autoDraftFromTodo: true,
+    autoDraftThreshold: 2,
+    autoAdoptAfterApproval: true,
+    autoAdoptMinConfidence: 0.75,
+    autoReviseAdoptedSkills: true,
+    autoReviseMinObservations: 3,
+    autoReviseMinFailures: 2,
+  },
+  setupWizard: {
+    completed: false,
   },
   hybrid: {
     enabled: true,

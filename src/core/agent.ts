@@ -22,6 +22,7 @@ import { createAgentRuntimeComponents } from './agent-runtime-factory.js';
 import type { IntentResolver } from './intent-resolver.js';
 import type { AgentGraphCheckpoint, AgentTaskBindingSnapshot, UnifiedAgentState } from '../types/index.js';
 import type { PendingInteraction } from './agent-interaction-service.js';
+import type { PermissionManager } from './permission-manager.js';
 
 export interface AgentOptions {
   llm: LLMProviderInterface;
@@ -34,6 +35,7 @@ export interface AgentOptions {
   maxToolCallsPerTurn?: number;
   planner?: Planner;
   intentResolver?: IntentResolver;
+  permissionManager?: Pick<PermissionManager, 'getConfig' | 'isGranted'>;
   onSkillInstallNeeded?: (skills: string[]) => Promise<void>;
   memoryProvider?: MemoryProvider;
   config?: Record<string, unknown>;
@@ -74,11 +76,14 @@ export interface AgentEvent {
     candidateName: string;
     candidatePath: string;
     sourceTask: string;
+    confidence?: number;
   };
   skillLearningTodo?: {
     todoId: string;
     suggestedSkill: string;
     sourceTask: string;
+    occurrenceCount?: number;
+    draftedCandidateName?: string;
   };
 }
 
@@ -171,6 +176,7 @@ export class Agent {
       skillManager: this.skillManager,
       planner: options.planner,
       intentResolver: options.intentResolver,
+      permissionManager: options.permissionManager,
       onSkillInstallNeeded: options.onSkillInstallNeeded,
       agentRole: this.agentRole,
       contextManager: this.contextManager,
@@ -207,6 +213,7 @@ export class Agent {
       },
       getMessages: () => this.contextManager.getMessages(),
       generateResponse: () => this.generateResponse(),
+      refreshTools: () => this.refreshTools(),
     });
     this.responseTurnExecutor = runtimeComponents.responseTurnExecutor;
     this.knownGapManager = runtimeComponents.knownGapManager;
@@ -393,14 +400,14 @@ export class Agent {
     }
 
     const response = await this.generateResponse();
-    this.setState('RESPONDING');
+    this.setState(this.interactionService.getConfirmationStatus().pending ? 'WAITING_CONFIRMATION' : 'RESPONDING');
     return response;
   }
 
   async continueResponse(): Promise<string> {
     this.beginResponseTurn();
     const response = await this.generateResponse();
-    this.setState('RESPONDING');
+    this.setState(this.interactionService.getConfirmationStatus().pending ? 'WAITING_CONFIRMATION' : 'RESPONDING');
     return response;
   }
 

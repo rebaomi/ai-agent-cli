@@ -15,7 +15,14 @@ export interface AgentPlanRuntimeServiceOptions {
   addMessage: (message: Message) => void;
   setWaitingConfirmation: () => void;
   setLastUserInput: (input: string) => void;
-  executePlan: (originalTask: string, plan: PlanResumeState['plan'], startStepIndex?: number, existingResults?: string[]) => Promise<string>;
+  executePlan: (
+    originalTask: string,
+    plan: PlanResumeState['plan'],
+    startStepIndex?: number,
+    existingResults?: string[],
+    currentStepState?: PlanResumeState['currentStepState'],
+    skipCurrentStep?: boolean,
+  ) => Promise<string>;
   resolvePlannedToolArgs: (args: Record<string, unknown>) => Record<string, unknown>;
   prepareToolCallsForExecution: (
     userInput: string,
@@ -34,7 +41,7 @@ export class AgentPlanRuntimeService {
   constructor(private readonly options: AgentPlanRuntimeServiceOptions) {}
 
   pausePlanForUserInput(resumeState: PlanResumeState): string {
-    const message = [
+    const message = resumeState.checkpointPrompt || [
       '## ⏸️ 任务已暂停',
       '',
       `当前阻塞步骤: ${resumeState.nextStepIndex + 1}. ${resumeState.blockedStepDescription}`,
@@ -58,12 +65,35 @@ export class AgentPlanRuntimeService {
     return message;
   }
 
-  async resumePlanExecution(resumeState: PlanResumeState, note?: string): Promise<string> {
+  async resumePlanExecution(
+    resumeState: PlanResumeState,
+    note?: string,
+    options?: { skipCurrentStep?: boolean; acceptPendingStepResult?: boolean; retryCurrentStep?: boolean },
+  ): Promise<string> {
     const resumedTask = note
       ? [resumeState.originalTask.trim(), `恢复执行前的用户补充: ${note.trim()}`].filter(Boolean).join('\n')
       : resumeState.originalTask;
+    const existingResults = [...resumeState.results];
+    let startStepIndex = resumeState.nextStepIndex;
+
+    if (options?.acceptPendingStepResult && resumeState.pendingStepResult) {
+      const stepNumber = (resumeState.checkpointStepIndex ?? resumeState.nextStepIndex) + 1;
+      existingResults.push(`[步骤 ${stepNumber}] ${resumeState.blockedStepDescription}\n${resumeState.pendingStepResult}`);
+    }
+
+    if (options?.retryCurrentStep && typeof resumeState.checkpointStepIndex === 'number') {
+      startStepIndex = resumeState.checkpointStepIndex;
+    }
+
     this.options.setLastUserInput(resumedTask);
-    return this.options.executePlan(resumedTask, resumeState.plan, resumeState.nextStepIndex, resumeState.results);
+    return this.options.executePlan(
+      resumedTask,
+      resumeState.plan,
+      startStepIndex,
+      existingResults,
+      resumeState.currentStepState,
+      options?.skipCurrentStep,
+    );
   }
 
   shouldPausePlanForUserInput(errorMessage: string): boolean {

@@ -13,6 +13,7 @@
     "dev": "tsx watch src/cli/index.ts",
     "start": "node dist/cli/index.js",
     "typecheck": "tsc --noEmit",
+    "test:unit": "node --import tsx --test tests/*.test.ts",
     "test:regression": "tsx scripts/regression-check.ts",
     "test:lark:send": "powershell -ExecutionPolicy Bypass -File scripts/lark-send-smoke.ps1",
     "push:news:lark": "node scripts/news-to-lark.mjs",
@@ -35,6 +36,7 @@
     "docx": "^9.6.1",
     "eventsource": "^2.0.2",
     "inquirer": "^9.2.23",
+    "node-notifier": "^10.0.1",
     "ora": "^7.0.1",
     "pdf-parse": "^2.4.5",
     "playwright": "^1.59.1",
@@ -49,6 +51,7 @@
     "@types/eventsource": "^1.1.15",
     "@types/inquirer": "^9.0.7",
     "@types/node": "^22.0.0",
+    "@types/node-notifier": "^8.0.5",
     "@types/ws": "^8.5.12",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0"

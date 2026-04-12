@@ -30,9 +30,11 @@ import { createToolRegistry } from '../src/core/tool-registry.js';
 import { createMemoryProvider } from '../src/core/memory-provider.js';
 import { BuiltInTools } from '../src/tools/builtin.js';
 import { progressTracker } from '../src/utils/progress.js';
-import { createOutputCoordinator } from '../src/utils/output.js';
+import { createOutputCoordinator, createStreamingOutput } from '../src/utils/output.js';
 import { getArtifactOutputDir, getDesktopPath, resolveOutputPath, resolveUserPath } from '../src/utils/path-resolution.js';
 import { detectRequestedExportFormat, selectPreferredExportTool } from '../src/core/export-intent.js';
+import { buildPlanPermissionBatchPrompt, collectPlanPermissionRequirements } from '../src/core/plan-permission-prescan.js';
+import { TerminalManager } from '../src/core/output/terminal-manager.js';
 import { buildFallbackIntentContract } from '../src/core/tool-intent-contract.js';
 import { validateToolCallsAgainstContract } from '../src/core/tool-call-validator.js';
 import { HybridClient } from '../src/llm/providers/hybrid.js';
@@ -44,11 +46,14 @@ import { ResponseTurnExecutor } from '../src/core/response-turn-executor.js';
 import { ResponseTurnProcessor } from '../src/core/response-turn-processor.js';
 import { KnownGapManager } from '../src/core/known-gap-manager.js';
 import { SkillLearningService } from '../src/core/skill-learning-service.js';
+import { CheckpointManager } from '../src/core/checkpoint-manager.js';
+import { PlanExecutionService } from '../src/core/plan-execution-service.js';
 import { createModerator } from '../src/core/content-moderator.js';
 import { PlannedToolArgsResolver } from '../src/core/planned-tool-args-resolver.js';
 import { AgentInteractionService } from '../src/core/agent-interaction-service.js';
-import { buildTaskContextJsonPayload, createAgentCheckpoint } from '../src/core/agent-graph-state.js';
+import { buildTaskContextJsonPayload, createAgentCheckpoint, deriveCheckpointFromUnifiedAgentState } from '../src/core/agent-graph-state.js';
 import { createAgentGraphRunner } from '../src/core/agent-graph-runner.js';
+import { ReActStepRuntime } from '../src/core/react-step-runtime.js';
 import { TaskSynthesisService } from '../src/core/task-synthesis-service.js';
 import { AgentToolCallService } from '../src/core/agent-tool-call-service.js';
 import { ToolExecutionGuard } from '../src/core/tool-execution-guard.js';
@@ -65,6 +70,7 @@ import { BrowserActionHandler } from '../src/core/direct-actions/handlers/browse
 import { BrowserWorkflowService } from '../src/browser-agent/workflows/browser-workflow-service.js';
 import { buildBrowserWorkflowQuickFixDrafts } from '../src/browser-agent/workflows/browser-workflow-quick-fix.js';
 import { BrowserActionPlanner } from '../src/browser-agent/planner/action-planner.js';
+import { createOrganization } from '../src/core/organization/manager.js';
 import { runBrowserAutomation } from '../src/utils/browser-automation.js';
 import { extractDocxText, validateDocxContent } from '../src/utils/docx-validation.js';
 import { extractPdfText } from '../src/utils/pdf-validation.js';
@@ -364,6 +370,163 @@ function testOutputCoordinatorPausesNonPermissionChannels(): void {
     { channel: 'process', text: 'process line' },
     { channel: 'notification', text: 'notify line' },
   ]);
+}
+
+async function testStreamingOutputPauseResume(): Promise<void> {
+  const streamed: string[] = [];
+  const output = createStreamingOutput({ speed: 0, showCursor: false });
+  const stdout = process.stdout as NodeJS.WriteStream & { write: (chunk: string | Uint8Array) => boolean };
+  const originalWrite = stdout.write.bind(process.stdout);
+
+  stdout.write = ((chunk: string | Uint8Array) => {
+    streamed.push(typeof chunk === 'string' ? chunk : chunk.toString());
+    return true;
+  }) as typeof stdout.write;
+
+  try {
+    output.pause('permission:req');
+    const streamPromise = output.stream('stream-safe');
+    await Promise.resolve();
+    assert.equal(streamed.join(''), '');
+    output.resume('permission:req');
+    await streamPromise;
+    assert.equal(streamed.join(''), 'stream-safe');
+  } finally {
+    stdout.write = originalWrite as typeof stdout.write;
+  }
+}
+
+async function testCollectPlanPermissionRequirementsFiltersGrantedAndSafe(tempDir: string): Promise<void> {
+  const permissionDir = path.join(tempDir, 'permissions-plan-prescan');
+  const manager = new PermissionManager(permissionDir);
+  await manager.initialize();
+  manager.grantPermission('network_request');
+
+  const requirements = collectPlanPermissionRequirements({
+    id: 'plan_1',
+    originalTask: 'run dangerous plan',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [
+      {
+        id: 'step_1',
+        description: '执行命令',
+        status: 'pending',
+        toolCalls: [{ name: 'execute_command', args: { command: 'curl https://example.com' } }],
+      },
+      {
+        id: 'step_2',
+        description: '访问网页',
+        status: 'pending',
+        toolCalls: [{ name: 'fetch_url', args: { url: 'https://example.com' } }],
+      },
+      {
+        id: 'step_3',
+        description: '只读文件',
+        status: 'pending',
+        toolCalls: [{ name: 'read_file', args: { path: path.join(tempDir, 'note.md') } }],
+      },
+    ],
+  }, manager);
+
+  assert.equal(requirements.length, 2);
+  assert.equal(requirements[0]?.type, 'command_execute');
+  assert.equal(requirements[0]?.isDangerous, true);
+  assert.equal(requirements[1]?.type, 'file_read');
+  assert.equal(requirements[1]?.isDangerous, false);
+}
+
+function testBuildPlanPermissionBatchPrompt(): void {
+  const prompt = buildPlanPermissionBatchPrompt([
+    {
+      type: 'command_execute',
+      resource: 'curl https://example.com',
+      toolName: 'execute_command',
+      stepIndex: 0,
+      stepDescription: '执行命令',
+      isDangerous: true,
+    },
+  ]);
+
+  assert.match(prompt, /计划执行前权限预检查/);
+  assert.match(prompt, /执行命令/);
+  assert.match(prompt, /task - 授权当前任务内同类操作/);
+}
+
+function testTerminalManagerSeparatesSystemOutput(): void {
+  let stdoutBuffer = '';
+  let stderrBuffer = '';
+
+  const stdout = {
+    write: (chunk: string | Uint8Array) => {
+      stdoutBuffer += typeof chunk === 'string' ? chunk : chunk.toString();
+      return true;
+    },
+  } as unknown as NodeJS.WriteStream;
+
+  const stderr = {
+    write: (chunk: string | Uint8Array) => {
+      stderrBuffer += typeof chunk === 'string' ? chunk : chunk.toString();
+      return true;
+    },
+  } as unknown as NodeJS.WriteStream;
+
+  const manager = new TerminalManager({
+    appBaseDir: path.join(os.tmpdir(), 'terminal-manager-separate'),
+    config: {
+      mode: 'development',
+      systemToStderr: true,
+      debugToFile: false,
+      channels: {
+        main: { target: 'stdout' },
+        system: { target: 'stderr', silentInProduction: true, enabledInProduction: true },
+        debug: { target: 'file', enabledInProduction: false },
+      },
+      agentcat: { displayInTerminal: true, useDesktopNotification: false },
+    },
+    stdout,
+    stderr,
+  });
+
+  manager.writeLine('main output');
+  manager.system('system output', { category: 'system' });
+  manager.close();
+
+  assert.match(stdoutBuffer, /main output/);
+  assert.doesNotMatch(stdoutBuffer, /system output/);
+  assert.match(stderrBuffer, /system output/);
+}
+
+function testTerminalManagerCanSilenceAgentCatInTerminal(): void {
+  let stderrBuffer = '';
+
+  const stderr = {
+    write: (chunk: string | Uint8Array) => {
+      stderrBuffer += typeof chunk === 'string' ? chunk : chunk.toString();
+      return true;
+    },
+  } as unknown as NodeJS.WriteStream;
+
+  const manager = new TerminalManager({
+    appBaseDir: path.join(os.tmpdir(), 'terminal-manager-agentcat-silent'),
+    config: {
+      mode: 'development',
+      systemToStderr: true,
+      debugToFile: false,
+      channels: {
+        main: { target: 'stdout' },
+        system: { target: 'stderr', silentInProduction: true, enabledInProduction: true },
+        debug: { target: 'file', enabledInProduction: false },
+      },
+      agentcat: { displayInTerminal: false, useDesktopNotification: false },
+    },
+    stderr,
+  });
+
+  manager.system('cat reminder', { category: 'agentcat' });
+  manager.close();
+
+  assert.equal(stderrBuffer, '');
 }
 
 async function testSandboxAllowedPathNormalization(tempDir: string): Promise<void> {
@@ -859,6 +1022,44 @@ function testTaskContextJsonPayload(): void {
   assert.equal(payload.taskContext.checkpoint?.node, 'finalize');
 }
 
+function testDeriveCheckpointIncludesReActResumeSummary(): void {
+  const checkpoint = deriveCheckpointFromUnifiedAgentState({
+    state: 'WAITING_CONFIRMATION',
+    lastUserInput: '继续任务',
+    messages: [],
+    pendingInteraction: {
+      type: 'plan_resume',
+      hasPlan: true,
+      hasResumeState: true,
+    },
+    planResume: {
+      originalTask: '继续任务',
+      nextStepIndex: 0,
+      blockedStepDescription: '执行修复脚本',
+      blockedReason: '需要授权',
+      resultCount: 1,
+      reactStep: {
+        phase: 'observation',
+        iteration: 2,
+        usedPlannedTools: true,
+        observationCount: 3,
+      },
+    },
+    toolBudget: {
+      iteration: 0,
+      toolCallCount: 0,
+      maxToolCallsPerTurn: 0,
+      maxIterations: 0,
+      lastStopReason: 'completed',
+      needsContinuation: false,
+    },
+  });
+
+  assert.equal(checkpoint.node, 'pause_for_input');
+  assert.match(checkpoint.summary || '', /当前 ReAct 阶段: observation/);
+  assert.match(checkpoint.summary || '', /已观察 3 次/);
+}
+
 async function testAgentGraphRunnerDirectAction(): Promise<void> {
   const agent = createAgent({ llm: new StubLLM() });
   const runner = createAgentGraphRunner({
@@ -912,6 +1113,83 @@ function testPlanCheckpointRiskSummary(): void {
   assert.equal(summary.hasOutboundDelivery, true);
   assert.match(text, /执行命令/);
   assert.match(text, /对外发送内容/);
+}
+
+async function testCheckpointManagerRequiresApprovalForRiskyStepWithoutPermission(): Promise<void> {
+  const manager = new CheckpointManager({
+    checkpoints: {
+      enabled: true,
+      riskyStepApproval: true,
+    },
+    permissionManager: {
+      getConfig: () => ({ autoGrantDangerous: false, askForPermissions: true }),
+      isGranted: () => false,
+    },
+  });
+
+  const result = await manager.checkpointBeforeStepExecution({
+    id: 'plan_1',
+    originalTask: '执行部署',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [],
+  }, {
+    id: 'step_1',
+    description: '执行部署命令',
+    status: 'pending',
+    toolCalls: [{ name: 'execute_command', args: { command: 'npm publish' } }],
+  }, 0);
+
+  assert.equal(result.approved, false);
+  assert.equal(result.skipStepOnReject, true);
+  assert.match(result.prompt || '', /执行命令/);
+  assert.match(result.prompt || '', /回复“否”会跳过当前步骤/);
+}
+
+async function testCheckpointManagerSupportsResultAcceptanceAndDynamicToolPreview(): Promise<void> {
+  const manager = new CheckpointManager({
+    checkpoints: {
+      enabled: true,
+      stepExecutionApproval: true,
+      stepResultApproval: true,
+    },
+    permissionManager: {
+      getConfig: () => ({ autoGrantDangerous: false, askForPermissions: true }),
+      isGranted: () => false,
+    },
+  });
+
+  const resultApproval = await manager.checkpointAfterStepExecution({
+    id: 'plan_1',
+    originalTask: '执行部署',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [{
+      id: 'step_1',
+      description: '执行部署命令',
+      status: 'pending',
+      toolCalls: [{ name: 'execute_command', args: { command: 'npm publish' } }],
+    }],
+  }, {
+    id: 'step_1',
+    description: '执行部署命令',
+    status: 'pending',
+    toolCalls: [{ name: 'execute_command', args: { command: 'npm publish' } }],
+  }, 0, '部署完成');
+  assert.equal(resultApproval.approved, false);
+  assert.match(resultApproval.prompt || '', /待验收的步骤结果/);
+  assert.match(resultApproval.prompt || '', /部署完成/);
+
+  const toolPreview = await manager.checkpointBeforeDynamicToolExecution('执行部署', [{
+    id: 'tool_1',
+    type: 'function',
+    function: {
+      name: 'execute_command',
+      arguments: JSON.stringify({ command: 'npm publish' }),
+    },
+  }]);
+  assert.equal(toolPreview.approved, false);
+  assert.match(toolPreview.prompt || '', /待确认的预测工具执行/);
 }
 
 async function testAgentGraphRunnerDirectActionApprovalCheckpoint(): Promise<void> {
@@ -2301,6 +2579,9 @@ async function testAgentInteractionService(): Promise<void> {
   const assistantMessages: string[] = [];
   let state = 'IDLE';
   let lastUserInput = '';
+  const resumeCalls: Array<{ note?: string; skipCurrentStep?: boolean; acceptPendingStepResult?: boolean; retryCurrentStep?: boolean }> = [];
+  const toolExecutionCalls: Array<{ confirmed: boolean; note?: string }> = [];
+  const skillAdoptionCalls: boolean[] = [];
 
   const service = new AgentInteractionService({
     addUserMessage: (content) => {
@@ -2310,7 +2591,15 @@ async function testAgentInteractionService(): Promise<void> {
       assistantMessages.push(content);
     },
     executePlan: async (originalTask) => `EXEC:${originalTask}`,
-    resumePlanExecution: async (_resumeState, note) => `RESUME:${note || 'none'}`,
+    resumePlanExecution: async (_resumeState, note, options) => {
+      resumeCalls.push({
+        note,
+        skipCurrentStep: options?.skipCurrentStep,
+        acceptPendingStepResult: options?.acceptPendingStepResult,
+        retryCurrentStep: options?.retryCurrentStep,
+      });
+      return `RESUME:${options?.skipCurrentStep ? 'skip' : options?.acceptPendingStepResult ? 'accept' : options?.retryCurrentStep ? `retry:${note || 'none'}` : (note || 'none')}`;
+    },
     chatWithPlanning: async (input) => `PLAN:${input}`,
     setState: (next) => {
       state = next;
@@ -2346,14 +2635,221 @@ async function testAgentInteractionService(): Promise<void> {
       results: [],
       blockedStepDescription: 'step',
       blockedReason: 'need auth',
+      currentStepState: {
+        phase: 'observation',
+        iteration: 2,
+        usedPlannedTools: true,
+        observations: [
+          { type: 'planned_tool', content: 'need auth', createdAt: new Date().toISOString() },
+        ],
+      },
     },
     prompt: 'resume',
   });
+
+  const resumeSnapshot = service.getPlanResumeSnapshot();
+  assert.equal(resumeSnapshot?.reactStep?.phase, 'observation');
+  assert.equal(resumeSnapshot?.reactStep?.observationCount, 1);
 
   const resumed = await service.respondToPendingInput('继续');
   assert.equal(resumed, 'RESUME:none');
   assert.equal(userMessages.includes('继续'), true);
   assert.equal(assistantMessages.length >= 0, true);
+
+  service.setPendingInteraction({
+    type: 'plan_resume',
+    originalTask: '风险步骤任务',
+    resumeState: {
+      originalTask: '风险步骤任务',
+      plan: { id: 'plan_checkpoint', originalTask: '风险步骤任务', currentStepIndex: 0, status: 'planning', steps: [] } as any,
+      nextStepIndex: 0,
+      results: [],
+      blockedStepDescription: '执行删除操作',
+      blockedReason: '当前高风险步骤需要你确认后才能继续执行。',
+      resumeKind: 'checkpoint',
+      skipStepOnReject: true,
+    },
+    prompt: 'checkpoint',
+  });
+
+  const skipped = await service.respondToPendingInput('否');
+  assert.equal(skipped, 'RESUME:skip');
+  assert.equal(resumeCalls.some(call => call.skipCurrentStep === true), true);
+
+  service.setPendingInteraction({
+    type: 'plan_resume',
+    originalTask: '验收步骤结果',
+    resumeState: {
+      originalTask: '验收步骤结果',
+      plan: { id: 'plan_accept', originalTask: '验收步骤结果', currentStepIndex: 1, status: 'planning', steps: [] } as any,
+      nextStepIndex: 1,
+      results: ['step-1'],
+      blockedStepDescription: '检查输出目录',
+      blockedReason: '当前步骤结果需要你验收后才能进入下一步。',
+      resumeKind: 'checkpoint',
+      checkpointStage: 'step_result',
+      checkpointStepIndex: 0,
+      pendingStepResult: '已输出到 dist/result.txt',
+    },
+    prompt: 'accept',
+  });
+
+  const accepted = await service.respondToPendingInput('继续');
+  assert.equal(accepted, 'RESUME:accept');
+  assert.equal(resumeCalls.some(call => call.acceptPendingStepResult === true), true);
+
+  service.setPendingInteraction({
+    type: 'plan_resume',
+    originalTask: '验收步骤结果',
+    resumeState: {
+      originalTask: '验收步骤结果',
+      plan: { id: 'plan_retry', originalTask: '验收步骤结果', currentStepIndex: 1, status: 'planning', steps: [] } as any,
+      nextStepIndex: 1,
+      results: ['step-1'],
+      blockedStepDescription: '检查输出目录',
+      blockedReason: '当前步骤结果需要你验收后才能进入下一步。',
+      resumeKind: 'checkpoint',
+      checkpointStage: 'step_result',
+      checkpointStepIndex: 0,
+      pendingStepResult: '已输出到 dist/result.txt',
+    },
+    prompt: 'accept',
+  });
+
+  const revised = await service.respondToPendingInput('改到 dist/final/result.txt');
+  assert.equal(revised, 'RESUME:retry:改到 dist/final/result.txt');
+  assert.equal(resumeCalls.some(call => call.retryCurrentStep === true && call.note === '改到 dist/final/result.txt'), true);
+
+  service.setPendingInteraction({
+    type: 'tool_execution',
+    originalTask: '执行危险命令',
+    prompt: 'tool-checkpoint',
+    callback: async (confirmed, params) => {
+      toolExecutionCalls.push({ confirmed, note: params?.note });
+      return confirmed ? `TOOL:${params?.note || 'run'}` : 'TOOL:cancel';
+    },
+  });
+
+  const toolRevised = await service.respondToPendingInput('命令改成 npm pack');
+  assert.equal(toolRevised, 'TOOL:命令改成 npm pack');
+  assert.equal(toolExecutionCalls.some(call => call.confirmed && call.note === '命令改成 npm pack'), true);
+
+  service.setPendingInteraction({
+    type: 'skill_adoption',
+    originalTask: '整理稳定工作流',
+    prompt: 'skill adoption prompt',
+    callback: async (confirmed) => {
+      skillAdoptionCalls.push(Boolean(confirmed));
+      return confirmed ? 'SKILL:adopted' : 'SKILL:kept';
+    },
+  });
+
+  const adopted = await service.respondToPendingInput('是');
+  assert.equal(adopted, 'SKILL:adopted');
+  assert.equal(skillAdoptionCalls.includes(true), true);
+
+  service.setPendingInteraction({
+    type: 'skill_adoption',
+    originalTask: '整理稳定工作流',
+    prompt: 'skill adoption prompt',
+    callback: async (confirmed) => confirmed ? 'SKILL:adopted' : 'SKILL:kept',
+  });
+
+  const kept = await service.respondToPendingInput('保留草稿');
+  assert.equal(kept, 'SKILL:kept');
+}
+
+async function testOrganizationContextBusSharesParentContext(tempDir: string): Promise<void> {
+  const enhancedMemory = createEnhancedMemoryManager(path.join(tempDir, 'org-memory'));
+  await enhancedMemory.initialize();
+  const contextScopeId = 'organization-test-session';
+
+  const prompts: Record<string, string[]> = {
+    orchestrator: [],
+    executor: [],
+  };
+
+  const fakeAgents = new Map<string, { chat: (input: string) => Promise<string> }>([
+    ['orchestrator', {
+      chat: async (input: string) => {
+        prompts.orchestrator.push(input);
+        return '简单任务，直接执行';
+      },
+    }],
+    ['executor', {
+      chat: async (input: string) => {
+        prompts.executor.push(input);
+        return '执行完成';
+      },
+    }],
+  ]);
+
+  const factory = {
+    createAgent(member: { id: string }) {
+      return fakeAgents.get(member.id);
+    },
+    getAgent(memberId: string) {
+      return fakeAgents.get(memberId);
+    },
+  };
+
+  const organization = createOrganization({
+    name: 'test-org',
+    agents: [
+      {
+        id: 'orchestrator',
+        name: 'Orchestrator',
+        role: 'orchestrator',
+        description: 'task orchestration',
+        status: 'idle',
+        capabilities: [],
+      },
+      {
+        id: 'executor',
+        name: 'Executor',
+        role: 'executor',
+        description: 'task execution',
+        status: 'idle',
+        capabilities: [],
+      },
+    ],
+    workflow: {
+      enabled: true,
+      defaultFlow: ['orchestrator', 'executor'],
+      autoSupervise: false,
+      allowFallback: false,
+    },
+  }, factory as any, {
+    enhancedMemory,
+    getContextScopeId: () => contextScopeId,
+  });
+
+  const result = await organization.processUserInput('帮我执行一个简单任务');
+  assert.equal(result, '执行完成');
+  assert.equal(prompts.orchestrator.length, 1);
+  assert.equal(prompts.executor.length, 1);
+  assert.match(prompts.executor[0] || '', /父级交接摘要/);
+  assert.match(prompts.executor[0] || '', /当前 Agent 摘要/);
+  assert.match(prompts.executor[0] || '', /协作链路/);
+  assert.doesNotMatch(prompts.executor[0] || '', /当前 Agent 上下文 \(JSON\)|父级 Agent 上下文 \(JSON\)|短期记忆 \(JSON\)/);
+
+  const laneId = organization.getAllLanes()[0]?.laneId || '';
+  const chain = organization.getContextBus().getAgentContextChain(laneId);
+  assert.equal(chain.length >= 2, true);
+  assert.equal(chain[1]?.parentId, chain[0]?.id);
+  assert.equal(enhancedMemory.getAgentShortTermMemory('executor').length > 0, true);
+
+  const graphSnapshot = organization.getContextBus().getCurrentSnapshot('graph', contextScopeId);
+  assert.ok(graphSnapshot);
+  assert.equal(graphSnapshot?.payload.metadata?.source, 'organization');
+  assert.equal(graphSnapshot?.payload.metadata?.memberName, 'Executor');
+
+  const taskStackSnapshot = organization.getContextBus().getCurrentSnapshot('task_stack', contextScopeId);
+  assert.ok(taskStackSnapshot);
+  assert.equal(taskStackSnapshot?.payload.taskContext?.recentTasks.length, 2);
+  assert.equal(taskStackSnapshot?.payload.taskContext?.recentTasks[0]?.title.includes('Orchestrator'), true);
+  assert.equal(taskStackSnapshot?.payload.taskContext?.recentTasks[1]?.title.includes('Executor'), true);
+  assert.equal(taskStackSnapshot?.payload.taskContext?.recentBindings.length, 1);
 }
 
 async function testWeatherToLarkRequestSkipsClarification(): Promise<void> {
@@ -3040,6 +3536,37 @@ async function testResponseTurnProcessorDefersFinalizationOnHandledNonStreamingT
 
   assert.equal(result.continueLoop, true);
   assert.equal(result.response, 'call tool now');
+  assert.equal(persistedMessages.length, 0);
+}
+
+async function testResponseTurnProcessorReturnsPausedPrompt(): Promise<void> {
+  const persistedMessages: Message[] = [];
+  const processor = new ResponseTurnProcessor({
+    llm: {
+      generate: async () => 'call tool now',
+      chatStream: undefined,
+    } as unknown as LLMProviderInterface,
+    responseStreamCollector: new ResponseStreamCollector(),
+    toolCallResponseCoordinator: {
+      coordinate: async () => ({
+        handled: false,
+        paused: true,
+        output: 'tool checkpoint prompt',
+        cleanResponse: 'call tool now',
+        toolCallSource: 'parsed' as const,
+      }),
+    },
+    finalResponseAssembler: new FinalResponseAssembler({
+      applyKnownGapNotice: (response) => response,
+      addMessage: (message) => {
+        persistedMessages.push(message);
+      },
+    }),
+  });
+
+  const result = await processor.execute([{ role: 'user', content: 'run tool' }], 'run tool');
+  assert.equal(result.continueLoop, false);
+  assert.equal(result.response, 'tool checkpoint prompt');
   assert.equal(persistedMessages.length, 0);
 }
 
@@ -5037,6 +5564,7 @@ async function testTaskExecutorServiceDelegatesToGraphRunner(): Promise<void> {
   assert.equal(typeof result.graphState.currentNode, 'string');
   assert.equal(result.executionContext.mode, 'fresh_task');
   assert.equal(result.executionPolicy.permissionStrategy, 'ask_dangerous');
+  assert.equal(result.executionPolicy.checkpoints.riskyStepApproval, true);
 }
 
 function testTaskExecutorServiceDescribesResumeContexts(): void {
@@ -5717,6 +6245,255 @@ async function testSkillLearningServiceCreatesTodo(tempDir: string): Promise<voi
   const todos = await skillManager.listLearningTodos();
   assert.equal(todos[0]?.suggestedSkill, 'markdown-to-docx-workflow');
   assert.match(todos[0]?.issueSummary || '', /markdown/);
+  assert.equal(todos[0]?.occurrenceCount, 1);
+  assert.equal(todos[0]?.draftedCandidateName, undefined);
+}
+
+async function testSkillLearningTodoAutoDraftsAfterRepeatedFailures(tempDir: string): Promise<void> {
+  const skillManager = createSkillManager(path.join(tempDir, 'repeated-todo-skills'));
+  await skillManager.initialize();
+
+  await skillManager.addLearningTodo({
+    sourceTask: '把 markdown 文件转成 word',
+    issueSummary: '缺少 markdown 转 docx 的稳定工作流。',
+    suggestedSkill: 'markdown-to-docx-workflow',
+    blockers: ['没有现成的 md 文件转 docx skill'],
+    nextActions: ['评估是否封装 markdown 导出 skill'],
+    tags: ['document', 'learning'],
+    confidence: 0.82,
+  });
+
+  const repeated = await skillManager.addLearningTodo({
+    sourceTask: '把 markdown 文件转成 word',
+    issueSummary: '缺少 markdown 转 docx 的稳定工作流。',
+    suggestedSkill: 'markdown-to-docx-workflow',
+    blockers: ['没有现成的 md 文件转 docx skill'],
+    nextActions: ['评估是否封装 markdown 导出 skill'],
+    tags: ['document', 'learning'],
+    confidence: 0.82,
+  });
+
+  assert.equal(repeated.occurrenceCount, 2);
+  assert.equal(Boolean(repeated.draftedCandidateName), true);
+
+  const candidates = await skillManager.listSkillCandidates();
+  assert.equal(candidates.some(item => item.name === repeated.draftedCandidateName), true);
+}
+
+async function testAgentQueuesSkillAutoAdoptionApproval(tempDir: string): Promise<void> {
+  const skillManager = createSkillManager(path.join(tempDir, 'auto-adopt-skills'));
+  await skillManager.initialize();
+
+  let adoptedCandidateName = '';
+  const originalAdoptCandidate = skillManager.adoptCandidate.bind(skillManager);
+  skillManager.adoptCandidate = (async (name: string) => {
+    adoptedCandidateName = name;
+    await originalAdoptCandidate(name);
+  }) as typeof skillManager.adoptCandidate;
+
+  const originalMaybeCreateCandidate = skillManager.maybeCreateCandidateFromExecution.bind(skillManager);
+  skillManager.maybeCreateCandidateFromExecution = (async (input) => {
+    const candidate = await originalMaybeCreateCandidate({
+      ...input,
+      refinement: {
+        ...input.refinement,
+        shouldCreate: true,
+        confidence: 0.91,
+        suggestedName: 'auto-adopt-skill',
+      },
+    });
+    return candidate;
+  }) as typeof skillManager.maybeCreateCandidateFromExecution;
+
+  const llm = new SequenceGenerateLLM([
+    '{"thought":"第一步已足够完成。","action":"finalize","finalResponse":"步骤一完成"}',
+    '{"thought":"第二步已足够完成。","action":"finalize","finalResponse":"步骤二完成"}',
+    '{"shouldCreate":true,"confidence":0.91,"refinedDescription":"高置信流程草稿","whenToUse":"整理稳定工作流","procedure":["步骤一","步骤二"],"verification":["确认结果"],"tags":["learning"],"qualitySummary":"稳定","suggestedName":"auto-adopt-skill"}',
+  ]);
+
+  const agent = createAgent({
+    llm,
+    skillManager,
+    config: {
+      skillLearning: {
+        autoDraftFromTodo: true,
+        autoDraftThreshold: 2,
+        autoAdoptAfterApproval: true,
+        autoAdoptMinConfidence: 0.75,
+      },
+    },
+  });
+
+  const result = await agent.executePlan('整理稳定工作流', {
+    id: 'plan_auto_adopt',
+    originalTask: '整理稳定工作流',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [
+      { id: 'step_1', description: '读取上下文', status: 'pending' },
+      { id: 'step_2', description: '沉淀稳定流程', status: 'pending' },
+    ],
+  });
+
+  assert.match(result, /任务完成/);
+  assert.equal(agent.getConfirmationStatus().type, 'skill_adoption');
+  assert.match(agent.getPendingInteractionDetails()?.prompt || '', /待确认的 skill 自动转正/);
+  assert.match(agent.getPendingInteractionDetails()?.prompt || '', /auto-adopt-skill/);
+
+  const adoptionResult = await agent.confirmAction(true);
+  assert.equal(adoptionResult, '已自动转正并启用 skill: auto-adopt-skill');
+  assert.equal(adoptedCandidateName, 'auto-adopt-skill');
+
+  const skills = await skillManager.listSkills();
+  assert.equal(skills.some(skill => skill.name === 'auto-adopt-skill' && skill.enabled), true);
+}
+
+async function testAdoptedSkillUsageAutoDraftsRevisionCandidate(tempDir: string): Promise<void> {
+  const skillsHome = path.join(tempDir, 'revision-skills');
+  const skillDir = path.join(skillsHome, 'stable-skill');
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(path.join(skillDir, 'SKILL.md'), [
+    '---',
+    'name: stable-skill',
+    'version: 1.0.0',
+    'description: Stable skill for repeated export workflows',
+    'tags: export, workflow',
+    'qualitySummary: Existing adopted workflow',
+    '---',
+    '',
+    '# stable-skill',
+    '',
+    '## When to Use',
+    'Use this skill for repeated export workflows.',
+    '',
+    '## Procedure',
+    '1. Validate input.',
+    '2. Generate output.',
+    '',
+    '## Verification',
+    '- Confirm the exported file exists.',
+    '- Confirm the response is truthful.',
+    '',
+  ].join('\n'), 'utf-8');
+
+  const skillManager = createSkillManager(skillsHome);
+  await skillManager.initialize();
+  skillManager.setLearningAutomation({
+    autoReviseAdoptedSkills: true,
+    autoReviseMinObservations: 3,
+    autoReviseMinFailures: 2,
+  });
+
+  await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'tool',
+    source: 'stable_export',
+    success: true,
+    summary: '导出成功，生成了 report-1.docx',
+  });
+  await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'tool',
+    source: 'stable_export',
+    success: false,
+    summary: '第二次导出失败，路径里有空格时没有正确处理',
+  });
+  const third = await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'command',
+    source: 'stable-skill command',
+    success: true,
+    summary: '第三次运行恢复成功，仍需要补充路径转义说明',
+  });
+
+  assert.equal(Boolean(third.revisionCandidate), true);
+  assert.match(third.revisionCandidate?.name || '', /stable-skill-revision/);
+
+  const usage = await skillManager.getSkillUsageSummary('stable-skill');
+  assert.equal(usage?.totalRuns, 3);
+  assert.equal(usage?.failureCount, 1);
+  assert.equal(usage?.lastRevisionCandidateName, third.revisionCandidate?.name);
+
+  const candidates = await skillManager.listSkillCandidates();
+  assert.equal(candidates.some(item => item.name === third.revisionCandidate?.name), true);
+}
+
+async function testRevisionCandidateFeedbackTracksLifecycle(tempDir: string): Promise<void> {
+  const skillsHome = path.join(tempDir, 'revision-feedback-skills');
+  const skillDir = path.join(skillsHome, 'stable-skill');
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(path.join(skillDir, 'SKILL.md'), [
+    '---',
+    'name: stable-skill',
+    'version: 1.0.0',
+    'description: Stable skill for repeated export workflows',
+    'tags: export, workflow',
+    'qualitySummary: Existing adopted workflow',
+    '---',
+    '',
+    '# stable-skill',
+    '',
+    '## When to Use',
+    'Use this skill for repeated export workflows.',
+  ].join('\n'), 'utf-8');
+
+  const skillManager = createSkillManager(skillsHome);
+  await skillManager.initialize();
+  skillManager.setLearningAutomation({
+    autoReviseAdoptedSkills: true,
+    autoReviseMinObservations: 3,
+    autoReviseMinFailures: 2,
+  });
+
+  await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'tool',
+    source: 'stable_export',
+    success: true,
+    summary: '导出成功，生成了 report-1.docx',
+  });
+  await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'tool',
+    source: 'stable_export',
+    success: false,
+    summary: '第二次导出失败，路径里有空格时没有正确处理',
+  });
+  const drafted = await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'command',
+    source: 'stable-skill command',
+    success: true,
+    summary: '第三次运行恢复成功，仍需要补充路径转义说明',
+  });
+
+  const draftName = drafted.revisionCandidate?.name || '';
+  assert.match(draftName, /stable-skill-revision/);
+
+  await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'tool',
+    source: 'stable_export',
+    success: false,
+    summary: '第四次仍失败，说明转义与异常处理仍未覆盖',
+  });
+  await skillManager.recordSkillUsageObservation({
+    skillName: 'stable-skill',
+    trigger: 'tool',
+    source: 'stable_export',
+    success: false,
+    summary: '第五次继续失败，revision 草稿已经值得优先转正',
+  });
+
+  const feedback = await skillManager.getRevisionCandidateFeedbackSummary(draftName);
+  assert.equal(feedback?.postDraftRuns, 2);
+  assert.equal(feedback?.postDraftFailures, 2);
+  assert.equal(feedback?.status, 'promotable');
+
+  await skillManager.adoptCandidate(draftName);
+  const adoptedFeedback = await skillManager.getRevisionCandidateFeedbackSummary(draftName);
+  assert.equal(adoptedFeedback?.status, 'adopted');
+  assert.equal(Boolean(adoptedFeedback?.adoptedAt), true);
 }
 
 async function testSkillLearningServiceSkipsPlaceholderExportTodo(tempDir: string): Promise<void> {
@@ -5853,11 +6630,22 @@ async function testKnownGapManagerBuildsNotice(tempDir: string): Promise<void> {
     tags: ['document'],
     confidence: 0.9,
   });
+  await skillManager.addLearningTodo({
+    sourceTask: '把 docx 转成 pdf',
+    issueSummary: '缺少 docx 转 pdf 的稳定工作流。',
+    suggestedSkill: 'docx-to-pdf-workflow',
+    blockers: ['没有 docx 转换器'],
+    nextActions: ['实现 docx 提取', '接入 pdf 导出'],
+    tags: ['document'],
+    confidence: 0.9,
+  });
 
   const manager = new KnownGapManager(skillManager);
   await manager.prepare('把 docx 转成 pdf');
 
   assert.match(manager.getNotice(), /^这是已知能力缺口：/);
+  assert.match(manager.getNotice(), /重复出现 2 次/);
+  assert.match(manager.getNotice(), /已自动起草 candidate/);
   assert.match(manager.getContext(), /Known skill gap detected/);
   assert.match(manager.applyNotice('可以先降级处理。'), /^这是已知能力缺口：/);
 }
@@ -6214,6 +7002,190 @@ async function testExecutePlanStopsAfterFailedStep(): Promise<void> {
   assert.equal(executeCount, 1);
 }
 
+async function testExecutePlanSkipsCurrentStepAfterCheckpointRejection(): Promise<void> {
+  const service = new PlanExecutionService({
+    onStepStart: () => {},
+    onStepCompleted: () => {},
+    onStepFailed: () => {},
+    executeStepWithReAct: async (_originalTask, _plan, step) => ({
+      status: 'completed',
+      output: `completed:${step.id}`,
+      state: {
+        phase: 'completed',
+        iteration: 1,
+        usedPlannedTools: false,
+        observations: [],
+      },
+    }),
+    executePlannedToolCalls: async () => 'unused',
+    generateStepResponse: async () => 'unused',
+    shouldPauseForUserInput: () => false,
+    pausePlanForUserInput: () => 'paused',
+    processSkillLearning: async () => {},
+    synthesizeResults: async (_originalTask, results) => results.join('\n---\n'),
+  });
+
+  const summary = await service.executePlan('执行任务', {
+    id: 'plan_skip_step',
+    originalTask: '执行任务',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [
+      { id: 'step_1', description: '高风险步骤', status: 'pending' },
+      { id: 'step_2', description: '普通步骤', status: 'pending' },
+    ],
+  }, 0, [], undefined, true);
+
+  assert.match(summary, /已跳过：你拒绝执行当前高风险步骤/);
+  assert.match(summary, /completed:step_2/);
+}
+
+async function testReActStepRuntimeRecoversFromNonBlockingError(): Promise<void> {
+  const runtime = new ReActStepRuntime({
+    decideNextAction: async (_input, state) => {
+      if (state.observations.some(item => item.type === 'dynamic_action')) {
+        return {
+          thought: '已经拿到恢复后的观察，可以结束当前步骤。',
+          action: 'finalize',
+          finalResponse: '恢复后的步骤结果',
+        };
+      }
+
+      return {
+        thought: '计划工具失败了，但不是阻塞性错误，尝试补做一轮动作。',
+        action: 'investigate',
+        instruction: '执行补救动作并返回新的观察。',
+      };
+    },
+    executePlannedToolCalls: async () => {
+      throw new Error('temporary parser mismatch');
+    },
+    executeDynamicAction: async () => '补救动作已完成',
+    generateStepResponse: async () => 'fallback step response',
+    shouldPauseForUserInput: () => false,
+  });
+
+  const result = await runtime.execute({
+    originalTask: '分析文件并整理结果',
+    plan: {
+      id: 'plan_react_recover',
+      originalTask: '分析文件并整理结果',
+      currentStepIndex: 0,
+      status: 'executing',
+      steps: [{
+        id: 'step_1',
+        description: '读取并分析关键内容',
+        status: 'pending',
+        toolCalls: [{ name: 'read_file', args: { path: '/tmp/demo.txt' } }],
+      }],
+    },
+    step: {
+      id: 'step_1',
+      description: '读取并分析关键内容',
+      status: 'pending',
+      toolCalls: [{ name: 'read_file', args: { path: '/tmp/demo.txt' } }],
+    },
+    stepIndex: 0,
+    totalSteps: 1,
+    previousResults: [],
+    stepContext: '执行当前步骤',
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.output, '恢复后的步骤结果');
+  assert.equal(result.state.observations.some(item => item.type === 'error' && /temporary parser mismatch/.test(item.content)), true);
+  assert.equal(result.state.observations.some(item => item.type === 'dynamic_action' && /补救动作已完成/.test(item.content)), true);
+}
+
+async function testPlanExecutionServiceStoresReActStateWhenPaused(): Promise<void> {
+  let capturedResumeState: any;
+  const service = new PlanExecutionService({
+    onStepStart: () => {},
+    onStepCompleted: () => {},
+    onStepFailed: () => {},
+    executeStepWithReAct: async () => ({
+      status: 'paused',
+      errorMessage: '需要授权',
+      state: {
+        phase: 'paused',
+        iteration: 1,
+        usedPlannedTools: true,
+        observations: [{ type: 'planned_tool', content: '等待授权', createdAt: new Date().toISOString() }],
+      },
+    }),
+    executePlannedToolCalls: async () => 'unused',
+    generateStepResponse: async () => 'unused',
+    shouldPauseForUserInput: () => true,
+    pausePlanForUserInput: (resumeState) => {
+      capturedResumeState = resumeState;
+      return 'paused';
+    },
+    processSkillLearning: async () => {},
+    synthesizeResults: async () => 'done',
+  });
+
+  const result = await service.executePlan('执行任务', {
+    id: 'plan_pause_state',
+    originalTask: '执行任务',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [{
+      id: 'step_1',
+      description: '执行需要授权的操作',
+      status: 'pending',
+    }],
+  });
+
+  assert.equal(result, 'paused');
+  assert.equal(capturedResumeState?.currentStepState?.phase, 'paused');
+  assert.equal(capturedResumeState?.currentStepState?.usedPlannedTools, true);
+}
+
+async function testPlanExecutionServicePausesForStepResultAcceptance(): Promise<void> {
+  let capturedResumeState: any;
+  const service = new PlanExecutionService({
+    onStepStart: () => {},
+    onStepCompleted: () => {},
+    onStepFailed: () => {},
+    checkpointAfterStepExecution: async () => ({
+      approved: false,
+      blockedReason: '当前步骤结果需要你验收后才能进入下一步。',
+      prompt: 'accept current result',
+    }),
+    executeStepWithReAct: async () => ({
+      status: 'completed',
+      output: '生成了 dist/output.txt',
+      state: {
+        phase: 'completed',
+        iteration: 1,
+        usedPlannedTools: true,
+        observations: [],
+      },
+    }),
+    executePlannedToolCalls: async () => 'unused',
+    generateStepResponse: async () => 'unused',
+    shouldPauseForUserInput: () => false,
+    pausePlanForUserInput: (resumeState) => {
+      capturedResumeState = resumeState;
+      return 'paused-for-acceptance';
+    },
+    processSkillLearning: async () => {},
+    synthesizeResults: async () => 'done',
+  });
+
+  const result = await service.executePlan('执行任务', {
+    id: 'plan_acceptance',
+    originalTask: '执行任务',
+    currentStepIndex: 0,
+    status: 'planning',
+    steps: [{ id: 'step_1', description: '执行命令', status: 'pending', toolCalls: [{ name: 'execute_command', args: { command: 'echo ok' } }] }],
+  });
+
+  assert.equal(result, 'paused-for-acceptance');
+  assert.equal(capturedResumeState?.checkpointStage, 'step_result');
+  assert.equal(capturedResumeState?.pendingStepResult, '生成了 dist/output.txt');
+}
+
 async function testAgentStoresArtifactOutputInMemory(): Promise<void> {
   const storedEntries: Array<{ key?: string; content: string }> = [];
   const agent = createAgent({
@@ -6558,6 +7530,11 @@ async function main(): Promise<void> {
     await runRegressionStep('testPermissionManagerAllowsLarkCliHelpCommands', () => testPermissionManagerAllowsLarkCliHelpCommands(tempDir));
     await runRegressionStep('testPermissionManagerParsesTaskScopedBatchAnswer', () => testPermissionManagerParsesTaskScopedBatchAnswer());
     await runRegressionStep('testOutputCoordinatorPausesNonPermissionChannels', () => testOutputCoordinatorPausesNonPermissionChannels());
+    await runRegressionStep('testStreamingOutputPauseResume', () => testStreamingOutputPauseResume());
+    await runRegressionStep('testCollectPlanPermissionRequirementsFiltersGrantedAndSafe', () => testCollectPlanPermissionRequirementsFiltersGrantedAndSafe(tempDir));
+    await runRegressionStep('testBuildPlanPermissionBatchPrompt', () => testBuildPlanPermissionBatchPrompt());
+    await runRegressionStep('testTerminalManagerSeparatesSystemOutput', () => testTerminalManagerSeparatesSystemOutput());
+    await runRegressionStep('testTerminalManagerCanSilenceAgentCatInTerminal', () => testTerminalManagerCanSilenceAgentCatInTerminal());
     await runRegressionStep('testSandboxAllowedPathNormalization', () => testSandboxAllowedPathNormalization(tempDir));
     await runRegressionStep('testSandboxDefaultsToWorkspaceWhitelist', () => testSandboxDefaultsToWorkspaceWhitelist(tempDir));
     await runRegressionStep('testSandboxRejectsCommandCwdOutsideWhitelist', () => testSandboxRejectsCommandCwdOutsideWhitelist(tempDir));
@@ -6566,8 +7543,11 @@ async function main(): Promise<void> {
     await runRegressionStep('testSessionTaskStackContextSnapshot', () => testSessionTaskStackContextSnapshot());
     await runRegressionStep('testSessionTaskStackPersistence', () => testSessionTaskStackPersistence(tempDir));
     await runRegressionStep('testTaskContextJsonPayload', () => testTaskContextJsonPayload());
+    await runRegressionStep('testDeriveCheckpointIncludesReActResumeSummary', () => testDeriveCheckpointIncludesReActResumeSummary());
     await runRegressionStep('testAgentGraphRunnerDirectAction', () => testAgentGraphRunnerDirectAction());
     await runRegressionStep('testPlanCheckpointRiskSummary', () => testPlanCheckpointRiskSummary());
+    await runRegressionStep('testCheckpointManagerRequiresApprovalForRiskyStepWithoutPermission', () => testCheckpointManagerRequiresApprovalForRiskyStepWithoutPermission());
+    await runRegressionStep('testCheckpointManagerSupportsResultAcceptanceAndDynamicToolPreview', () => testCheckpointManagerSupportsResultAcceptanceAndDynamicToolPreview());
     await runRegressionStep('testAgentGraphRunnerDirectActionApprovalCheckpoint', () => testAgentGraphRunnerDirectActionApprovalCheckpoint());
     await runRegressionStep('testAgentGraphRunnerMainChain', () => testAgentGraphRunnerMainChain());
     await runRegressionStep('testAgentGraphRunnerAutoConfirmPlanExecutionOption', () => testAgentGraphRunnerAutoConfirmPlanExecutionOption());
@@ -6643,6 +7623,7 @@ async function main(): Promise<void> {
     await runRegressionStep('testCliSendsPendingInteractionPromptToLarkChat', () => testCliSendsPendingInteractionPromptToLarkChat());
     await runRegressionStep('testCliForwardsPermissionPromptToLarkAndConsumesLarkReply', () => testCliForwardsPermissionPromptToLarkAndConsumesLarkReply(tempDir));
     await runRegressionStep('testAgentInteractionService', () => testAgentInteractionService());
+    await runRegressionStep('testOrganizationContextBusSharesParentContext', () => testOrganizationContextBusSharesParentContext(tempDir));
     await runRegressionStep('testWeatherToLarkRequestSkipsClarification', () => testWeatherToLarkRequestSkipsClarification());
     await runRegressionStep('testHybridClientRouting', () => testHybridClientRouting());
     await runRegressionStep('testOllamaVisionService', () => testOllamaVisionService(tempDir));
@@ -6669,9 +7650,18 @@ async function main(): Promise<void> {
     await runRegressionStep('testPlaceholderResolutionFallsBackToToolContent', () => testPlaceholderResolutionFallsBackToToolContent());
     await runRegressionStep('testPlaceholderResolutionPrefersWrittenTextContent', () => testPlaceholderResolutionPrefersWrittenTextContent());
     await runRegressionStep('testExecutePlanStopsAfterFailedStep', () => testExecutePlanStopsAfterFailedStep());
+    await runRegressionStep('testExecutePlanSkipsCurrentStepAfterCheckpointRejection', () => testExecutePlanSkipsCurrentStepAfterCheckpointRejection());
+    await runRegressionStep('testReActStepRuntimeRecoversFromNonBlockingError', () => testReActStepRuntimeRecoversFromNonBlockingError());
+    await runRegressionStep('testPlanExecutionServiceStoresReActStateWhenPaused', () => testPlanExecutionServiceStoresReActStateWhenPaused());
+    await runRegressionStep('testPlanExecutionServicePausesForStepResultAcceptance', () => testPlanExecutionServicePausesForStepResultAcceptance());
+    await runRegressionStep('testResponseTurnProcessorReturnsPausedPrompt', () => testResponseTurnProcessorReturnsPausedPrompt());
     await runRegressionStep('testAgentStoresArtifactOutputInMemory', () => testAgentStoresArtifactOutputInMemory());
     await runRegressionStep('testSkillLearningServiceCandidateAssessment', () => testSkillLearningServiceCandidateAssessment());
+    await runRegressionStep('testAgentQueuesSkillAutoAdoptionApproval', () => testAgentQueuesSkillAutoAdoptionApproval(tempDir));
+    await runRegressionStep('testAdoptedSkillUsageAutoDraftsRevisionCandidate', () => testAdoptedSkillUsageAutoDraftsRevisionCandidate(tempDir));
+    await runRegressionStep('testRevisionCandidateFeedbackTracksLifecycle', () => testRevisionCandidateFeedbackTracksLifecycle(tempDir));
     await runRegressionStep('testSkillLearningServiceCreatesTodo', () => testSkillLearningServiceCreatesTodo(tempDir));
+    await runRegressionStep('testSkillLearningTodoAutoDraftsAfterRepeatedFailures', () => testSkillLearningTodoAutoDraftsAfterRepeatedFailures(tempDir));
     await runRegressionStep('testSkillLearningServiceSkipsPlaceholderExportTodo', () => testSkillLearningServiceSkipsPlaceholderExportTodo(tempDir));
     await runRegressionStep('testLearningTodoCanSeedCandidate', () => testLearningTodoCanSeedCandidate(tempDir));
     await runRegressionStep('testToolExecutionGuardRejectsPlaceholderExportInput', () => testToolExecutionGuardRejectsPlaceholderExportInput());

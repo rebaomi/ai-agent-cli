@@ -1,12 +1,44 @@
 import type {
   ContextBusCurrentPointer,
   ContextBusLayer,
-  ContextBusQuery,
   ContextBusSnapshot,
+  ContextBusQuery,
   ContextBusSnapshotPayload,
   ContextBusState,
 } from '../types/index.js';
 import { CONTEXT_BUS_SCHEMA_VERSION } from '../types/index.js';
+
+export interface ContextBusMemoryResolver {
+  getLongTermMemoryIds?: (agentId: string) => string[];
+  getShortTermMemory?: (agentId: string) => unknown[];
+}
+
+export interface PushAgentContextInput {
+  agentId: string;
+  scopeId: string;
+  state: Record<string, unknown>;
+  parentSnapshotId?: string;
+  taskId?: string;
+  title?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentContextQueryOptions {
+  scopeId: string;
+  includeParent?: boolean;
+  includeMemory?: boolean;
+}
+
+export interface AgentContextView {
+  current?: ContextBusSnapshot;
+  parent?: ContextBusSnapshot;
+  chain: ContextBusSnapshot[];
+}
+
+export interface ContextBusOrganizationSyncTarget {
+  shareContext: (agentId: string, snapshot: ContextBusSnapshot) => Promise<void> | void;
+}
 
 export interface CaptureContextSnapshotInput {
   layer: ContextBusLayer;
@@ -21,11 +53,16 @@ export interface CaptureContextSnapshotInput {
 export class ContextBus {
   private readonly snapshots = new Map<string, ContextBusSnapshot>();
   private readonly currentPointers = new Map<string, ContextBusCurrentPointer>();
+  private memoryResolver?: ContextBusMemoryResolver;
 
   constructor(initialState?: ContextBusState) {
     if (initialState) {
       this.replaceState(initialState);
     }
+  }
+
+  setMemoryResolver(resolver?: ContextBusMemoryResolver): void {
+    this.memoryResolver = resolver;
   }
 
   replaceState(state?: ContextBusState): void {
@@ -97,6 +134,104 @@ export class ContextBus {
       snapshotId: snapshot.id,
     });
     return snapshot;
+  }
+
+  pushAgentContext(input: PushAgentContextInput): ContextBusSnapshot {
+    const payload: ContextBusSnapshotPayload = {
+      metadata: {
+        agentId: input.agentId,
+        state: input.state,
+        tags: input.tags || [],
+        ...(input.metadata || {}),
+        ...(this.memoryResolver && {
+          longTermMemoryIds: this.memoryResolver.getLongTermMemoryIds?.(input.agentId) || [],
+          shortTermMemory: this.memoryResolver.getShortTermMemory?.(input.agentId) || [],
+        }),
+      },
+    };
+
+    return this.captureSnapshot({
+      layer: 'agent',
+      scopeId: input.scopeId,
+      payload,
+      parentId: input.parentSnapshotId,
+      taskId: input.taskId,
+      title: input.title || input.agentId,
+    });
+  }
+
+  popAgentContext(scopeId: string, snapshotId?: string): void {
+    const current = snapshotId
+      ? this.snapshots.get(snapshotId)
+      : this.getCurrentSnapshot('agent', scopeId);
+    if (!current) {
+      return;
+    }
+
+    const parent = current.parentId ? this.snapshots.get(current.parentId) : undefined;
+    const pointerKey = this.getPointerKey('agent', scopeId);
+    if (parent && parent.layer === 'agent' && parent.scopeId === scopeId) {
+      this.currentPointers.set(pointerKey, {
+        layer: 'agent',
+        scopeId,
+        snapshotId: parent.id,
+      });
+      return;
+    }
+
+    this.currentPointers.delete(pointerKey);
+  }
+
+  getContextForAgent(agentId: string, options: AgentContextQueryOptions): AgentContextView {
+    const snapshots = this.findSnapshots({
+      layer: 'agent',
+      scopeId: options.scopeId,
+    }).filter((snapshot) => snapshot.payload.metadata?.agentId === agentId);
+    const current = snapshots[0] ? cloneSnapshot(snapshots[0]) : undefined;
+    const parentSnapshot = options.includeParent && current?.parentId
+      ? this.snapshots.get(current.parentId)
+      : undefined;
+    const parent = parentSnapshot ? cloneSnapshot(parentSnapshot) : undefined;
+    const chain = current
+      ? this.getLineage(current.id)
+        .filter(snapshot => snapshot.layer === 'agent')
+        .map(snapshot => cloneSnapshot(snapshot))
+      : [];
+
+    if (!options.includeMemory && current?.payload.metadata) {
+      current.payload.metadata = stripMemoryMetadata(current.payload.metadata);
+    }
+    if (!options.includeMemory && parent?.payload.metadata) {
+      parent.payload.metadata = stripMemoryMetadata(parent.payload.metadata);
+    }
+
+    return {
+      current,
+      parent,
+      chain,
+    };
+  }
+
+  getAgentContextChain(scopeId: string): ContextBusSnapshot[] {
+    return this.findSnapshots({
+      layer: 'agent',
+      scopeId,
+    }).sort((left, right) => left.createdAt.localeCompare(right.createdAt)).map(snapshot => cloneSnapshot(snapshot));
+  }
+
+  async syncToOrganization(target: ContextBusOrganizationSyncTarget, scopeId?: string): Promise<void> {
+    const snapshots = this.findSnapshots({
+      layer: 'agent',
+      ...(scopeId ? { scopeId } : {}),
+    }).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+
+    for (const snapshot of snapshots) {
+      const agentId = snapshot.payload.metadata?.agentId;
+      if (typeof agentId !== 'string' || !agentId.trim()) {
+        continue;
+      }
+      await target.shareContext(agentId, cloneSnapshot(snapshot));
+    }
   }
 
   getSnapshot(id: string): ContextBusSnapshot | undefined {
@@ -188,6 +323,20 @@ export class ContextBus {
   private getPointerKey(layer: ContextBusLayer, scopeId: string): string {
     return `${scopeId}::${layer}`;
   }
+}
+
+function stripMemoryMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const clone = { ...metadata };
+  delete clone.longTermMemoryIds;
+  delete clone.shortTermMemory;
+  return clone;
+}
+
+function cloneSnapshot(snapshot: ContextBusSnapshot): ContextBusSnapshot {
+  return {
+    ...snapshot,
+    payload: JSON.parse(JSON.stringify(snapshot.payload)),
+  };
 }
 
 function createContextSnapshotId(): string {

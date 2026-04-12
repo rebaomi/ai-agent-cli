@@ -7,6 +7,7 @@ export interface SkillLearningCandidate {
   name: string;
   path: string;
   sourceTask: string;
+  confidence?: number;
 }
 
 export interface SkillLearningManager {

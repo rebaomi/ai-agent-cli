@@ -27,7 +27,10 @@ import { AgentToolCallService } from './agent-tool-call-service.js';
 import { AgentPlanRuntimeService } from './agent-plan-runtime-service.js';
 import { AgentMessageViewService } from './agent-message-view-service.js';
 import { AgentToolExecutionLogger } from './agent-tool-execution-logger.js';
+import { ReActStepRuntime, type ReActStepDecision, type ReActStepExecutionInput } from './react-step-runtime.js';
+import { CheckpointManager } from './checkpoint-manager.js';
 import type { IntentResolver } from './intent-resolver.js';
+import type { PermissionManager } from './permission-manager.js';
 
 interface AgentRuntimeEvent {
   type: string;
@@ -43,6 +46,7 @@ export interface AgentRuntimeFactoryOptions {
   skillManager?: any;
   planner?: Planner;
   intentResolver?: IntentResolver;
+  permissionManager?: Pick<PermissionManager, 'getConfig' | 'isGranted'>;
   onSkillInstallNeeded?: (skills: string[]) => Promise<void>;
   agentRole?: string;
   contextManager: ContextManager;
@@ -65,6 +69,7 @@ export interface AgentRuntimeFactoryOptions {
   addMessage: (message: Message) => void;
   getMessages: () => Message[];
   generateResponse: () => Promise<string>;
+  refreshTools?: () => Promise<void>;
 }
 
 export interface AgentRuntimeComponents {
@@ -83,6 +88,20 @@ export interface AgentRuntimeComponents {
 }
 
 export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions): AgentRuntimeComponents {
+  if (options.skillManager && typeof options.skillManager.setLearningAutomation === 'function') {
+    options.skillManager.setLearningAutomation(options.config.skillLearning && typeof options.config.skillLearning === 'object'
+      ? options.config.skillLearning as {
+          autoDraftFromTodo?: boolean;
+          autoDraftThreshold?: number;
+          autoAdoptAfterApproval?: boolean;
+          autoAdoptMinConfidence?: number;
+          autoReviseAdoptedSkills?: boolean;
+          autoReviseMinObservations?: number;
+          autoReviseMinFailures?: number;
+        }
+      : undefined);
+  }
+
   const interactionMode = options.config.agentInteractionMode === 'chat' || options.config.agentInteractionMode === 'task'
     ? options.config.agentInteractionMode
     : 'auto';
@@ -121,6 +140,12 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
   let interactionService!: AgentInteractionService;
   let planExecutionService!: PlanExecutionService;
   let planningService!: AgentPlanningService;
+  const checkpointManager = new CheckpointManager({
+    permissionManager: options.permissionManager,
+    checkpoints: (options.config.checkpoints && typeof options.config.checkpoints === 'object')
+      ? options.config.checkpoints as any
+      : undefined,
+  });
   const knownGapManager = new KnownGapManager(options.skillManager);
   const messageViewService = new AgentMessageViewService({
     getMessages: () => options.getMessages(),
@@ -222,6 +247,54 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
     runPreparedToolCalls: async (batch) => {
       await toolCallRunner.run(batch);
     },
+    previewPreparedToolCalls: async ({ userInput, assistantContent, batch }) => {
+      const checkpoint = await checkpointManager.checkpointBeforeDynamicToolExecution(userInput, batch.toolCalls);
+      if (checkpoint.approved) {
+        return { blocked: false };
+      }
+
+      interactionService.setPendingInteraction({
+        type: 'tool_execution',
+        originalTask: userInput,
+        effectiveInput: userInput,
+        prompt: checkpoint.prompt,
+        callback: async (confirmed, params) => {
+          if (!confirmed) {
+            return '已取消当前预测工具执行。';
+          }
+
+          const note = typeof params?.note === 'string' ? params.note.trim() : '';
+          if (note) {
+            const refinedInput = [userInput.trim(), `工具执行前的用户补充: ${note}`].filter(Boolean).join('\n');
+            options.setLastUserInput(refinedInput);
+            options.setState('THINKING');
+            return options.generateResponse();
+          }
+
+          const assistantMessage = toolCallConversationBridge.createAssistantToolCallMessage(
+            assistantContent,
+            batch,
+            {
+              fallbackContent: assistantContent ? undefined : 'Using tool...',
+              omitIfEmpty: true,
+            },
+          );
+
+          options.setState('TOOL_CALLING');
+          if (assistantMessage) {
+            options.addMessage(assistantMessage);
+          }
+          await toolCallRunner.run(batch);
+          return options.generateResponse();
+        },
+      });
+      options.setState('WAITING_CONFIRMATION');
+
+      return {
+        blocked: true,
+        prompt: checkpoint.prompt,
+      };
+    },
   });
   const responseStreamCollector = new ResponseStreamCollector({
     onChunk: (chunk) => {
@@ -238,6 +311,13 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
     llm: options.llm,
     skillManager: options.skillManager,
     onSkillLearning: (candidate) => {
+      maybeQueueSkillAdoptionApproval({
+        candidateName: candidate.name,
+        candidatePath: candidate.path,
+        sourceTask: candidate.sourceTask,
+        confidence: candidate.confidence,
+        trigger: 'successful_task',
+      });
       options.onEvent?.({
         type: 'skill_learning',
         content: `已基于本次成功任务生成候选 skill 草稿: ${candidate.name}`,
@@ -245,17 +325,31 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
           candidateName: candidate.name,
           candidatePath: candidate.path,
           sourceTask: candidate.sourceTask,
+          confidence: candidate.confidence,
         },
       });
     },
     onSkillLearningTodo: (todo) => {
+      if (todo.draftedCandidateName) {
+        maybeQueueSkillAdoptionApproval({
+          candidateName: todo.draftedCandidateName,
+          candidatePath: todo.draftedCandidatePath,
+          sourceTask: todo.sourceTask,
+          confidence: todo.draftedCandidateConfidence ?? todo.confidence,
+          trigger: 'repeated_known_gap',
+        });
+      }
       options.onEvent?.({
         type: 'skill_learning_todo',
-        content: `已记录待学习 skill todo: ${todo.suggestedSkill}`,
+        content: todo.draftedCandidateName
+          ? `已记录待学习 skill todo，并自动生成候选草稿: ${todo.suggestedSkill} -> ${todo.draftedCandidateName}`
+          : `已记录待学习 skill todo: ${todo.suggestedSkill}`,
         skillLearningTodo: {
           todoId: todo.id,
           suggestedSkill: todo.suggestedSkill,
           sourceTask: todo.sourceTask,
+          occurrenceCount: todo.occurrenceCount,
+          draftedCandidateName: todo.draftedCandidateName,
         },
       });
     },
@@ -294,8 +388,8 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
     setLastUserInput: (input) => {
       options.setLastUserInput(input);
     },
-    executePlan: (originalTask, plan, startStepIndex, existingResults) => (
-      planExecutionService.executePlan(originalTask, plan, startStepIndex, existingResults)
+    executePlan: (originalTask, plan, startStepIndex, existingResults, currentStepState, skipCurrentStep) => (
+      planExecutionService.executePlan(originalTask, plan, startStepIndex, existingResults, currentStepState, skipCurrentStep)
     ),
     resolvePlannedToolArgs: (args) => plannedToolArgsResolver.resolve(args),
     prepareToolCallsForExecution: (userInput, assistantContent, toolCalls, useModelContract) => (
@@ -307,6 +401,23 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
       throwOnToolError: true,
       collectOutputs: true,
     }),
+  });
+  const reactStepRuntime = new ReActStepRuntime({
+    maxIterations: 6,
+    decideNextAction: async (input, state) => decideNextReActStepAction(options.llm, input, state),
+    executePlannedToolCalls: (step, stepContext) => planRuntimeService.executePlannedToolCalls(step, stepContext),
+    executeDynamicAction: async (prompt) => {
+      options.addMessage({ role: 'user', content: prompt });
+      return options.generateResponse();
+    },
+    generateStepResponse: async (prompt) => {
+      options.addMessage({ role: 'user', content: prompt });
+      return options.generateResponse();
+    },
+    shouldPauseForUserInput: (errorMessage) => planRuntimeService.shouldPausePlanForUserInput(errorMessage),
+    onStateNote: (message) => {
+      options.onEvent?.({ type: 'thinking', content: message });
+    },
   });
   planExecutionService = new PlanExecutionService({
     onStepStart: (plan, step, stepIndex, totalSteps) => {
@@ -359,6 +470,20 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
       });
       console.log(chalk.red(formatStepFailedConsole(stepIndex + 1, errorMessage)));
     },
+    checkpointBeforeStepExecution: (plan, step, stepIndex) => checkpointManager.checkpointBeforeStepExecution(plan, step, stepIndex),
+    checkpointAfterStepExecution: (plan, step, stepIndex, totalSteps, stepResult) => checkpointManager.checkpointAfterStepExecution(plan, step, stepIndex, stepResult),
+    executeStepWithReAct: (originalTask, plan, step, stepIndex, totalSteps, previousResults, stepContext, previousState) => (
+      reactStepRuntime.execute({
+        originalTask,
+        plan,
+        step,
+        stepIndex,
+        totalSteps,
+        previousResults,
+        stepContext,
+        previousState,
+      })
+    ),
     executePlannedToolCalls: (step, stepContext) => planRuntimeService.executePlannedToolCalls(step, stepContext),
     generateStepResponse: async (stepContext) => {
       options.addMessage({ role: 'user', content: stepContext });
@@ -379,7 +504,7 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
       options.addMessage({ role: 'assistant', content });
     },
     executePlan: (originalTask, plan) => planExecutionService.executePlan(originalTask, plan),
-    resumePlanExecution: (resumeState, note) => planRuntimeService.resumePlanExecution(resumeState, note),
+    resumePlanExecution: (resumeState, note, executionOptions) => planRuntimeService.resumePlanExecution(resumeState, note, executionOptions),
     chatWithPlanning: (input) => planningService.chatWithPlanning(input),
     detectComplexTask: (input) => planningService.detectComplexTask(input),
     generateDirectResponse: () => options.generateResponse(),
@@ -462,4 +587,136 @@ export function createAgentRuntimeComponents(options: AgentRuntimeFactoryOptions
     taskSynthesisService,
     getMessagesForLLM: () => messageViewService.getMessagesForLLM(),
   };
+
+  function maybeQueueSkillAdoptionApproval(input: {
+    candidateName: string;
+    candidatePath?: string;
+    sourceTask: string;
+    confidence?: number;
+    trigger: 'successful_task' | 'repeated_known_gap';
+  }): void {
+    if (!options.skillManager || typeof options.skillManager.shouldAutoAdoptCandidate !== 'function') {
+      return;
+    }
+
+    if (!options.skillManager.shouldAutoAdoptCandidate({ confidence: input.confidence })) {
+      return;
+    }
+
+    if (interactionService.getPendingInteraction()) {
+      return;
+    }
+
+    const confidenceText = typeof input.confidence === 'number' ? input.confidence.toFixed(2) : 'n/a';
+    const triggerText = input.trigger === 'successful_task'
+      ? '本次成功任务的可复用流程已经比较稳定。'
+      : '这个能力缺口已重复出现，并且已经自动起草了可转正草稿。';
+    const prompt = [
+      '## 待确认的 skill 自动转正',
+      '',
+      `候选 skill: ${input.candidateName}`,
+      `触发来源: ${input.trigger === 'successful_task' ? '成功任务学习' : '重复能力缺口'}`,
+      `原始任务: ${input.sourceTask}`,
+      `confidence: ${confidenceText}`,
+      input.candidatePath ? `草稿路径: ${input.candidatePath}` : undefined,
+      '',
+      triggerText,
+      '回复“是”会自动 adopt 并立即启用这个 skill；回复“否”则保留草稿，稍后可手动转正。',
+    ].filter((line): line is string => typeof line === 'string').join('\n');
+
+    interactionService.setPendingInteraction({
+      type: 'skill_adoption',
+      originalTask: input.sourceTask,
+      prompt,
+      callback: async (confirmed) => {
+        if (!confirmed) {
+          return '已保留当前 candidate 草稿，暂不自动转正。';
+        }
+
+        await options.skillManager.adoptCandidate(input.candidateName);
+        await options.refreshTools?.();
+        return `已自动转正并启用 skill: ${input.candidateName}`;
+      },
+    });
+  }
+}
+
+async function decideNextReActStepAction(
+  llm: Pick<LLMProviderInterface, 'generate'>,
+  input: ReActStepExecutionInput,
+  state: { iteration: number; usedPlannedTools: boolean; observations: Array<{ type: string; content: string }> },
+): Promise<ReActStepDecision> {
+  const response = await llm.generate([
+    {
+      role: 'system',
+      content: [
+        '你是一个 ReAct 步骤运行时决策器。',
+        '你只能决定当前计划步骤的下一步，不要扩展到其他步骤。',
+        '你必须在以下 action 中选择一个：investigate、finalize、pause、fail。',
+        'investigate: 还需要做一轮动作或工具调用来获得新观察。',
+        'finalize: 当前观察已经足够，直接结束当前步骤。',
+        'pause: 当前步骤需要用户补充信息、路径、权限或外部前置条件。',
+        'fail: 当前步骤已明确无法完成。',
+        '只返回 JSON，不要输出代码块。',
+        'JSON 格式: {"thought":"...","action":"investigate|finalize|pause|fail","instruction":"...","finalResponse":"...","reason":"..."}',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: [
+        `原任务: ${input.originalTask}`,
+        `当前步骤: ${input.stepIndex + 1}/${input.totalSteps}`,
+        `步骤描述: ${input.step.description}`,
+        `本步骤是否已有计划工具且已执行: ${state.usedPlannedTools ? '是' : '否'}`,
+        `当前迭代次数: ${state.iteration}`,
+        `已完成步骤结果:\n${input.previousResults.length > 0 ? input.previousResults.join('\n---\n') : '暂无'}`,
+        `当前观察:\n${state.observations.length > 0 ? state.observations.map((item, index) => `${index + 1}. [${item.type}] ${item.content}`).join('\n---\n') : '暂无'}`,
+        '决策要求:',
+        '- 如果观察已经足够回答当前步骤，优先 finalize。',
+        '- 如果失败只是暂时性的，优先 investigate 或 pause，不要过早 fail。',
+        '- 只有在确实需要用户补资料、补权限、补路径时才 pause。',
+        '- investigate 时 instruction 必须明确下一轮要做什么。',
+        '- finalize 时 finalResponse 必须直接可用。',
+      ].join('\n'),
+    },
+  ]);
+
+  const parsed = parseReActDecision(response);
+  if (parsed) {
+    return parsed;
+  }
+
+  if (state.observations.length > 0) {
+    return {
+      thought: '当前已有可用观察，优先整理为步骤结果。',
+      action: 'finalize',
+    };
+  }
+
+  return {
+    thought: '当前仍缺少足够观察，需要再做一轮动作。',
+    action: 'investigate',
+    instruction: '执行当前步骤所需的下一项最关键动作，并返回新的观察。',
+  };
+}
+
+function parseReActDecision(raw: string): ReActStepDecision | null {
+  const match = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```|(\{[\s\S]*\})/);
+  const jsonText = (match?.[1] || match?.[2] || raw).trim();
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    const action = typeof parsed.action === 'string' ? parsed.action.trim() : '';
+    if (!['investigate', 'finalize', 'pause', 'fail'].includes(action)) {
+      return null;
+    }
+    return {
+      thought: typeof parsed.thought === 'string' ? parsed.thought : '',
+      action: action as ReActStepDecision['action'],
+      instruction: typeof parsed.instruction === 'string' ? parsed.instruction : undefined,
+      finalResponse: typeof parsed.finalResponse === 'string' ? parsed.finalResponse : undefined,
+      reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
+    };
+  } catch {
+    return null;
+  }
 }

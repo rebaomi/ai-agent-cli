@@ -10,7 +10,7 @@ export interface TaskExecutorServiceOptions {
   agent: Agent;
   directActionRouter?: DirectActionRouter;
   memoryProvider?: MemoryProvider;
-  permissionManager?: Pick<PermissionManager, 'getConfig'>;
+  permissionManager?: Pick<PermissionManager, 'getConfig' | 'isGranted'>;
   recallLimit: number;
   autoContinueOnToolLimit: boolean;
   maxContinuationTurns: number;
@@ -42,6 +42,9 @@ export interface TaskExecutorTurnResult extends AgentGraphTurnResult {
       continuationApproval: boolean;
       outboundApproval: boolean;
       riskyDirectActionApproval: boolean;
+      riskyStepApproval: boolean;
+      stepExecutionApproval: boolean;
+      stepResultApproval: boolean;
     };
   };
 }
@@ -120,6 +123,14 @@ export class TaskExecutorService {
       if (pending.pending && pending.type === 'direct_action_execution') {
         turnResult.notices.push({ level: 'info', message: '已进入 direct action 检查点，等待你确认高风险或外发操作。' });
       }
+
+      if (pending.pending && pending.type === 'tool_execution') {
+        turnResult.notices.push({ level: 'info', message: '已进入工具执行检查点，等待你确认或修改预测到的高风险工具动作。' });
+      }
+
+      if (pending.pending && pending.type === 'skill_adoption') {
+        turnResult.notices.push({ level: 'info', message: '已进入 skill 自动转正检查点，等待你确认是否 adopt 并立即启用。' });
+      }
     }
 
     return {
@@ -159,6 +170,9 @@ export class TaskExecutorService {
         continuationApproval: this.requiresContinuationApproval(),
         outboundApproval: this.requiresOutboundApproval(),
         riskyDirectActionApproval: this.requiresRiskyDirectActionApproval(),
+        riskyStepApproval: this.requiresRiskyStepApproval(),
+        stepExecutionApproval: this.requiresStepExecutionApproval(),
+        stepResultApproval: this.requiresStepResultApproval(),
       },
     };
   }
@@ -177,6 +191,24 @@ export class TaskExecutorService {
 
   private requiresRiskyDirectActionApproval(): boolean {
     return this.options.checkpoints?.enabled !== false && this.options.checkpoints?.riskyDirectActionApproval !== false;
+  }
+
+  private requiresRiskyStepApproval(): boolean {
+    return this.options.checkpoints?.enabled !== false && this.options.checkpoints?.riskyStepApproval !== false;
+  }
+
+  private requiresStepExecutionApproval(): boolean {
+    if (this.options.checkpoints?.enabled === false) {
+      return false;
+    }
+    if (typeof this.options.checkpoints?.stepExecutionApproval === 'boolean') {
+      return this.options.checkpoints.stepExecutionApproval;
+    }
+    return this.requiresRiskyStepApproval();
+  }
+
+  private requiresStepResultApproval(): boolean {
+    return this.options.checkpoints?.enabled !== false && this.options.checkpoints?.stepResultApproval === true;
   }
 
   private shouldAutoContinueOnToolLimit(): boolean {

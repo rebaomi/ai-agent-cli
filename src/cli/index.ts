@@ -30,9 +30,11 @@ import { parseOnboardingInput } from '../core/onboarding.js';
 import { PermissionManager, permissionManager } from '../core/permission-manager.js';
 import type { PermissionType } from '../core/permission-manager.js';
 import { createPlanner } from '../core/planner.js';
+import type { Plan } from '../core/planner.js';
 import { createTaskManager, TaskManager } from '../core/task-manager.js';
 import { createCronManager, CronManager } from '../core/cron-manager.js';
 import { createMemoryProvider, type MemoryProvider } from '../core/memory-provider.js';
+import { buildPlanPermissionBatchPrompt, collectPlanPermissionRequirements } from '../core/plan-permission-prescan.js';
 import { progressTracker } from '../utils/progress.js';
 import {
   printSuccess,
@@ -65,6 +67,9 @@ import { SessionTaskStackManager } from '../core/session-task-stack-manager.js';
 import type { AgentGraphState, AgentTaskBindingSnapshot } from '../types/index.js';
 import { ChatRouter } from '../core/chat-router.js';
 import { TaskExecutorService } from '../core/task-executor-service.js';
+import { TerminalManager } from '../core/output/terminal-manager.js';
+import { PerformanceMonitor } from '../core/monitoring/performance-monitor.js';
+import { buildSetupWizardConfigPatch, runSetupWizard } from '../core/setup-wizard.js';
 
 const logo = buildCliLogo();
 
@@ -141,6 +146,8 @@ export class CLI {
   private splitScreen?: SplitScreenRenderer;
   private lastProcessLogMessage = '';
   private readonly outputCoordinator: OutputCoordinator;
+  private readonly terminalManager: TerminalManager;
+  private readonly performanceMonitor = new PerformanceMonitor();
   private readonly sessionTaskStack = new SessionTaskStackManager();
   private readonly contextBus = new ContextBus();
   private readonly chatRouter = new ChatRouter();
@@ -165,6 +172,10 @@ export class CLI {
     this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
     this.sessionTaskStackDir = path.join(this.appBaseDir, 'runtime', 'session-task-stack');
     this.backgroundDaemon = new BackgroundDaemonManager(this.appBaseDir);
+    this.terminalManager = new TerminalManager({
+      config: configManager.getAgentConfig().output,
+      appBaseDir: this.appBaseDir,
+    });
     this.outputCoordinator = createOutputCoordinator({
       getPolicy: (channel) => this.getOutputChannelPolicy(channel),
       write: (entry) => this.renderOutputEntry(entry),
@@ -175,7 +186,10 @@ export class CLI {
     console.log(chalk.cyan(logo));
     console.log(chalk.gray('Initializing...\n'));
 
+    await this.maybeRunSetupWizard();
+
     const config = configManager.getAgentConfig();
+    this.terminalManager.updateConfig(this.getResolvedOutputConfig(config.output), this.appBaseDir);
     this.workspace = config.workspace || this.workspace;
     this.applyGlobalPathsFromConfig(config);
 
@@ -274,6 +288,14 @@ export class CLI {
     this.writeNotification('info', `当前 artifact 输出目录: ${artifactOutputDir}`);
 
     await this.skillManager.initialize();
+    this.skillManager.setRuntimeEventListener((event) => {
+      if (event.type === 'skill_revision_drafted') {
+        this.writeNotification(
+          'info',
+          `[Skill Learning] ${event.skillName} 已根据使用反馈起草修订草稿 ${event.revisionCandidate.name}。原因: ${event.reasonSummary}`,
+        );
+      }
+    });
     const skills = await this.skillManager.listSkills();
     if (skills.length > 0) {
       this.writeNotification('info', skills.length + ' skills loaded');
@@ -353,6 +375,7 @@ export class CLI {
       planner: createPlanner({ llm: this.llm!, memoryProvider: this.memoryProvider, skillManager: this.skillManager }),
       intentResolver: this.intentResolver,
       memoryProvider: this.memoryProvider,
+      permissionManager: this.permissionMgr,
       config: config as unknown as Record<string, unknown>,
     });
 
@@ -378,19 +401,12 @@ export class CLI {
     this.permissionHandlerSetup = true;
 
     this.permissionMgr.onPermissionRequest(async (request) => {
+      this.performanceMonitor.trackPermissionHits(request.type);
       if (this.hasTaskScopedPermissionApproval(request.type)) {
         return true;
       }
-
       const prompt = this.permissionMgr!.showPermissionRequest(request);
-      const pauseOnPrompt = configManager.getAgentConfig().output?.pauseOnPermissionPrompt !== false;
-      const pauseToken = `permission:${request.id}`;
-      if (pauseOnPrompt) {
-        this.outputCoordinator.pause(pauseToken);
-        this.streamingOutput?.clear();
-      }
-
-      try {
+      return this.withPermissionPromptPause(`permission:${request.id}`, async () => {
         this.outputCoordinator.write({ channel: 'permission', level: 'info', text: prompt });
         await this.sendPermissionPromptToActiveLarkTarget(prompt);
 
@@ -410,11 +426,7 @@ export class CLI {
         }
 
         return result.granted;
-      } finally {
-        if (pauseOnPrompt) {
-          this.outputCoordinator.resume(pauseToken);
-        }
-      }
+      });
     });
   }
 
@@ -804,6 +816,7 @@ export class CLI {
       return;
     }
     this.lastProcessLogMessage = normalized;
+    this.terminalManager.debug(repaired);
     this.outputCoordinator.write({ channel: 'process', level: 'info', text: repaired });
   }
 
@@ -1268,6 +1281,8 @@ export class CLI {
       case 'c':
         if (args[0] === 'update' || args[0] === 'reload') {
           await this.reloadRuntimeConfig();
+        } else if (args[0] === 'setup') {
+          await this.runConfigSetupWizard(true);
         } else if (args[0] === 'edit') {
           await this.editConfigFile();
         } else {
@@ -1347,6 +1362,9 @@ export class CLI {
       case 'p':
         this.showProgress();
         break;
+      case 'perf':
+        this.handlePerfCommand(args);
+        break;
       case 'task-context':
         this.showTaskContext(args);
         break;
@@ -1387,6 +1405,7 @@ export class CLI {
   }
 
   private async handleMessage(input: string): Promise<void> {
+    const turnStartedAt = Date.now();
     const moderationResult = this.moderator?.moderateUserInput(input);
     if (moderationResult) {
       if (!moderationResult.allowed) {
@@ -1478,7 +1497,9 @@ export class CLI {
           }
           break;
         case 'skill_learning_todo':
-          this.writeProcessLog(`${event.content}。可用 /skill todos 查看待学习清单。`);
+          this.writeProcessLog(event.skillLearningTodo?.draftedCandidateName
+            ? `${event.content}。可用 /skill candidates 查看草稿，/skill adopt ${event.skillLearningTodo.draftedCandidateName} 转正启用。`
+            : `${event.content}。可用 /skill todos 查看待学习清单。`);
           break;
         case 'error':
           this.failTrackedTask(event.content);
@@ -1497,6 +1518,12 @@ export class CLI {
       } else {
         await this.handleTaskModeMessage(input, taskBinding);
       }
+
+      if (this.agent) {
+        this.performanceMonitor.trackContextSize(this.agent.getMessages());
+      }
+      this.performanceMonitor.trackResponseTime(`turn:${functionMode}`, Date.now() - turnStartedAt);
+      this.terminalManager.debug(`[Performance] ${this.performanceMonitor.formatSummary()}`);
     } catch (error) {
       this.sessionTaskStack.recordTask({
         channel: 'agent',
@@ -1518,6 +1545,7 @@ export class CLI {
       this.lastGraphState = undefined;
       await this.persistSessionTaskStack();
       printError('Failed to get response: ' + (error instanceof Error ? error.message : String(error)));
+      this.performanceMonitor.trackResponseTime('turn:error', Date.now() - turnStartedAt);
     } finally {
       this.taskScopedPermissionApprovals.splice(0, this.taskScopedPermissionApprovals.length, ...this.taskScopedPermissionApprovals.filter(item => item.scopeId !== executionScopeId));
       if (this.currentExecutionScopeId === executionScopeId) {
@@ -1563,6 +1591,9 @@ export class CLI {
 
         if (confirmationStatus.type === 'plan_execution' && (isConfirmed || isRejected)) {
           this.writeNotification('info', isConfirmed ? '确认执行计划...' : '取消执行计划');
+          if (isConfirmed) {
+            await this.preapprovePendingPlanPermissions();
+          }
           result = await agent.confirmAction(isConfirmed);
           if (isRejected) {
             this.failTrackedTask('用户取消执行计划');
@@ -1579,6 +1610,7 @@ export class CLI {
           await this.streamResponse(result);
           await this.sendAssistantReplyToActiveLarkTarget(result);
         }
+        await this.showPendingInteractionPromptIfNeeded(result);
         await this.sendPendingInteractionPromptToActiveLarkTarget(result);
         return;
       }
@@ -1650,6 +1682,9 @@ export class CLI {
     }
 
     const config = configManager.getAgentConfig();
+    if (this.isAffirmativeApproval(input)) {
+      await this.preapprovePendingPlanPermissions();
+    }
     const executor = new TaskExecutorService({
       agent,
       directActionRouter: this.directActionRouter,
@@ -1725,6 +1760,7 @@ export class CLI {
       await this.streamResponse(result.output);
       await this.sendAssistantReplyToActiveLarkTarget(result.output);
     }
+    await this.showPendingInteractionPromptIfNeeded(result.output);
     await this.sendPendingInteractionPromptToActiveLarkTarget(result.output);
   }
 
@@ -1746,10 +1782,10 @@ export class CLI {
     toolBudget: { toolCallCount: number; maxToolCallsPerTurn: number; maxIterations: number; lastStopReason: string };
     permissionStrategy: string;
     checkpointResumeHint?: string;
-    checkpoints: { enabled: boolean; planApproval: boolean; continuationApproval: boolean; outboundApproval: boolean; riskyDirectActionApproval: boolean };
+    checkpoints: { enabled: boolean; planApproval: boolean; continuationApproval: boolean; outboundApproval: boolean; riskyDirectActionApproval: boolean; stepExecutionApproval?: boolean; stepResultApproval?: boolean };
   }): void {
     const checkpointDetail = policy.checkpoints.enabled
-      ? ` | checkpoints=plan:${policy.checkpoints.planApproval ? 'manual' : 'auto'},continue:${policy.checkpoints.continuationApproval ? 'manual' : 'auto'},outbound:${policy.checkpoints.outboundApproval ? 'manual' : 'auto'},direct:${policy.checkpoints.riskyDirectActionApproval ? 'manual' : 'auto'}`
+      ? ` | checkpoints=plan:${policy.checkpoints.planApproval ? 'manual' : 'auto'},continue:${policy.checkpoints.continuationApproval ? 'manual' : 'auto'},outbound:${policy.checkpoints.outboundApproval ? 'manual' : 'auto'},direct:${policy.checkpoints.riskyDirectActionApproval ? 'manual' : 'auto'},step-exec:${policy.checkpoints.stepExecutionApproval ? 'manual' : 'auto'},step-result:${policy.checkpoints.stepResultApproval ? 'manual' : 'auto'}`
       : ' | checkpoints=off';
     const detail = `[Workflow Policy] budget=${policy.toolBudget.toolCallCount}/${policy.toolBudget.maxToolCallsPerTurn} | iterations=${policy.toolBudget.maxIterations} | permissions=${policy.permissionStrategy}${checkpointDetail}${policy.checkpointResumeHint ? ` | resume=${policy.checkpointResumeHint}` : ''}`;
     if (this.splitScreen?.isActive()) {
@@ -1761,7 +1797,7 @@ export class CLI {
   }
 
   private getOutputChannelPolicy(channel: 'process' | 'notification' | 'permission'): { enabled?: boolean; minLevel?: OutputLevel } | undefined {
-    const outputConfig = configManager.getAgentConfig().output;
+    const outputConfig = this.getResolvedOutputConfig();
     switch (channel) {
       case 'process':
         return outputConfig?.process;
@@ -1785,27 +1821,16 @@ export class CLI {
     }
 
     if (entry.channel === 'permission') {
-      console.log(text);
+      this.terminalManager.system(text, { level: entry.level, category: 'permission' });
       return;
     }
 
     if (entry.channel === 'process') {
-      console.log(text);
+      this.terminalManager.writeLine(text);
       return;
     }
 
-    switch (entry.level) {
-      case 'error':
-        printError(text);
-        break;
-      case 'warning':
-        printWarning(text);
-        break;
-      case 'debug':
-      case 'info':
-        printInfo(text);
-        break;
-    }
+    this.terminalManager.system(text, { level: entry.level, category: 'system' });
   }
 
   private writeNotification(level: OutputLevel, message: string): void {
@@ -1886,8 +1911,106 @@ export class CLI {
       return;
     }
 
-    const output = createStreamingOutput({ color: 'cyan', speed: 5 });
-    await output.stream(normalizedText);
+    if (!this.streamingOutput) {
+      this.streamingOutput = createStreamingOutput({ color: 'cyan', speed: 5 });
+    }
+
+    await this.streamingOutput.stream(normalizedText);
+  }
+
+  private async withPermissionPromptPause<T>(pauseToken: string, action: () => Promise<T>): Promise<T> {
+    const pauseOnPrompt = configManager.getAgentConfig().output?.pauseOnPermissionPrompt !== false;
+    if (pauseOnPrompt) {
+      this.outputCoordinator.pause(pauseToken);
+      this.streamingOutput?.pause(pauseToken);
+    }
+
+    try {
+      return await action();
+    } finally {
+      if (pauseOnPrompt) {
+        this.streamingOutput?.resume(pauseToken);
+        this.outputCoordinator.resume(pauseToken);
+      }
+    }
+  }
+
+  private isAffirmativeApproval(input: string): boolean {
+    return /^(是|好|好的|可以|继续|继续执行|确认|yes|y|ok|okay|go|continue)$/i.test(input.trim());
+  }
+
+  private async preapprovePendingPlanPermissions(): Promise<void> {
+    const pending = this.agent?.getPendingInteractionDetails();
+    if (!pending?.plan || pending.type !== 'plan_execution') {
+      return;
+    }
+
+    await this.preapprovePlanPermissionsIfNeeded(pending.plan);
+  }
+
+  private async preapprovePlanPermissionsIfNeeded(plan: Plan): Promise<void> {
+    if (!this.permissionMgr) {
+      return;
+    }
+
+    const permissionConfig = this.permissionMgr.getConfig();
+    if (permissionConfig.autoGrantDangerous || permissionConfig.askForPermissions === false) {
+      return;
+    }
+
+    const requirements = collectPlanPermissionRequirements(plan, this.permissionMgr)
+      .filter(requirement => requirement.isDangerous)
+      .filter(requirement => !this.hasTaskScopedPermissionApproval(requirement.type));
+
+    if (requirements.length === 0) {
+      return;
+    }
+
+    const prompt = buildPlanPermissionBatchPrompt(requirements);
+    const granted = await this.withPermissionPromptPause(`permission:plan:${plan.id}`, async () => {
+      this.outputCoordinator.write({ channel: 'permission', level: 'info', text: prompt });
+      await this.sendPermissionPromptToActiveLarkTarget(prompt);
+
+      const answer = await this.requestInlineApprovalAnswer();
+      const result = this.permissionMgr!.parsePermissionAnswer(answer);
+      if (!result.granted) {
+        return false;
+      }
+
+      const uniqueTypes = Array.from(new Set(requirements.map(requirement => requirement.type)));
+      if (result.batchCurrentTask) {
+        for (const type of uniqueTypes) {
+          this.addTaskScopedPermissionApproval(type);
+        }
+        return true;
+      }
+
+      if (result.permanent) {
+        for (const type of uniqueTypes) {
+          this.permissionMgr!.grantPermission(type);
+        }
+        return true;
+      }
+
+      if (result.expiresInMs) {
+        for (const type of uniqueTypes) {
+          this.permissionMgr!.grantPermission(type, undefined, result.expiresInMs);
+        }
+        return true;
+      }
+
+      for (const requirement of requirements) {
+        this.permissionMgr!.grantPermission(requirement.type, requirement.resource);
+      }
+      return true;
+    });
+
+    if (granted) {
+      this.writeNotification('info', `[Permission] 已完成计划预授权，共覆盖 ${requirements.length} 个潜在权限点。`);
+      return;
+    }
+
+    this.writeNotification('warning', '[Permission] 未接受计划预授权，后续执行时将按需逐项确认。');
   }
 
   private printHybridRouteSummary(): void {
@@ -1952,6 +2075,7 @@ export class CLI {
 
   private async showWelcomeQuestions(): Promise<void> {
     console.log(chalk.bold('\n👋 欢迎使用 coolAI！\n'));
+    console.log(chalk.gray('首次启动已支持配置向导，可先设置输出、AgentCat 和检查点策略。\n'));
     console.log(chalk.gray('为了更好地为您服务，请告诉我一些关于您的信息：\n'));
     
     console.log(chalk.cyan('1. 您的工作是？') + chalk.gray(' (如：学生、程序员、产品经理、设计师...)'));
@@ -1986,6 +2110,160 @@ export class CLI {
       printSuccess('已更新用户档案');
       this.syncProfileToEnhancedMemory();
     }
+  }
+
+  private async maybeRunSetupWizard(): Promise<void> {
+    const configPath = configManager.getConfigPath();
+    const wizardState = configManager.get('setupWizard');
+    if (wizardState?.completed) {
+      return;
+    }
+
+    if (process.env.AI_AGENT_CLI_SKIP_SETUP_WIZARD === '1' || !process.stdin.isTTY || !process.stdout.isTTY) {
+      return;
+    }
+
+    let configExists = true;
+    try {
+      await fs.access(configPath);
+    } catch {
+      configExists = false;
+    }
+
+    if (configExists) {
+      return;
+    }
+
+    await this.runConfigSetupWizard(false);
+  }
+
+  private async runConfigSetupWizard(reloadRuntimeAfterSave: boolean): Promise<void> {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      printWarning('当前终端不支持交互式配置向导。');
+      return;
+    }
+
+    console.log(chalk.bold(reloadRuntimeAfterSave ? '重新运行配置向导。\n' : '欢迎使用 coolAI！让我们先完成初始配置。\n'));
+    const selections = await runSetupWizard();
+    const patch = buildSetupWizardConfigPatch(selections, configManager.getAgentConfig());
+    configManager.setAll({
+      output: {
+        ...configManager.get('output'),
+        ...patch.output,
+      } as any,
+      checkpoints: {
+        ...configManager.get('checkpoints'),
+        ...patch.checkpoints,
+      } as any,
+      setupWizard: patch.setupWizard,
+    });
+    await configManager.save();
+    this.terminalManager.updateConfig(this.getResolvedOutputConfig(patch.output), this.appBaseDir);
+    printSuccess(reloadRuntimeAfterSave ? '配置向导结果已保存' : '初始配置已保存');
+
+    if (reloadRuntimeAfterSave) {
+      await this.reloadRuntimeConfig();
+    }
+  }
+
+  private getResolvedOutputConfig(rawOutput = configManager.getAgentConfig().output): typeof rawOutput {
+    if (!rawOutput || rawOutput.mode !== 'production') {
+      return rawOutput;
+    }
+
+    return {
+      ...rawOutput,
+      verbosity: rawOutput.verbosity === 'verbose' ? 'normal' : rawOutput.verbosity,
+      silentSystemInProduction: true,
+      debugToFile: false,
+      process: {
+        ...rawOutput.process,
+        enabled: rawOutput.process?.enabled !== false,
+        minLevel: this.maxOutputLevel(rawOutput.process?.minLevel, 'warning'),
+      },
+      notification: {
+        ...rawOutput.notification,
+        enabled: rawOutput.notification?.enabled !== false,
+        minLevel: this.maxOutputLevel(rawOutput.notification?.minLevel, 'warning'),
+      },
+      permission: {
+        ...rawOutput.permission,
+        enabled: rawOutput.permission?.enabled !== false,
+        minLevel: this.maxOutputLevel(rawOutput.permission?.minLevel, 'info'),
+      },
+      channels: {
+        ...rawOutput.channels,
+        system: {
+          ...rawOutput.channels?.system,
+          silentInProduction: true,
+          enabledInProduction: true,
+        },
+        debug: {
+          ...rawOutput.channels?.debug,
+          target: rawOutput.channels?.debug?.target || 'file',
+          enabledInProduction: false,
+        },
+      },
+      agentcat: {
+        ...rawOutput.agentcat,
+        displayInTerminal: rawOutput.agentcat?.displayInTerminal ?? false,
+      },
+    };
+  }
+
+  private maxOutputLevel(current: OutputLevel | undefined, fallback: OutputLevel): OutputLevel {
+    const order: OutputLevel[] = ['debug', 'info', 'warning', 'error'];
+    const currentIndex = order.indexOf(current || fallback);
+    const fallbackIndex = order.indexOf(fallback);
+    return order[Math.max(currentIndex, fallbackIndex)] || fallback;
+  }
+
+  private handlePerfCommand(args: string[]): void {
+    const subcommand = (args[0] || 'status').toLowerCase();
+    if (subcommand === 'reset') {
+      this.performanceMonitor.reset();
+      printSuccess('Performance monitor has been reset.');
+      return;
+    }
+
+    if (subcommand === 'recent') {
+      this.showRecentPerformanceEvents();
+      return;
+    }
+
+    this.showPerformanceStatus();
+  }
+
+  private showPerformanceStatus(): void {
+    const snapshot = this.performanceMonitor.getSnapshot();
+    console.log(chalk.bold('\nPerformance Status:\n'));
+    console.log(chalk.gray(`Summary: ${this.performanceMonitor.formatSummary()}`));
+    console.log(chalk.gray(`Context samples: ${snapshot.contextSize.sampleCount}`));
+    console.log(chalk.gray(`Messages: current=${snapshot.contextSize.lastMessageCount}, max=${snapshot.contextSize.maxMessageCount}`));
+    console.log(chalk.gray(`Approx tokens: current=${snapshot.contextSize.lastApproxTokens}, max=${snapshot.contextSize.maxApproxTokens}`));
+    console.log(chalk.gray(`Permission hits: ${snapshot.permissionHits.total}`));
+    const responseLines = snapshot.responseTimes.length > 0
+      ? snapshot.responseTimes.map(item => `  - ${item.label}: last=${item.lastMs.toFixed(0)}ms avg=${item.avgMs.toFixed(0)}ms max=${item.maxMs.toFixed(0)}ms count=${item.count}`)
+      : ['  (none)'];
+    console.log(chalk.cyan('\nResponse Timings'));
+    responseLines.forEach(line => console.log(line));
+    console.log();
+  }
+
+  private showRecentPerformanceEvents(): void {
+    const snapshot = this.performanceMonitor.getSnapshot();
+    console.log(chalk.bold('\nRecent Performance Events:\n'));
+
+    if (snapshot.recentResponseTimes.length === 0) {
+      console.log(chalk.gray('(none)'));
+      console.log();
+      return;
+    }
+
+    snapshot.recentResponseTimes.slice(-10).forEach((event, index) => {
+      console.log(chalk.gray(`  ${index + 1}. ${event.label} | ${event.durationMs.toFixed(0)}ms | ${event.recordedAt}`));
+    });
+    console.log();
   }
 
   private syncProfileToEnhancedMemory(): void {
@@ -2379,6 +2657,7 @@ export class CLI {
       console.log(chalk.green('\n--- Result ---\n'));
       await this.streamResponse(response);
       await this.sendAssistantReplyToActiveLarkTarget(response);
+      await this.persistSessionTaskStack();
     } catch (error) {
       printError('Organization processing failed: ' + (error instanceof Error ? error.message : String(error)));
     }
@@ -2390,7 +2669,15 @@ export class CLI {
     const subcommand = args[0]?.toLowerCase();
 
     if (!this.agentCat) {
-      this.agentCat = createAgentCat();
+      const outputConfig = configManager.getAgentConfig().output;
+      this.agentCat = createAgentCat(
+        this.buildAgentCatReminderConfig(),
+        this.terminalManager,
+        {
+          displayInTerminal: outputConfig?.agentcat?.displayInTerminal,
+          useDesktopNotification: outputConfig?.agentcat?.useDesktopNotification,
+        },
+      );
       this.agentCat.start();
     }
 
@@ -2446,6 +2733,52 @@ export class CLI {
     console.log(`  上次运动: ${status.lastWalk}`);
     console.log(`  互动次数: ${status.interactionCount}`);
     console.log();
+  }
+
+  private buildAgentCatReminderConfig(): Partial<import('../core/companion/index.js').ReminderConfig> {
+    const outputConfig = configManager.getAgentConfig().output;
+    const waterInterval = this.parseReminderIntervalMinutes(outputConfig?.agentcat?.reminders?.water?.interval, 30);
+    const restInterval = this.parseReminderIntervalMinutes(outputConfig?.agentcat?.reminders?.rest?.interval, 20);
+    const walkInterval = this.parseReminderIntervalMinutes(outputConfig?.agentcat?.reminders?.walk?.interval, 60);
+
+    return {
+      enabled: true,
+      waterEnabled: outputConfig?.agentcat?.reminders?.water?.enabled !== false,
+      waterIntervalMinutes: waterInterval,
+      eyeRestEnabled: outputConfig?.agentcat?.reminders?.rest?.enabled !== false,
+      eyeRestIntervalMinutes: restInterval,
+      walkEnabled: outputConfig?.agentcat?.reminders?.walk?.enabled !== false,
+      walkIntervalMinutes: walkInterval,
+      mealEnabled: true,
+    };
+  }
+
+  private parseReminderIntervalMinutes(value: string | number | undefined, fallback: number): number {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+
+    if (typeof value !== 'string') {
+      return fallback;
+    }
+
+    const trimmed = value.trim().toLowerCase();
+    const match = trimmed.match(/^(\d+)(m|min|h|hour)s?$/);
+    if (!match) {
+      return fallback;
+    }
+
+    const amount = Number.parseInt(match[1] || '', 10);
+    const unit = match[2] || 'm';
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return fallback;
+    }
+
+    if (unit === 'h' || unit === 'hour') {
+      return amount * 60;
+    }
+
+    return amount;
   }
 
   private showProgress(): void {
@@ -2600,6 +2933,13 @@ export class CLI {
       console.log(chalk.gray(`  currentTaskSnapshot=${currentTaskSnapshot.id}`));
       console.log(chalk.gray(`  lineageDepth=${this.contextBus.getLineage(currentTaskSnapshot.id).length}`));
       console.log(chalk.gray(`  children=${this.contextBus.getChildren(currentTaskSnapshot.id).length}`));
+      const projectedTasks = currentTaskSnapshot.payload.taskContext?.recentTasks || [];
+      if (projectedTasks.length > 0) {
+        console.log(chalk.cyan('  projected recentTasks'));
+        projectedTasks.slice(-5).forEach((task, index) => {
+          console.log(chalk.gray(`    ${index + 1}. ${task.title} | ${task.status} | ${task.category || task.handlerName || 'unknown'}`));
+        });
+      }
       console.log();
     }
   }
@@ -3505,6 +3845,24 @@ ${chalk.gray('权限组:')}
     }
 
     await this.sendAssistantReplyToActiveLarkTarget(prompt);
+  }
+
+  private async showPendingInteractionPromptIfNeeded(alreadyShownText?: string): Promise<void> {
+    const prompt = this.agent?.getPendingInteractionDetails()?.prompt?.trim();
+    if (!prompt) {
+      return;
+    }
+
+    if (typeof alreadyShownText === 'string' && alreadyShownText.trim() === prompt) {
+      return;
+    }
+
+    console.log(chalk.green('\nAssistant: '));
+    await this.streamResponse(prompt);
+  }
+
+  private async refreshSkillRuntime(): Promise<void> {
+    await this.agent?.refreshTools();
   }
 
   private createLLMClient(config: any): LLMProviderInterface {
@@ -5334,6 +5692,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
 
   private showConfig(): void {
     const config = configManager.getAll();
+    const resolvedOutput = this.getResolvedOutputConfig(config.output);
     console.log(chalk.bold('\nCurrent Configuration:\n'));
     console.log(`  Path: ${configManager.getConfigPath()}`);
     console.log(`  App Base Dir: ${config.appBaseDir}`);
@@ -5365,6 +5724,22 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       console.log(`  Simple Conversation Max Chars: ${config.hybrid.simpleConversationMaxChars || 6000}`);
       console.log(`  Local Availability Cache: ${config.hybrid.localAvailabilityCacheMs || 15000}ms`);
     }
+    console.log(chalk.gray('\nOutput:'));
+    console.log(`  Mode: ${resolvedOutput?.mode || 'development'}`);
+    console.log(`  Process Min Level: ${resolvedOutput?.process?.minLevel || 'info'}`);
+    console.log(`  Notification Min Level: ${resolvedOutput?.notification?.minLevel || 'warning'}`);
+    console.log(`  Permission Min Level: ${resolvedOutput?.permission?.minLevel || 'info'}`);
+    console.log(chalk.gray('\nCheckpoints:'));
+    console.log(`  Step Execution Approval: ${config.checkpoints?.stepExecutionApproval ?? config.checkpoints?.riskyStepApproval ?? true}`);
+    console.log(`  Step Result Approval: ${config.checkpoints?.stepResultApproval ?? false}`);
+    console.log(chalk.gray('\nSkill Learning:'));
+    console.log(`  Auto Draft From Todo: ${config.skillLearning?.autoDraftFromTodo === false ? 'no' : 'yes'}`);
+    console.log(`  Auto Draft Threshold: ${config.skillLearning?.autoDraftThreshold ?? 2}`);
+    console.log(`  Auto Adopt After Approval: ${config.skillLearning?.autoAdoptAfterApproval === false ? 'no' : 'yes'}`);
+    console.log(`  Auto Adopt Min Confidence: ${config.skillLearning?.autoAdoptMinConfidence ?? 0.75}`);
+    console.log(`  Auto Revise Adopted Skills: ${config.skillLearning?.autoReviseAdoptedSkills === false ? 'no' : 'yes'}`);
+    console.log(`  Auto Revise Min Observations: ${config.skillLearning?.autoReviseMinObservations ?? 3}`);
+    console.log(`  Auto Revise Min Failures: ${config.skillLearning?.autoReviseMinFailures ?? 2}`);
     console.log();
   }
 
@@ -5407,6 +5782,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
     this.currentProvider = config.defaultProvider || 'ollama';
     this.workspace = config.workspace || this.workspace;
     this.applyGlobalPathsFromConfig(config);
+    this.terminalManager.updateConfig(this.getResolvedOutputConfig(config.output), this.appBaseDir);
 
     try {
       await this.rebuildRuntimeFromConfig(config, previousMessages);
@@ -5433,6 +5809,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
     this.currentProvider = config.defaultProvider || 'ollama';
     this.workspace = config.workspace || this.workspace;
     this.applyGlobalPathsFromConfig(config);
+    this.terminalManager.updateConfig(this.getResolvedOutputConfig(config.output), this.appBaseDir);
     await this.rebuildRuntimeFromConfig(config, previousMessages);
 
     return this.llm ? await this.llm.checkConnection().catch(() => false) : false;
@@ -5516,6 +5893,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       planner: createPlanner({ llm: this.llm!, memoryProvider: this.memoryProvider, skillManager: this.skillManager }),
       intentResolver: this.intentResolver,
       memoryProvider: this.memoryProvider,
+      permissionManager: this.permissionMgr,
       config: config as unknown as Record<string, unknown>,
     });
 
@@ -5869,7 +6247,8 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
           console.log(chalk.gray('No pending learning todos. Unresolved tasks will add items here.'));
         } else {
           for (const todo of todos) {
-            console.log(`${chalk.yellow('•')} ${chalk.cyan(todo.suggestedSkill)} ${chalk.gray(todo.createdAt)} ${chalk.gray(`[${todo.id}]`)}`);
+            const countText = todo.occurrenceCount && todo.occurrenceCount > 1 ? chalk.gray(` x${todo.occurrenceCount}`) : '';
+            console.log(`${chalk.yellow('•')} ${chalk.cyan(todo.suggestedSkill)} ${chalk.gray(todo.createdAt)} ${chalk.gray(`[${todo.id}]`)}${countText}`);
             console.log(chalk.gray(`  task: ${todo.sourceTask}`));
             console.log(chalk.gray(`  issue: ${todo.issueSummary}`));
             if (todo.nextActions.length > 0) {
@@ -5893,6 +6272,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
         }
         try {
           await this.skillManager.adoptCandidate(skillName);
+          await this.refreshSkillRuntime();
           printSuccess('Skill candidate adopted and enabled: ' + skillName);
         } catch (error) {
           printError('Failed to adopt candidate: ' + (error instanceof Error ? error.message : String(error)));
@@ -5927,6 +6307,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
         try {
           printInfo(`Installing skill from: ${skillName}...`);
           await this.skillManager.installSkill(skillName);
+          await this.refreshSkillRuntime();
           printSuccess('Skill installed: ' + skillName);
         } catch (error) {
           printError('Failed to install: ' + (error instanceof Error ? error.message : String(error)));
@@ -5941,6 +6322,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
         }
         try {
           await this.skillManager.uninstallSkill(skillName);
+          await this.refreshSkillRuntime();
           printSuccess('Skill uninstalled: ' + skillName);
         } catch (error) {
           printError('Failed to uninstall: ' + (error instanceof Error ? error.message : String(error)));
@@ -5953,6 +6335,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
           return;
         }
         this.skillManager.enableSkill(skillName);
+        await this.refreshSkillRuntime();
         printSuccess('Skill enabled: ' + skillName);
         break;
 
@@ -5962,6 +6345,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
           return;
         }
         this.skillManager.disableSkill(skillName);
+        await this.refreshSkillRuntime();
         printSuccess('Skill disabled: ' + skillName);
         break;
 
@@ -6037,7 +6421,11 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
         sandbox: this.sandbox,
       });
 
-      this.organization = await loadOrganization(targetPath, factory);
+      this.organization = await loadOrganization(targetPath, factory, {
+        enhancedMemory: this.enhancedMemory,
+        contextBus: this.contextBus,
+        getContextScopeId: () => this.memoryManager.getCurrentSessionId(),
+      });
       printSuccess(`Organization loaded: ${this.organization.getConfig().name}`);
       this.organization.printOrganization();
       this.organizationMode = true;

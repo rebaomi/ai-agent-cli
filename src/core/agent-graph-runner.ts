@@ -1,4 +1,5 @@
 import type { Agent } from './agent.js';
+import type { DirectActionDispatchPreview } from './direct-action-dispatch-service.js';
 import type { DirectActionResult, DirectActionRouter } from './direct-action-router.js';
 import type { SessionTaskRecordInput } from './session-task-stack-manager.js';
 import type { PendingInteraction } from './agent-interaction-service.js';
@@ -113,7 +114,7 @@ export class AgentGraphRunner {
       route: 'direct_action',
     });
 
-    const directActionPreview = await this.options.directActionRouter?.preview(input.input, input.taskBinding);
+    const directActionPreview = await this.previewDirectAction(input.input, input.taskBinding);
     if (directActionPreview && this.shouldPauseBeforeDirectAction(directActionPreview.riskSummary)) {
       const prompt = buildDirectActionCheckpointPrompt(directActionPreview.riskSummary, input.input);
       this.options.agent.restorePendingInteraction({
@@ -144,7 +145,7 @@ export class AgentGraphRunner {
       };
     }
 
-    const directAction = await this.options.directActionRouter?.tryHandle(input.input, input.taskBinding);
+    const directAction = await this.tryDirectAction(input.input, input.taskBinding);
     if (directAction?.handled) {
       graphState = await this.transition(graphState, 'finalize', directAction.isError ? 'failed' : 'completed', {
         summary: directAction.isError ? 'direct action 执行失败' : 'direct action 已完成',
@@ -258,7 +259,7 @@ export class AgentGraphRunner {
           input: confirmedInput,
           route: 'direct_action',
         });
-        const directAction = await this.options.directActionRouter?.tryHandle(confirmedInput, {
+        const directAction = await this.tryDirectAction(confirmedInput, {
           effectiveInput: confirmedInput,
           isFollowUp: input.taskBinding.isFollowUp,
           boundTask: input.taskBinding.boundTask,
@@ -587,7 +588,7 @@ export class AgentGraphRunner {
           type: 'plan_resume',
           originalTask: resumeState.originalTask,
           plan: resumeState.plan,
-          prompt: checkpoint.summary || this.buildResumePrompt(resumeState),
+          prompt: resumeState.checkpointPrompt || checkpoint.summary || this.buildResumePrompt(resumeState),
           resumeState,
           callback: () => {},
         });
@@ -710,11 +711,22 @@ export class AgentGraphRunner {
   }
 
   private buildResumePrompt(resumeState: PlanResumeState): string {
+    const currentStepState = resumeState.currentStepState;
     return [
       '## ⏸️ 任务已暂停',
       '',
       `当前阻塞步骤: ${resumeState.nextStepIndex + 1}. ${resumeState.blockedStepDescription}`,
       `阻塞原因: ${resumeState.blockedReason}`,
+      ...(resumeState.resumeKind === 'checkpoint'
+        ? ['当前状态: 这是一个执行前人工检查点。回复“否”会跳过当前步骤并继续后续步骤。']
+        : []),
+      ...(currentStepState
+        ? [
+          `当前 ReAct 阶段: ${currentStepState.phase}`,
+          `当前观察数: ${currentStepState.observations.length}`,
+          `当前迭代数: ${currentStepState.iteration}`,
+        ]
+        : []),
       '',
       '你可以直接回复“继续”恢复执行，或补充新的约束后继续。',
     ].join('\n');
@@ -740,7 +752,23 @@ export class AgentGraphRunner {
       && typeof candidate.nextStepIndex === 'number'
       && Array.isArray(candidate.results)
       && typeof candidate.blockedStepDescription === 'string'
-      && typeof candidate.blockedReason === 'string';
+      && typeof candidate.blockedReason === 'string'
+      && (candidate.resumeKind === undefined || candidate.resumeKind === 'blocked' || candidate.resumeKind === 'checkpoint')
+      && (candidate.checkpointPrompt === undefined || typeof candidate.checkpointPrompt === 'string')
+      && (candidate.skipStepOnReject === undefined || typeof candidate.skipStepOnReject === 'boolean')
+      && (candidate.currentStepState === undefined || this.isReActStepState(candidate.currentStepState));
+  }
+
+  private isReActStepState(value: unknown): boolean {
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+
+    const candidate = value as Record<string, unknown>;
+    return typeof candidate.phase === 'string'
+      && typeof candidate.iteration === 'number'
+      && typeof candidate.usedPlannedTools === 'boolean'
+      && Array.isArray(candidate.observations);
   }
 
   private isDirectActionRiskSummary(value: unknown): value is DirectActionRiskSummary {
@@ -768,6 +796,24 @@ export class AgentGraphRunner {
     }
 
     return false;
+  }
+
+  private async previewDirectAction(input: string, binding: AgentTaskBindingSnapshot): Promise<DirectActionDispatchPreview | null> {
+    const router = this.options.directActionRouter as { preview?: (input: string, binding?: AgentTaskBindingSnapshot) => Promise<DirectActionDispatchPreview | null> } | undefined;
+    if (!router || typeof router.preview !== 'function') {
+      return null;
+    }
+
+    return router.preview(input, binding);
+  }
+
+  private async tryDirectAction(input: string, binding: AgentTaskBindingSnapshot): Promise<DirectActionResult | null> {
+    const router = this.options.directActionRouter as { tryHandle?: (input: string, binding?: AgentTaskBindingSnapshot) => Promise<DirectActionResult | null> } | undefined;
+    if (!router || typeof router.tryHandle !== 'function') {
+      return null;
+    }
+
+    return router.tryHandle(input, binding);
   }
 }
 

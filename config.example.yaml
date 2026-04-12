@@ -168,15 +168,43 @@ functionRouting:
 
 checkpoints:
   enabled: true
+  level: balanced
   planApproval: true
   continuationApproval: true
   outboundApproval: true
   riskyDirectActionApproval: true
+  # stepExecutionApproval: 高风险步骤执行前确认
+  stepExecutionApproval: true
+  # stepResultApproval: 风险步骤产出完成后是否要求人工验收
+  stepResultApproval: false
   announceCheckpoints: true
 
+skillLearning:
+  # 连续命中同类能力缺口时，自动从 todo 起草 candidate 草稿
+  autoDraftFromTodo: true
+  # 同类 todo 达到这个次数后自动起草
+  autoDraftThreshold: 2
+  # 高置信 candidate 会先进入“自动转正审批”，确认后自动 adopt 并启用
+  autoAdoptAfterApproval: true
+  # 只有 confidence 高于这个阈值时才触发自动转正审批
+  autoAdoptMinConfidence: 0.75
+  # 已 adopt 的 skill 在真实使用后会累计反馈，并按阈值自动起草 revision candidate
+  autoReviseAdoptedSkills: true
+  # 距离上次 revision 草稿后，至少累计多少次真实使用才起草下一份 revision candidate
+  autoReviseMinObservations: 3
+  # 或者累计多少次失败就提前起草 revision candidate
+  autoReviseMinFailures: 2
+
 output:
+  mode: development
+  verbosity: normal
+  # production 预设会自动抬高 process/notification 的最小级别，关闭 debug 输出，压低大部分 system 噪音
+  # mode: production
   pauseOnPermissionPrompt: true
   separateChannels: true
+  systemToStderr: true
+  silentSystemInProduction: true
+  debugToFile: true
   process:
     enabled: true
     minLevel: info
@@ -186,6 +214,31 @@ output:
   permission:
     enabled: true
     minLevel: info
+  channels:
+    main:
+      target: stdout
+    system:
+      target: stderr
+      silentInProduction: true
+      logFile: ~/.ai-agent-cli/logs/system.log
+    debug:
+      target: file
+      file: ~/.ai-agent-cli/logs/debug.log
+      enabledInProduction: false
+  agentcat:
+    mode: desktop
+    displayInTerminal: false
+    useDesktopNotification: true
+    reminders:
+      water:
+        enabled: true
+        interval: 30m
+      rest:
+        enabled: true
+        interval: 20m
+      walk:
+        enabled: true
+        interval: 60m
 
 sandbox:
   enabled: true

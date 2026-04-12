@@ -153,8 +153,25 @@ export function deriveCheckpointFromUnifiedAgentState(state: UnifiedAgentState):
     return createAgentCheckpoint('direct_action', 'waiting', state.lastUserInput, 'direct action 已命中风险检查点，等待用户确认执行');
   }
 
+  if (state.pendingInteraction?.type === 'tool_execution') {
+    return createAgentCheckpoint('pause_for_input', 'waiting', state.lastUserInput, '预测到高风险工具调用，等待用户确认或修改后继续');
+  }
+
+  if (state.pendingInteraction?.type === 'skill_adoption') {
+    return createAgentCheckpoint('pause_for_input', 'waiting', state.lastUserInput, '已生成高置信候选 skill，等待你确认是否自动转正并启用');
+  }
+
   if (state.pendingInteraction?.type === 'plan_resume') {
-    return createAgentCheckpoint('pause_for_input', 'waiting', state.lastUserInput, state.planResume?.blockedReason || '计划执行暂停，等待恢复');
+    const reactStep = state.planResume?.reactStep;
+    const reactSummary = reactStep
+      ? `当前 ReAct 阶段: ${reactStep.phase}，已观察 ${reactStep.observationCount} 次，迭代 ${reactStep.iteration} 轮`
+      : undefined;
+    return createAgentCheckpoint(
+      'pause_for_input',
+      'waiting',
+      state.lastUserInput,
+      [state.planResume?.blockedReason || '计划执行暂停，等待恢复', reactSummary].filter(Boolean).join('；'),
+    );
   }
 
   if (state.state === 'TOOL_CALLING') {

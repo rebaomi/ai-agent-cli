@@ -81,6 +81,8 @@
 3. **Planner / Plan Runtime**
   当任务是多步骤或带依赖的复合流程时，会自动生成计划、等待确认、逐步执行，并支持中断恢复。
 
+当前版本的 plan runtime 已升级为步骤级 ReAct 状态机：每个计划步骤不再只是“一次调用然后结束”，而是会在步骤内部显式经过 thought、action、observation、reflection，再决定继续补做动作、暂停等待用户输入，还是完成当前步骤结果。这让计划执行从“线性脚本”变成“可观察、可恢复、可自纠偏”的运行时。
+
 ### 重构后的架构概览
 
 这轮重构的目标不是增加新功能，而是把原本过大的主链路拆成稳定、可测试的运行时组件。
@@ -254,11 +256,32 @@ functionRouting:
 
 checkpoints:
   enabled: true
+  level: balanced
   planApproval: true
   continuationApproval: true
   outboundApproval: true
   riskyDirectActionApproval: true
+  stepExecutionApproval: true
+  stepResultApproval: false
   announceCheckpoints: true
+
+output:
+  mode: development
+  verbosity: normal
+  pauseOnPermissionPrompt: true
+  separateChannels: true
+  systemToStderr: true
+  silentSystemInProduction: true
+  debugToFile: true
+  process:
+    enabled: true
+    minLevel: info
+  notification:
+    enabled: true
+    minLevel: warning
+  permission:
+    enabled: true
+    minLevel: info
 
 sandbox:
   enabled: true
@@ -288,10 +311,25 @@ sandbox:
 - `functionRouting.allowAutoSwitchFromChatToWorkflow` 允许在 chat 模式下，用户一旦明确提出“切到 workflow / 开始执行任务”，自动回切到 workflow
 - `checkpoints.outboundApproval` 会在外发动作前先卡一次检查点，例如飞书发送
 - `checkpoints.riskyDirectActionApproval` 会在高风险 direct action 前先确认，例如命令执行、浏览器自动化、外部脚本工作流
+- `checkpoints.stepExecutionApproval` 会把高风险步骤拆成“执行前确认”，允许你在真正执行前直接改路径、改目标、改命令
+- `checkpoints.stepResultApproval` 会把风险步骤拆出“结果验收”，当前步骤做完后先挂起，等你验收通过再进入下一步
+- `output.mode=production` 会启用更安静的生产预设：默认抬高 process 和 notification 的输出门槛，关闭 debug 输出，并压低大部分 system 噪音
+- `skillLearning.autoDraftFromTodo` 会在同类能力缺口重复出现时，自动把 todo 起草成 candidate 草稿
+- `skillLearning.autoDraftThreshold` 控制重复多少次后自动起草，默认是 2
+- `skillLearning.autoAdoptAfterApproval` 会把高置信 candidate 变成“待确认的自动转正”，你确认后立即 adopt 并启用
+- `skillLearning.autoAdoptMinConfidence` 控制触发自动转正审批的最低 confidence，默认是 0.75
+- `skillLearning.autoReviseAdoptedSkills` 会在已 adopt skill 的真实使用过程中累计反馈，并按阈值自动起草 revision candidate
+- `skillLearning.autoReviseMinObservations` 控制距离上次 revision 草稿后，至少累计多少次真实使用才再次起草 revision candidate
+- `skillLearning.autoReviseMinFailures` 控制距离上次 revision 草稿后，累计多少次失败就提前起草 revision candidate
 - `sandbox.allowedPaths` 采用白名单优先；即使留空，默认也只允许工作区、artifact 输出目录和 cron 存储目录，不会退化成全盘放行
 - `sandbox.allowCommandExecution` / `sandbox.allowBash` / `sandbox.allowPowerShell` 用来显式控制命令能力边界，建议按当前平台只打开必要能力
 - `sandbox.commandExecutionMode` 用来约束 execute_command：`shell` 保持原行为，`direct-only` 禁止 shell 元字符，`allowlist` 只允许白名单命令直执行
 - `sandbox.allowNetworkRequests` / `sandbox.allowBrowserOpen` / `sandbox.allowBrowserAutomation` 用来把 network、browser open、browser automation 分开收敛，而不是只靠权限提示
+
+运行时命令里也新增了两组可直接使用的入口：
+
+- `/config setup` 可以重复运行交互式 setup wizard，而不只限首次启动
+- `/perf status` 查看累计性能摘要，`/perf recent` 看最近响应耗时事件，`/perf reset` 清空当前统计
 
 常用配置文件：
 

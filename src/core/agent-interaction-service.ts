@@ -3,13 +3,13 @@ import type { AgentState } from './agent.js';
 import type { PlanResumeState } from './plan-execution-service.js';
 import type { DirectActionRiskSummary } from './checkpoint-risk.js';
 import { resolveKnownWebsiteUrl } from './site-aliases.js';
-import type { AgentPendingInteractionSnapshot, AgentPlanResumeSnapshot } from '../types/index.js';
+import type { AgentPendingInteractionSnapshot, AgentPlanResumeSnapshot, AgentReActStepSnapshot } from '../types/index.js';
 
-export type PendingInteractionType = 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume' | 'direct_action_execution';
+export type PendingInteractionType = 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume' | 'direct_action_execution' | 'tool_execution' | 'skill_adoption';
 
 export interface PendingInteraction {
   type: PendingInteractionType;
-  callback?: (confirmed: boolean, params?: any) => void;
+  callback?: (confirmed: boolean, params?: any) => void | Promise<string | undefined>;
   plan?: Plan;
   originalTask?: string;
   effectiveInput?: string;
@@ -22,7 +22,11 @@ export interface AgentInteractionServiceOptions {
   addUserMessage: (content: string) => void;
   addAssistantMessage: (content: string) => void;
   executePlan: (originalTask: string, plan: Plan) => Promise<string>;
-  resumePlanExecution: (resumeState: PlanResumeState, note?: string) => Promise<string>;
+  resumePlanExecution: (
+    resumeState: PlanResumeState,
+    note?: string,
+    options?: { skipCurrentStep?: boolean; acceptPendingStepResult?: boolean; retryCurrentStep?: boolean },
+  ) => Promise<string>;
   chatWithPlanning: (input: string) => Promise<string>;
   detectComplexTask: (input: string) => Promise<boolean>;
   generateDirectResponse: () => Promise<string>;
@@ -78,6 +82,23 @@ export class AgentInteractionService {
       blockedStepDescription: resumeState.blockedStepDescription,
       blockedReason: resumeState.blockedReason,
       resultCount: resumeState.results.length,
+      reactStep: this.buildReActStepSnapshot(resumeState),
+    };
+  }
+
+  private buildReActStepSnapshot(resumeState: PlanResumeState): AgentReActStepSnapshot | undefined {
+    const stepState = resumeState.currentStepState;
+    if (!stepState) {
+      return undefined;
+    }
+
+    return {
+      phase: stepState.phase,
+      iteration: stepState.iteration,
+      usedPlannedTools: stepState.usedPlannedTools,
+      observationCount: stepState.observations.length,
+      lastThought: stepState.lastThought,
+      lastInstruction: stepState.lastInstruction,
     };
   }
 
@@ -100,11 +121,19 @@ export class AgentInteractionService {
       return false;
     }
 
-    if (/(补充|补一下|改成|改为|调整为|路径是|输出到|保存到|目录是|文件名是|继续刚才|基于上面|按刚才|针对上面)/i.test(trimmed)) {
+    if (/(补充|补一下|改成|改为|调整为|路径是|输出到|保存到|目录是|文件名是|命令改成|目标改成|参数改成|继续刚才|基于上面|按刚才|针对上面)/i.test(trimmed)) {
       return false;
     }
 
     if (pending.type === 'write_file' && /(保存|写入|路径|目录|文件名|文件路径|输出到)/i.test(trimmed) && !this.isLikelyStandaloneTask(trimmed)) {
+      return false;
+    }
+
+    if (pending.type === 'tool_execution' && /(路径|目录|文件名|命令|参数|目标|输出到|保存到|改成|改为|换成|不要|只处理|限制在)/i.test(trimmed)) {
+      return false;
+    }
+
+    if (pending.type === 'skill_adoption' && /(保留草稿|先不转正|不要转正|稍后转正|后面再说|先保留)/i.test(trimmed)) {
       return false;
     }
 
@@ -119,7 +148,9 @@ export class AgentInteractionService {
       return undefined;
     }
 
-    this.options.addUserMessage(confirmed ? '是' : '否');
+    if (!params?.skipUserMessage) {
+      this.options.addUserMessage(confirmed ? '是' : '否');
+    }
 
     if (confirmed && pending.type === 'plan_execution' && pending.plan) {
       executionResult = await this.options.executePlan(pending.originalTask || 'task', pending.plan);
@@ -127,18 +158,50 @@ export class AgentInteractionService {
         this.options.addAssistantMessage(executionResult);
       }
     } else if (confirmed && pending.type === 'plan_resume' && pending.resumeState) {
-      executionResult = await this.options.resumePlanExecution(pending.resumeState, typeof params?.note === 'string' ? params.note : undefined);
+      const note = typeof params?.note === 'string' ? params.note : undefined;
+      executionResult = await this.options.resumePlanExecution(
+        pending.resumeState,
+        note,
+        pending.resumeState.checkpointStage === 'step_result'
+          ? params?.retryCurrentStep
+            ? { retryCurrentStep: true }
+            : { acceptPendingStepResult: params?.acceptPendingStepResult !== false }
+          : undefined,
+      );
       if (executionResult) {
         this.options.addAssistantMessage(executionResult);
       }
     } else if (!confirmed && pending.type === 'plan_execution') {
       this.options.addAssistantMessage('已取消执行当前计划。');
     } else if (!confirmed && pending.type === 'plan_resume') {
-      executionResult = '已暂停当前计划。等你补齐权限、路径或其他前置条件后，直接回复“继续”或补充新要求，我会从中断步骤继续。';
+      if (pending.resumeState?.checkpointStage === 'step_result') {
+        executionResult = await this.options.resumePlanExecution(
+          pending.resumeState,
+          '用户拒绝当前步骤结果，请根据验收意见重做当前步骤。',
+          { retryCurrentStep: true },
+        );
+      } else if (pending.resumeState?.resumeKind === 'checkpoint' && pending.resumeState.skipStepOnReject) {
+        executionResult = await this.options.resumePlanExecution(pending.resumeState, undefined, { skipCurrentStep: true });
+      } else {
+        executionResult = '已暂停当前计划。等你补齐权限、路径或其他前置条件后，直接回复“继续”或补充新要求，我会从中断步骤继续。';
+      }
       this.options.addAssistantMessage(executionResult);
+    } else if (pending.type === 'tool_execution' || pending.type === 'skill_adoption') {
+      const callbackResult = await pending.callback?.(confirmed, params);
+      if (typeof callbackResult === 'string' && callbackResult.length > 0) {
+        executionResult = callbackResult;
+        this.options.addAssistantMessage(callbackResult);
+      } else if (!confirmed) {
+        executionResult = pending.type === 'skill_adoption'
+          ? '已保留当前 candidate 草稿，暂不自动转正。'
+          : '已取消当前预测工具执行。';
+        this.options.addAssistantMessage(executionResult);
+      }
     }
 
-    pending.callback?.(confirmed, params);
+    if (pending.type !== 'tool_execution' && pending.type !== 'skill_adoption') {
+      await pending.callback?.(confirmed, params);
+    }
     if (this.pendingConfirmation === pending) {
       this.pendingConfirmation = undefined;
       this.options.setState('IDLE');
@@ -167,10 +230,10 @@ export class AgentInteractionService {
 
     if (pending.type === 'plan_execution') {
       if (this.isAffirmative(trimmed)) {
-        return this.confirmAction(true);
+        return this.confirmAction(true, { skipUserMessage: true });
       }
       if (this.isNegative(trimmed)) {
-        return this.confirmAction(false);
+        return this.confirmAction(false, { skipUserMessage: true });
       }
 
       this.pendingConfirmation = undefined;
@@ -181,20 +244,55 @@ export class AgentInteractionService {
     }
 
     if (pending.type === 'plan_resume' && pending.resumeState) {
+      if (pending.resumeState.checkpointStage === 'step_result') {
+        if (this.isAffirmative(trimmed) || this.isResumeSignal(trimmed)) {
+          return this.confirmAction(true, { acceptPendingStepResult: true, skipUserMessage: true });
+        }
+        if (this.isNegative(trimmed)) {
+          return this.confirmAction(false, { skipUserMessage: true });
+        }
+        return this.confirmAction(true, {
+          note: trimmed,
+          retryCurrentStep: true,
+          skipUserMessage: true,
+        });
+      }
+
       if (this.isNegative(trimmed)) {
-        return this.confirmAction(false);
+        return this.confirmAction(false, { skipUserMessage: true });
       }
       return this.confirmAction(true, {
         note: this.isResumeSignal(trimmed) ? undefined : trimmed,
+        skipUserMessage: true,
       });
+    }
+
+    if (pending.type === 'tool_execution') {
+      if (this.isAffirmative(trimmed) || this.isResumeSignal(trimmed)) {
+        return this.confirmAction(true, { skipUserMessage: true });
+      }
+      if (this.isNegative(trimmed)) {
+        return this.confirmAction(false, { skipUserMessage: true });
+      }
+      return this.confirmAction(true, { note: trimmed, revised: true, skipUserMessage: true });
+    }
+
+    if (pending.type === 'skill_adoption') {
+      if (this.isAffirmative(trimmed) || this.isResumeSignal(trimmed)) {
+        return this.confirmAction(true, { skipUserMessage: true });
+      }
+      if (this.isNegative(trimmed) || /(保留草稿|先不转正|不要转正|稍后转正|后面再说|先保留)/i.test(trimmed)) {
+        return this.confirmAction(false, { skipUserMessage: true });
+      }
+      return '请回复“是”自动转正并启用这个 candidate，或回复“否”继续保留草稿。';
     }
 
     if (pending.type === 'write_file') {
       if (this.isAffirmative(trimmed)) {
-        return this.confirmAction(true);
+        return this.confirmAction(true, { skipUserMessage: true });
       }
       if (this.isNegative(trimmed)) {
-        return this.confirmAction(false);
+        return this.confirmAction(false, { skipUserMessage: true });
       }
     }
 

@@ -17,6 +17,11 @@ export interface ToolCallResponseCoordinatorOptions {
   addMessage: (message: Message) => void;
   enterToolCallingState: () => void;
   runPreparedToolCalls: (batch: PreparedToolCallExecutionBatch) => Promise<void>;
+  previewPreparedToolCalls?: (params: {
+    userInput: string;
+    assistantContent: string;
+    batch: PreparedToolCallExecutionBatch;
+  }) => Promise<{ blocked: boolean; prompt?: string }>;
 }
 
 export interface CoordinateToolCallResponseParams {
@@ -29,6 +34,8 @@ export interface CoordinateToolCallResponseParams {
 
 export interface CoordinateToolCallResponseResult {
   handled: boolean;
+  paused?: boolean;
+  output?: string;
   cleanResponse: string;
   toolCallSource: 'native' | 'parsed' | 'none';
 }
@@ -50,14 +57,29 @@ export class ToolCallResponseCoordinator {
       };
     }
 
-    this.options.enterToolCallingState();
-
     const prepared = await this.options.prepareToolCallsForExecution(
       params.userInput,
       cleanResponse || params.prepareFallbackContent || '',
       finalToolCalls,
       true,
     );
+
+    const preview = await this.options.previewPreparedToolCalls?.({
+      userInput: params.userInput,
+      assistantContent: cleanResponse,
+      batch: prepared,
+    });
+    if (preview?.blocked) {
+      return {
+        handled: false,
+        paused: true,
+        output: preview.prompt,
+        cleanResponse,
+        toolCallSource: nativeToolCalls.length > 0 ? 'native' : 'parsed',
+      };
+    }
+
+    this.options.enterToolCallingState();
 
     const assistantMessage = this.options.conversationBridge.createAssistantToolCallMessage(
       cleanResponse,

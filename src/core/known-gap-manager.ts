@@ -33,7 +33,13 @@ export class KnownGapManager {
         return;
       }
 
-      this.currentNotice = `这是已知能力缺口：${strongest.issueSummary}（todo: ${strongest.id}，建议 skill: ${strongest.suggestedSkill}）。`;
+      const repeatText = strongest.occurrenceCount && strongest.occurrenceCount > 1
+        ? `，已重复出现 ${strongest.occurrenceCount} 次`
+        : '';
+      const draftText = strongest.draftedCandidateName
+        ? `，已自动起草 candidate: ${strongest.draftedCandidateName}`
+        : '';
+      this.currentNotice = `这是已知能力缺口：${strongest.issueSummary}（todo: ${strongest.id}，建议 skill: ${strongest.suggestedSkill}${repeatText}${draftText}）。`;
       this.currentContext = [
         'Known skill gap detected for this task.',
         `Start by telling the user exactly this sentence: ${this.currentNotice}`,

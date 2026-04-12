@@ -34,6 +34,13 @@ export class DirectActionLegacyFallbackService {
     for (const skill of this.options.skillManager.getEnabledSkills()) {
       const result = await skill.hooks?.onMessage?.(input, ctx);
       if (result) {
+        await this.options.skillManager.recordSkillUsageObservation?.({
+          skillName: skill.name,
+          trigger: 'message_hook',
+          source: 'onMessage',
+          success: true,
+          summary: result,
+        });
         return {
           handled: true,
           title: `[Skill:${skill.name}]`,
