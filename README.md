@@ -610,10 +610,23 @@ coolAI --cron-daemon
 coolAI --cron-once
 ```
 
+退出 CLI 后，也可以直接用外部命令查看或控制后台 daemon：
+
+```bash
+coolAI status
+coolAI status --json
+coolAI start
+coolAI stop
+coolAI restart
+```
+
 说明：
 - 普通 `coolAI` 启动时会自动确保后台 daemon 存在，关闭当前命令行后定时任务仍继续执行
 - `/q`、`/quit`、`/bye` 只退出当前命令行，不停止后台 daemon
 - `/exit` 会停止后台 daemon 并退出
+- `coolAI status` 会显示后台 daemon、bridge 相关进程，以及 daemon 状态文件、日志文件、配置路径
+- `coolAI status --json` 会输出结构化 JSON，便于脚本或监控读取
+- `coolAI start`、`coolAI stop`、`coolAI restart` 可在不进入交互 CLI 的情况下直接管理后台 daemon
 - `--cron-daemon` 会常驻前台运行定时任务调度器
 - `--cron-once` 会立即检查一次当前到期任务并退出
 - cron 任务保存在 `~/.ai-agent-cli/cron/jobs.json`
@@ -1817,7 +1830,20 @@ coolAI --cron-daemon
 coolAI --cron-once
 ```
 
+After leaving the CLI, you can inspect or control the background daemon directly:
+
+```bash
+coolAI status
+coolAI status --json
+coolAI start
+coolAI stop
+coolAI restart
+```
+
 Notes:
+- `coolAI status` shows daemon and bridge processes, plus the daemon state file, log file, and config path
+- `coolAI status --json` returns structured JSON for scripts or monitoring
+- `coolAI start`, `coolAI stop`, and `coolAI restart` manage the background daemon without entering the interactive CLI
 - `--cron-daemon` keeps the scheduler running in the foreground
 - `--cron-once` checks due jobs once and exits
 - Cron jobs are stored in `~/.ai-agent-cli/cron/jobs.json`
