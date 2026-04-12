@@ -84,7 +84,7 @@ if (args.length === 0 || args[0] === 'run' || args[0] === 'chat') {
   });
 } else if (args[0] === '--help' || args[0] === '-h') {
   console.log(`
-AI Agent CLI - Your intelligent coding assistant
+AI Agent CLI - Your intelligent AI assistant
 
 Usage:
   ai                 Start interactive CLI

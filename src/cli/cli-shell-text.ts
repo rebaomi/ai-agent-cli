@@ -6,7 +6,7 @@ export function buildCliLogo(): string {
   return `
 ╔═══════════════════════════════════════════════════╗
 ║           AI Agent CLI v${APP_VERSION}                     ║
-║   Your intelligent coding assistant                 ║
+║   Your intelligent AI assistant                     ║
 ╚═══════════════════════════════════════════════════╝
 `;
 }
