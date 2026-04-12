@@ -41,6 +41,14 @@ const sandboxSchema = z.object({
   deniedPaths: z.array(z.string()).optional(),
   timeout: z.number().default(30000),
   maxMemory: z.number().optional(),
+  allowCommandExecution: z.boolean().default(true),
+  allowBash: z.boolean().default(process.platform !== 'win32'),
+  allowPowerShell: z.boolean().default(process.platform === 'win32'),
+  commandExecutionMode: z.enum(['shell', 'direct-only', 'allowlist']).default('shell'),
+  commandAllowlist: z.array(z.string()).default([]),
+  allowNetworkRequests: z.boolean().default(true),
+  allowBrowserOpen: z.boolean().default(true),
+  allowBrowserAutomation: z.boolean().default(true),
 });
 
 const providerSchema = z.object({
@@ -244,6 +252,39 @@ const functionRoutingSchema = z.object({
 
 const agentInteractionModeSchema = z.enum(['auto', 'chat', 'task']);
 
+const workflowCheckpointSchema = z.object({
+  enabled: z.boolean().default(true),
+  planApproval: z.boolean().default(true),
+  continuationApproval: z.boolean().default(false),
+  outboundApproval: z.boolean().default(true),
+  riskyDirectActionApproval: z.boolean().default(true),
+  announceCheckpoints: z.boolean().default(true),
+});
+
+const outputChannelLevelSchema = z.enum(['debug', 'info', 'warning', 'error']);
+
+const outputChannelSchema = z.object({
+  enabled: z.boolean().default(true),
+  minLevel: outputChannelLevelSchema.default('info'),
+});
+
+const outputSchema = z.object({
+  pauseOnPermissionPrompt: z.boolean().default(true),
+  separateChannels: z.boolean().default(true),
+  process: outputChannelSchema.default({
+    enabled: true,
+    minLevel: 'info',
+  }),
+  notification: outputChannelSchema.default({
+    enabled: true,
+    minLevel: 'warning',
+  }),
+  permission: outputChannelSchema.default({
+    enabled: true,
+    minLevel: 'info',
+  }),
+});
+
 const larkMorningNewsSchema = z.object({
   userId: z.string().optional(),
   chatId: z.string().optional(),
@@ -331,12 +372,36 @@ const configSchema = z.object({
   artifactOutputDir: z.string().default(getDefaultArtifactOutputDir()),
   documentOutputDir: z.string().optional(),
   workspace: z.string().default(process.cwd()),
-  maxIterations: z.number().default(100),
-  maxToolCallsPerTurn: z.number().int().min(1).max(200).default(20),
-  autoContinueOnToolLimit: z.boolean().default(true),
-  maxContinuationTurns: z.number().int().min(0).max(20).default(5),
+  maxIterations: z.number().default(40),
+  maxToolCallsPerTurn: z.number().int().min(1).max(200).default(8),
+  autoContinueOnToolLimit: z.boolean().default(false),
+  maxContinuationTurns: z.number().int().min(0).max(20).default(1),
   toolTimeout: z.number().default(60000),
   notifications: notificationsSchema,
+  checkpoints: workflowCheckpointSchema.default({
+    enabled: true,
+    planApproval: true,
+    continuationApproval: true,
+    outboundApproval: true,
+    riskyDirectActionApproval: true,
+    announceCheckpoints: true,
+  }),
+  output: outputSchema.default({
+    pauseOnPermissionPrompt: true,
+    separateChannels: true,
+    process: {
+      enabled: true,
+      minLevel: 'info',
+    },
+    notification: {
+      enabled: true,
+      minLevel: 'warning',
+    },
+    permission: {
+      enabled: true,
+      minLevel: 'info',
+    },
+  }),
 });
 
 export type ConfigSchema = z.infer<typeof configSchema>;
@@ -355,11 +420,35 @@ const defaultConfig: ConfigSchema = {
   appBaseDir: getDefaultAppBaseDir(),
   artifactOutputDir: getDefaultArtifactOutputDir(),
   workspace: process.cwd(),
-  maxIterations: 100,
-  maxToolCallsPerTurn: 20,
-  autoContinueOnToolLimit: true,
-  maxContinuationTurns: 5,
+  maxIterations: 40,
+  maxToolCallsPerTurn: 8,
+  autoContinueOnToolLimit: false,
+  maxContinuationTurns: 1,
   toolTimeout: 60000,
+  checkpoints: {
+    enabled: true,
+    planApproval: true,
+    continuationApproval: true,
+    outboundApproval: true,
+    riskyDirectActionApproval: true,
+    announceCheckpoints: true,
+  },
+  output: {
+    pauseOnPermissionPrompt: true,
+    separateChannels: true,
+    process: {
+      enabled: true,
+      minLevel: 'info',
+    },
+    notification: {
+      enabled: true,
+      minLevel: 'warning',
+    },
+    permission: {
+      enabled: true,
+      minLevel: 'info',
+    },
+  },
   hybrid: {
     enabled: true,
     localProvider: 'ollama',
@@ -504,6 +593,14 @@ const defaultConfig: ConfigSchema = {
   sandbox: {
     enabled: true,
     timeout: 30000,
+    allowCommandExecution: true,
+    allowBash: process.platform !== 'win32',
+    allowPowerShell: process.platform === 'win32',
+    commandExecutionMode: 'shell',
+    commandAllowlist: [],
+    allowNetworkRequests: true,
+    allowBrowserOpen: true,
+    allowBrowserAutomation: true,
   },
 };
 

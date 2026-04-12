@@ -6,6 +6,7 @@ import type { Message } from '../types/index.js';
 import { LarkDeliveryWorkflow } from './workflows/lark-delivery.js';
 import { createDirectActionRuntimeComponents } from './direct-action-runtime-factory.js';
 import { DirectActionDispatchService } from './direct-action-dispatch-service.js';
+import type { DirectActionDispatchPreview } from './direct-action-dispatch-service.js';
 import type { IntentResolver } from './intent-resolver.js';
 import type { SessionTaskRecord } from '../types/index.js';
 
@@ -58,6 +59,15 @@ export class DirectActionRouter {
 
   async tryHandle(input: string, binding?: DirectActionBindingContext): Promise<DirectActionResult | null> {
     return this.dispatchService.tryHandle({
+      originalInput: input,
+      effectiveInput: binding?.effectiveInput || input,
+      isFollowUp: binding?.isFollowUp === true,
+      boundTask: binding?.boundTask,
+    });
+  }
+
+  async preview(input: string, binding?: DirectActionBindingContext): Promise<DirectActionDispatchPreview | null> {
+    return this.dispatchService.preview({
       originalInput: input,
       effectiveInput: binding?.effectiveInput || input,
       isFollowUp: binding?.isFollowUp === true,

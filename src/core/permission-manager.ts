@@ -662,6 +662,8 @@ export class PermissionManager {
     msg += `说明: ${request.description}\n`;
     msg += `\n输入:\n`;
     msg += `  ${chalk.green('yes')}  - 授权本次\n`;
+    msg += `  ${chalk.green('task')} - 授权当前任务内同类操作\n`;
+    msg += `  ${chalk.green('batch')} - 授权当前任务内同类操作\n`;
     msg += `  ${chalk.green('all')}  - 永久授权此类操作\n`;
     msg += `  ${chalk.cyan('10m')} - 授权10分钟\n`;
     msg += `  ${chalk.cyan('1h')}  - 授权1小时\n`;
@@ -671,7 +673,7 @@ export class PermissionManager {
     return msg;
   }
 
-  parsePermissionAnswer(answer: string): { granted: boolean; expiresInMs?: number; permanent?: boolean } {
+  parsePermissionAnswer(answer: string): { granted: boolean; expiresInMs?: number; permanent?: boolean; batchCurrentTask?: boolean } {
     const lower = answer.toLowerCase().trim();
     
     if (lower === 'yes' || lower === 'y') {
@@ -680,6 +682,10 @@ export class PermissionManager {
     
     if (lower === 'all') {
       return { granted: true, permanent: true };
+    }
+
+    if (lower === 'task' || lower === 'batch' || lower === 'this-task' || lower === 'current-task') {
+      return { granted: true, batchCurrentTask: true };
     }
     
     if (lower === 'no' || lower === 'n') {

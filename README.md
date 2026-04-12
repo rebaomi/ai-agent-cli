@@ -34,7 +34,7 @@
 - 🔌 **MCP 协议** - 接入 Model Context Protocol 服务器
 - 📝 **LSP 支持** - Language Server Protocol 代码智能提示
 - 🎯 **Skills 系统** - 安装、启用、学习和转正第三方技能扩展
-- 🛡️ **安全沙箱** - 文件、命令、浏览器、网络操作均在受控环境与权限模型下运行
+- 🛡️ **安全沙箱** - 默认采用白名单优先边界；文件与命令执行默认收敛到工作区、artifact 输出目录和 cron 存储目录，并叠加权限确认
 - 📨 **任务与轻量协作工具** - 本地 Task、Team、Peer 消息、Cron 调度统一接入
 - 🏢 **多 Agent 组织架构** - 模拟企业团队协作，多角色 Agent 协同工作
 - 🐱 **AgentCat 电子宠物** - 健康提醒助手，提醒喝水、休息、运动
@@ -91,6 +91,70 @@
 - **Tool Call Bridge**：工具调用解析、意图契约校验、执行与结果回写分层
 - **Direct Action Runtime**：router、dispatch、handler、support、legacy fallback 分层
 - **Lark Delivery Workflow**：飞书发送保留在独立 workflow，只接确定性发送场景
+
+### Agent Runtime Flow
+
+下面这张图对应当前项目里的核心执行路径，重点展示输入路由、plan runtime、tool execution、memory 和 checkpoint 如何串起来：
+
+```mermaid
+flowchart TD
+  A[User Input / CLI / Feishu] --> B[CLI Runtime]
+  B --> C{Function Routing}
+
+  C -->|Direct / deterministic| D[Direct Action Router]
+  C -->|Complex / multi-step| E[Agent Main Chain]
+  C -->|Chat / explanation| E
+
+  D --> D1[Preview Risk]
+  D1 -->|High-risk or outbound| K[Checkpoint / Permission]
+  D1 -->|Safe enough| D2[Dispatch Handler]
+  K -->|Approved| D2
+  K -->|Rejected| Z[Finalize / Cancel]
+
+  E --> E1{Need Plan?}
+  E1 -->|Yes| F[Planner]
+  E1 -->|No| G[Response Turn Executor]
+
+  F --> F1[Plan Summary]
+  F1 --> K
+  K -->|Approved| H[Plan Runtime / Execute Step]
+
+  G --> I[Tool Call Bridge]
+  H --> I
+
+  I --> J[Tool Registry]
+  J --> J1[Built-in Tools]
+  J --> J2[Skills]
+  J --> J3[MCP Tools]
+
+  J1 --> L[Sandbox / Capability Boundary]
+  J2 --> L
+  J3 --> L
+
+  L --> M[Tool Result + Post Processor]
+  M --> N[Context Manager]
+  N --> G
+
+  E --> O[Memory Provider]
+  F --> O
+  G --> O
+  O --> O1[Session Memory]
+  O --> O2[Long-term Facts / Memory Palace]
+  O --> O3[Procedural Skills]
+
+  B --> P[Context Bus / Task Stack]
+  P --> E
+  P --> D
+
+  G --> Q[Streaming Output]
+  D2 --> Q
+  Q --> R[process / notification / permission]
+  R --> S[User Visible Output]
+
+  H --> Z
+  G --> Z
+  D2 --> Z
+```
 
 如果你想看更细的拆分清单，可参考 [docs/agent-refactor-progress.md](docs/agent-refactor-progress.md)。
 
@@ -175,11 +239,11 @@ ollama:
   visionMaxImages: 12
 
 workspace: .
-maxIterations: 100
+maxIterations: 40
 artifactOutputDir: C:/Users/your-name/.ai-agent-cli/outputs
-maxToolCallsPerTurn: 20
-autoContinueOnToolLimit: true
-maxContinuationTurns: 5
+maxToolCallsPerTurn: 8
+autoContinueOnToolLimit: false
+maxContinuationTurns: 1
 
 functionMode: workflow
 
@@ -188,9 +252,33 @@ functionRouting:
   allowAutoSwitchFromChatToWorkflow: true
   announceRouteDecisions: true
 
+checkpoints:
+  enabled: true
+  planApproval: true
+  continuationApproval: true
+  outboundApproval: true
+  riskyDirectActionApproval: true
+  announceCheckpoints: true
+
 sandbox:
   enabled: true
   timeout: 30000
+  # 默认白名单会自动包含 workspace、artifactOutputDir、cron store。
+  # 如需额外路径，显式写入 allowedPaths，而不是依赖隐式放行。
+  allowedPaths: []
+  allowCommandExecution: true
+  # shell: use shell wrapper execution
+  # direct-only: only allow executable + args, no shell metacharacters
+  # allowlist: only allow commands listed in commandAllowlist, also without shell metacharacters
+  commandExecutionMode: shell
+  commandAllowlist: []
+  # Windows 建议 allowBash=false / allowPowerShell=true
+  # Linux/macOS 建议 allowBash=true / allowPowerShell=false
+  allowBash: false
+  allowPowerShell: true
+  allowNetworkRequests: true
+  allowBrowserOpen: true
+  allowBrowserAutomation: true
 ```
 
 其中：
@@ -198,6 +286,12 @@ sandbox:
 - `functionMode` 控制当前默认功能模式，建议保持 `workflow`
 - `functionRouting.preferWorkflow` 会让系统在边界模糊时更倾向任务执行而不是闲聊
 - `functionRouting.allowAutoSwitchFromChatToWorkflow` 允许在 chat 模式下，用户一旦明确提出“切到 workflow / 开始执行任务”，自动回切到 workflow
+- `checkpoints.outboundApproval` 会在外发动作前先卡一次检查点，例如飞书发送
+- `checkpoints.riskyDirectActionApproval` 会在高风险 direct action 前先确认，例如命令执行、浏览器自动化、外部脚本工作流
+- `sandbox.allowedPaths` 采用白名单优先；即使留空，默认也只允许工作区、artifact 输出目录和 cron 存储目录，不会退化成全盘放行
+- `sandbox.allowCommandExecution` / `sandbox.allowBash` / `sandbox.allowPowerShell` 用来显式控制命令能力边界，建议按当前平台只打开必要能力
+- `sandbox.commandExecutionMode` 用来约束 execute_command：`shell` 保持原行为，`direct-only` 禁止 shell 元字符，`allowlist` 只允许白名单命令直执行
+- `sandbox.allowNetworkRequests` / `sandbox.allowBrowserOpen` / `sandbox.allowBrowserAutomation` 用来把 network、browser open、browser automation 分开收敛，而不是只靠权限提示
 
 常用配置文件：
 
@@ -1523,15 +1617,24 @@ ollama:
   model: qwen3.5:9b
 
 workspace: .
-maxIterations: 100
+maxIterations: 40
 artifactOutputDir: C:/Users/your-name/.ai-agent-cli/outputs
-maxToolCallsPerTurn: 20
-autoContinueOnToolLimit: true
-maxContinuationTurns: 5
+maxToolCallsPerTurn: 8
+autoContinueOnToolLimit: false
+maxContinuationTurns: 1
 
 sandbox:
   enabled: true
   timeout: 30000
+  allowedPaths: []
+  allowCommandExecution: true
+  commandExecutionMode: shell
+  commandAllowlist: []
+  allowBash: false
+  allowPowerShell: true
+  allowNetworkRequests: true
+  allowBrowserOpen: true
+  allowBrowserAutomation: true
 ```
 
 Common example files:

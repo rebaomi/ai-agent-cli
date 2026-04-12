@@ -4,11 +4,14 @@ import type { SessionTaskRecordInput } from './session-task-stack-manager.js';
 import type { PendingInteraction } from './agent-interaction-service.js';
 import type { PlanResumeState } from './plan-execution-service.js';
 import type { Plan } from './planner.js';
+import type { DirectActionRiskSummary } from './checkpoint-risk.js';
+import { buildDirectActionCheckpointPrompt } from './checkpoint-risk.js';
 import type {
   AgentGraphCheckpoint,
   AgentGraphState,
   AgentTaskBindingSnapshot,
   UnifiedAgentState,
+  WorkflowCheckpointConfig,
 } from '../types/index.js';
 import {
   applyUnifiedAgentStateToGraph,
@@ -22,6 +25,7 @@ export interface AgentGraphRunnerOptions {
   autoContinueOnToolLimit?: boolean;
   maxContinuationTurns?: number;
   autoConfirmPlanExecution?: boolean;
+  checkpoints?: WorkflowCheckpointConfig;
   getMemoryContext?: (input: string, effectiveInput: string) => Promise<string>;
   onStateChange?: (state: AgentGraphState) => Promise<void> | void;
 }
@@ -88,6 +92,10 @@ export class AgentGraphRunner {
         }
         return this.runFreshTurn(input, graphState);
       case 'direct_action':
+        if (checkpoint.status === 'waiting' && checkpoint.metadata?.pendingType === 'direct_action_execution') {
+          return this.restoreDirectActionTurn(input, graphState, checkpoint, hasPendingInteraction);
+        }
+        return this.runFreshTurn(input, graphState);
       default:
         return this.runFreshTurn(input, graphState);
     }
@@ -104,6 +112,37 @@ export class AgentGraphRunner {
       input: input.input,
       route: 'direct_action',
     });
+
+    const directActionPreview = await this.options.directActionRouter?.preview(input.input, input.taskBinding);
+    if (directActionPreview && this.shouldPauseBeforeDirectAction(directActionPreview.riskSummary)) {
+      const prompt = buildDirectActionCheckpointPrompt(directActionPreview.riskSummary, input.input);
+      this.options.agent.restorePendingInteraction({
+        type: 'direct_action_execution',
+        originalTask: input.input,
+        effectiveInput: input.taskBinding.effectiveInput,
+        prompt,
+        directActionRiskSummary: directActionPreview.riskSummary,
+        callback: () => {},
+      });
+      graphState = await this.transition(graphState, 'direct_action', 'waiting', {
+        summary: prompt,
+        metadata: {
+          route: 'direct_action',
+          pendingType: 'direct_action_execution',
+          directActionRiskSummary: directActionPreview.riskSummary,
+        },
+        input: input.input,
+        route: 'direct_action',
+      });
+
+      return {
+        graphState,
+        checkpoint: graphState.checkpoint!,
+        route: 'direct_action',
+        output: prompt,
+        notices,
+      };
+    }
 
     const directAction = await this.options.directActionRouter?.tryHandle(input.input, input.taskBinding);
     if (directAction?.handled) {
@@ -181,23 +220,115 @@ export class AgentGraphRunner {
       };
     }
 
-    const pending = this.options.agent.getConfirmationStatus();
+    const pendingStatus = this.options.agent.getConfirmationStatus();
+    const pending = this.options.agent.getPendingInteractionDetails();
     const normalizedInput = input.input.trim().toLowerCase();
     const isConfirmed = normalizedInput === '是' || normalizedInput === 'yes' || normalizedInput === 'y';
     const isRejected = normalizedInput === '否' || normalizedInput === 'no' || normalizedInput === 'n';
     let output: string | undefined;
 
-    if (pending.type === 'plan_execution' && (isConfirmed || isRejected)) {
+    if (!pending) {
+      return this.runFreshTurn(input, graphState);
+    }
+
+    if (pending.type === 'direct_action_execution') {
+      if (isRejected) {
+        this.options.agent.clearPendingInteraction();
+        graphState = await this.transition(graphState, 'finalize', 'failed', {
+          summary: '用户取消 direct action 执行',
+          metadata: { pendingType: pending.type },
+          input: input.input,
+          route: 'direct_action',
+        });
+        return {
+          graphState,
+          checkpoint: graphState.checkpoint!,
+          route: 'direct_action',
+          output: '已取消当前 direct action。',
+          notices,
+        };
+      }
+
+      if (isConfirmed) {
+        this.options.agent.clearPendingInteraction();
+        const confirmedInput = pending.effectiveInput || pending.originalTask || input.taskBinding.effectiveInput;
+        graphState = await this.transition(graphState, 'direct_action', 'running', {
+          summary: '用户确认 direct action，开始执行',
+          metadata: { pendingType: pending.type },
+          input: confirmedInput,
+          route: 'direct_action',
+        });
+        const directAction = await this.options.directActionRouter?.tryHandle(confirmedInput, {
+          effectiveInput: confirmedInput,
+          isFollowUp: input.taskBinding.isFollowUp,
+          boundTask: input.taskBinding.boundTask,
+        });
+
+        if (directAction?.handled) {
+          graphState = await this.transition(graphState, 'finalize', directAction.isError ? 'failed' : 'completed', {
+            summary: directAction.isError ? 'direct action 执行失败' : 'direct action 已完成',
+            metadata: {
+              route: 'direct_action',
+              handlerName: directAction.handlerName,
+              category: directAction.category,
+            },
+            input: confirmedInput,
+            output: directAction.output,
+            route: 'direct_action',
+          });
+
+          return {
+            graphState,
+            checkpoint: graphState.checkpoint!,
+            route: 'direct_action',
+            output: directAction.output,
+            directAction,
+            notices,
+            taskRecord: {
+              channel: 'direct_action',
+              title: directAction.title || confirmedInput.trim(),
+              input: confirmedInput,
+              effectiveInput: confirmedInput,
+              category: directAction.category,
+              handlerName: directAction.handlerName,
+              status: directAction.isError ? 'failed' : 'completed',
+              metadata: {
+                ...(input.taskBinding.isFollowUp && input.taskBinding.boundTask
+                  ? { boundTaskId: input.taskBinding.boundTask.id, boundTaskTitle: input.taskBinding.boundTask.title }
+                  : {}),
+                ...(directAction.metadata || {}),
+              },
+            },
+          };
+        }
+
+        graphState = await this.transition(graphState, 'finalize', 'failed', {
+          summary: 'direct action 检查点确认后未找到可执行处理器',
+          metadata: { pendingType: pending.type },
+          input: confirmedInput,
+          route: 'direct_action',
+        });
+        return {
+          graphState,
+          checkpoint: graphState.checkpoint!,
+          route: 'direct_action',
+          output: '已确认 direct action，但当前没有可执行处理器。',
+          notices,
+        };
+      }
+    }
+
+    if (pendingStatus.type === 'plan_execution' && (isConfirmed || isRejected)) {
       graphState = await this.transition(graphState, isConfirmed ? 'resume' : 'finalize', isConfirmed ? 'running' : 'failed', {
         summary: isConfirmed ? '用户确认继续执行计划' : '用户取消执行计划',
-        metadata: { pendingType: pending.type },
+        metadata: { pendingType: pendingStatus.type },
         input: input.input,
         route: 'agent',
       });
       if (isConfirmed) {
         graphState = await this.transition(graphState, 'execute_step', 'running', {
           summary: '进入计划执行',
-          metadata: { pendingType: pending.type },
+          metadata: { pendingType: pendingStatus.type },
           input: input.input,
           route: 'agent',
         });
@@ -206,15 +337,15 @@ export class AgentGraphRunner {
     } else {
       graphState = await this.transition(graphState, 'resume', 'running', {
         summary: '继续处理待补充输入',
-        metadata: { pendingType: pending.type },
+        metadata: { pendingType: pendingStatus.type },
         input: input.input,
         route: 'agent',
       });
 
-      if (pending.type === 'plan_resume') {
+      if (pendingStatus.type === 'plan_resume') {
         graphState = await this.transition(graphState, 'execute_step', 'running', {
           summary: '恢复执行中断计划',
-          metadata: { pendingType: pending.type },
+          metadata: { pendingType: pendingStatus.type },
           input: input.input,
           route: 'agent',
         });
@@ -356,7 +487,7 @@ export class AgentGraphRunner {
     }
 
     if (hasPendingInteraction) {
-      return checkpoint.node !== 'direct_action';
+      return checkpoint.status !== 'completed';
     }
 
     if (checkpoint.status === 'completed' && checkpoint.node === 'finalize') {
@@ -413,6 +544,29 @@ export class AgentGraphRunner {
         notices.push({ level: 'warning', message: 'checkpoint 中缺少计划载荷，已按原任务重新规划。' });
         await this.options.agent.chatWithResolvedInput(originalTask, originalTask);
       }
+    }
+
+    const result = await this.runPendingTurn(input, graphState);
+    return { ...result, notices: [...notices, ...result.notices] };
+  }
+
+  private async restoreDirectActionTurn(
+    input: AgentGraphTurnInput,
+    graphState: AgentGraphState,
+    checkpoint: AgentGraphCheckpoint,
+    hasPendingInteraction: boolean,
+  ): Promise<AgentGraphTurnResult> {
+    const notices: AgentGraphNotice[] = [];
+    if (!hasPendingInteraction) {
+      this.options.agent.restorePendingInteraction({
+        type: 'direct_action_execution',
+        originalTask: this.getCheckpointOriginalTask(checkpoint, input.taskBinding.effectiveInput),
+        effectiveInput: this.getCheckpointEffectiveInput(checkpoint, input.taskBinding.effectiveInput),
+        prompt: checkpoint.summary || 'direct action 已命中风险检查点，等待确认执行。',
+        directActionRiskSummary: this.getCheckpointDirectActionRiskSummary(checkpoint),
+        callback: () => {},
+      });
+      notices.push({ level: 'info', message: '已根据 checkpoint 恢复到 direct action 检查点，继续等待确认。' });
     }
 
     const result = await this.runPendingTurn(input, graphState);
@@ -503,8 +657,14 @@ export class AgentGraphRunner {
     if (pending?.plan) {
       metadata.plan = pending.plan;
     }
+    if (pending?.effectiveInput) {
+      metadata.effectiveInput = pending.effectiveInput;
+    }
     if (pending?.resumeState) {
       metadata.resumeState = pending.resumeState;
+    }
+    if (pending?.directActionRiskSummary) {
+      metadata.directActionRiskSummary = pending.directActionRiskSummary;
     }
     if (state.currentNode === 'finalize' && state.status === 'waiting' && state.toolBudget.needsContinuation) {
       metadata.continuation = true;
@@ -530,6 +690,18 @@ export class AgentGraphRunner {
   private getCheckpointPlan(checkpoint: AgentGraphCheckpoint): Plan | undefined {
     const plan = checkpoint.metadata?.plan;
     return this.isPlan(plan) ? plan : undefined;
+  }
+
+  private getCheckpointEffectiveInput(checkpoint: AgentGraphCheckpoint, fallback: string): string {
+    const effectiveInput = checkpoint.metadata?.effectiveInput;
+    return typeof effectiveInput === 'string' && effectiveInput.trim().length > 0
+      ? effectiveInput
+      : fallback;
+  }
+
+  private getCheckpointDirectActionRiskSummary(checkpoint: AgentGraphCheckpoint): DirectActionRiskSummary | undefined {
+    const summary = checkpoint.metadata?.directActionRiskSummary;
+    return this.isDirectActionRiskSummary(summary) ? summary : undefined;
   }
 
   private getCheckpointResumeState(checkpoint: AgentGraphCheckpoint): PlanResumeState | undefined {
@@ -569,6 +741,33 @@ export class AgentGraphRunner {
       && Array.isArray(candidate.results)
       && typeof candidate.blockedStepDescription === 'string'
       && typeof candidate.blockedReason === 'string';
+  }
+
+  private isDirectActionRiskSummary(value: unknown): value is DirectActionRiskSummary {
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+
+    const summary = value as Record<string, unknown>;
+    return typeof summary.handlerName === 'string'
+      && typeof summary.category === 'string'
+      && Array.isArray(summary.items);
+  }
+
+  private shouldPauseBeforeDirectAction(summary: DirectActionRiskSummary): boolean {
+    if (this.options.checkpoints?.enabled === false) {
+      return false;
+    }
+
+    if (summary.hasOutboundDelivery && this.options.checkpoints?.outboundApproval !== false) {
+      return true;
+    }
+
+    if (summary.hasRiskyActions && this.options.checkpoints?.riskyDirectActionApproval !== false) {
+      return true;
+    }
+
+    return false;
   }
 }
 

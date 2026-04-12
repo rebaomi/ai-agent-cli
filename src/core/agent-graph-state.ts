@@ -6,15 +6,16 @@ import type {
   AgentGraphRoute,
   AgentGraphState,
   AGENT_GRAPH_STATE_SCHEMA_VERSION,
+  ContextBusState,
   TASK_CONTEXT_SCHEMA_VERSION,
   AgentTaskBindingSnapshot,
+  SessionTaskContextSnapshot,
   UnifiedAgentState,
 } from '../types/index.js';
 import {
   AGENT_GRAPH_STATE_SCHEMA_VERSION as AGENT_GRAPH_STATE_SCHEMA_VERSION_VALUE,
   TASK_CONTEXT_SCHEMA_VERSION as TASK_CONTEXT_SCHEMA_VERSION_VALUE,
 } from '../types/index.js';
-import type { SessionTaskContextSnapshot } from './session-task-stack-manager.js';
 
 export interface TaskContextJsonPayload {
   schemaVersion: typeof TASK_CONTEXT_SCHEMA_VERSION_VALUE;
@@ -22,6 +23,7 @@ export interface TaskContextJsonPayload {
   taskContext: SessionTaskContextSnapshot;
   graphState?: AgentGraphState;
   agentState?: UnifiedAgentState;
+  contextBus?: ContextBusState;
 }
 
 export interface CreateAgentGraphStateOptions {
@@ -126,6 +128,7 @@ export function buildTaskContextJsonPayload(
   taskContext: SessionTaskContextSnapshot,
   graphState?: AgentGraphState,
   agentState?: UnifiedAgentState,
+  contextBus?: ContextBusState,
 ): TaskContextJsonPayload {
   return {
     schemaVersion: TASK_CONTEXT_SCHEMA_VERSION_VALUE,
@@ -133,6 +136,7 @@ export function buildTaskContextJsonPayload(
     taskContext,
     graphState,
     agentState,
+    contextBus,
   };
 }
 
@@ -143,6 +147,10 @@ export function deriveCheckpointFromUnifiedAgentState(state: UnifiedAgentState):
 
   if (state.pendingInteraction?.type === 'plan_execution') {
     return createAgentCheckpoint('plan', 'waiting', state.lastUserInput, '计划已生成，等待用户确认执行');
+  }
+
+  if (state.pendingInteraction?.type === 'direct_action_execution') {
+    return createAgentCheckpoint('direct_action', 'waiting', state.lastUserInput, 'direct action 已命中风险检查点，等待用户确认执行');
   }
 
   if (state.pendingInteraction?.type === 'plan_resume') {

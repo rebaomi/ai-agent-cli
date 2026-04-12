@@ -28,15 +28,26 @@ import { createDirectActionRouter, DirectActionRouter } from '../core/direct-act
 import { IntentResolver } from '../core/intent-resolver.js';
 import { parseOnboardingInput } from '../core/onboarding.js';
 import { PermissionManager, permissionManager } from '../core/permission-manager.js';
+import type { PermissionType } from '../core/permission-manager.js';
 import { createPlanner } from '../core/planner.js';
 import { createTaskManager, TaskManager } from '../core/task-manager.js';
 import { createCronManager, CronManager } from '../core/cron-manager.js';
 import { createMemoryProvider, type MemoryProvider } from '../core/memory-provider.js';
 import { progressTracker } from '../utils/progress.js';
-import { printSuccess, printError, printWarning, printInfo, createStreamingOutput, StreamingOutput } from '../utils/output.js';
+import {
+  printSuccess,
+  printError,
+  printWarning,
+  printInfo,
+  createStreamingOutput,
+  StreamingOutput,
+  createOutputCoordinator,
+  type OutputCoordinator,
+  type OutputCoordinatorEntry,
+  type OutputLevel,
+} from '../utils/output.js';
 import { normalizeDisplayText } from '../utils/text-repair.js';
-import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
-import { extractObsidianVaultPath } from '../core/obsidian-config.js';
+import { getArtifactOutputDir } from '../utils/path-resolution.js';
 import { LarkRelayAgent, type LarkRelayMessage, type LarkRelayStatus } from '../lark/relay-agent.js';
 import type { AgentInteractionMode, FunctionMode, LarkRelayConfig } from '../types/index.js';
 import { BackgroundDaemonManager, type BackgroundDaemonStatus } from '../core/background-daemon.js';
@@ -48,6 +59,7 @@ import * as readline from 'readline';
 import { BrowserWorkflowService } from '../browser-agent/workflows/browser-workflow-service.js';
 import { buildBrowserWorkflowQuickFixDrafts } from '../browser-agent/workflows/browser-workflow-quick-fix.js';
 import { buildTaskContextJsonPayload, createAgentCheckpoint, createAgentGraphState, deriveCheckpointFromUnifiedAgentState } from '../core/agent-graph-state.js';
+import { ContextBus } from '../core/context-bus.js';
 import { createOllamaVisionService } from '../core/ollama-vision-service.js';
 import { SessionTaskStackManager } from '../core/session-task-stack-manager.js';
 import type { AgentGraphState, AgentTaskBindingSnapshot } from '../types/index.js';
@@ -65,6 +77,11 @@ interface PendingLarkInlineReply {
   chatId?: string;
   senderId?: string;
   resolve: (answer: string) => void;
+}
+
+interface TaskScopedPermissionApproval {
+  scopeId: string;
+  type: PermissionType;
 }
 
 export class CLI {
@@ -123,8 +140,12 @@ export class CLI {
   private currentInputMode: 'cli' | 'feishu' = 'cli';
   private splitScreen?: SplitScreenRenderer;
   private lastProcessLogMessage = '';
+  private readonly outputCoordinator: OutputCoordinator;
   private readonly sessionTaskStack = new SessionTaskStackManager();
+  private readonly contextBus = new ContextBus();
   private readonly chatRouter = new ChatRouter();
+  private currentExecutionScopeId?: string;
+  private readonly taskScopedPermissionApprovals: TaskScopedPermissionApproval[] = [];
   private pendingDirectActionPreamble?: string;
   private lastGraphState?: AgentGraphState;
   private activeLarkReplyTarget?: LarkRelayMessage;
@@ -144,22 +165,26 @@ export class CLI {
     this.newsOutputDir = path.join(this.appBaseDir, 'outputs', 'tencent-news');
     this.sessionTaskStackDir = path.join(this.appBaseDir, 'runtime', 'session-task-stack');
     this.backgroundDaemon = new BackgroundDaemonManager(this.appBaseDir);
+    this.outputCoordinator = createOutputCoordinator({
+      getPolicy: (channel) => this.getOutputChannelPolicy(channel),
+      write: (entry) => this.renderOutputEntry(entry),
+    });
   }
 
   async initialize(): Promise<void> {
     console.log(chalk.cyan(logo));
     console.log(chalk.gray('Initializing...\n'));
-    
+
     const config = configManager.getAgentConfig();
     this.workspace = config.workspace || this.workspace;
     this.applyGlobalPathsFromConfig(config);
 
     this.memoryManager = createMemoryManager();
     await this.memoryManager.initialize();
-    printSuccess('Memory manager ready');
+    this.writeNotification('info', 'Memory manager ready');
     const discardedPinnedSessionId = this.memoryManager.consumeDiscardedPinnedSessionId();
     if (discardedPinnedSessionId) {
-      printInfo(`检测到跨天旧会话，已自动新建会话: ${discardedPinnedSessionId} -> ${this.memoryManager.getCurrentSessionId()}`);
+      this.writeNotification('info', `检测到跨天旧会话，已自动新建会话: ${discardedPinnedSessionId} -> ${this.memoryManager.getCurrentSessionId()}`);
     }
     await this.loadPersistedSessionTaskStack();
 
@@ -167,7 +192,7 @@ export class CLI {
 
     this.enhancedMemory = createEnhancedMemoryManager();
     await this.enhancedMemory.initialize();
-    printSuccess('Enhanced memory ready');
+    this.writeNotification('info', 'Enhanced memory ready');
 
     this.userProfile = userProfileManager;
     await this.userProfile.initialize();
@@ -175,7 +200,7 @@ export class CLI {
     if (profile) {
       this.isFirstInteraction = false;
       this.awaitingOnboardingInput = false;
-      printSuccess('User profile loaded');
+      this.writeNotification('info', 'User profile loaded');
       this.syncProfileToEnhancedMemory();
     } else {
       this.isFirstInteraction = true;
@@ -190,34 +215,33 @@ export class CLI {
 
     this.taskManager = createTaskManager();
     await this.taskManager.initialize();
-    printSuccess('Task manager ready');
+    this.writeNotification('info', 'Task manager ready');
 
     this.cronManager = createCronManager();
     await this.cronManager.initialize();
-    printSuccess('Cron manager ready');
+    this.writeNotification('info', 'Cron manager ready');
 
     if (this.options.ensureBackgroundDaemon && !this.options.runLocalCronScheduler) {
       await this.ensureBackgroundCronDaemon(true);
     }
 
     this.currentProvider = config.defaultProvider || 'ollama';
-    
     this.llm = this.createLLMClient(config);
     this.intentResolver = new IntentResolver(this.llm);
-    
+
     let connected = false;
     let connectionError = '';
-    
+
     try {
       connected = await Promise.race([
         this.llm.checkConnection(),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000))
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000)),
       ]);
     } catch (error) {
       connectionError = error instanceof Error ? error.message : String(error);
-      printWarning(`Failed to connect to ${this.currentProvider}: ${connectionError}`);
+      this.writeNotification('warning', `Failed to connect to ${this.currentProvider}: ${connectionError}`);
     }
-    
+
     if (!connected) {
       if (this.currentProvider === 'ollama') {
         console.log(chalk.yellow('\n⚠️  Ollama 未连接'));
@@ -235,41 +259,24 @@ export class CLI {
         console.log(chalk.yellow(`\n⚠️  ${this.currentProvider} 未连接: ${connectionError}`));
       }
     } else {
-      printSuccess(`Connected to ${this.currentProvider} (${this.llm.getModel()})`);
+      this.writeNotification('info', `Connected to ${this.currentProvider} (${this.llm.getModel()})`);
     }
 
-    const sandboxConfig = config.sandbox || { enabled: true, timeout: 30000 };
-    if (!sandboxConfig.allowedPaths) {
-      sandboxConfig.allowedPaths = [config.workspace || process.cwd()];
-    }
+    const sandboxConfig = this.buildRestrictedSandboxConfig(config);
     const artifactOutputDir = getArtifactOutputDir({
       workspace: this.workspace,
       artifactOutputDir: config.artifactOutputDir,
       documentOutputDir: config.documentOutputDir,
     });
-    const desktopPath = getDesktopPath();
-    const cronStoreDir = this.cronManager.getStoreDir();
-    const obsidianVaultPath = extractObsidianVaultPath(config);
-    for (const extraPath of [artifactOutputDir, desktopPath, cronStoreDir, obsidianVaultPath].filter(Boolean) as string[]) {
-      if (!sandboxConfig.allowedPaths.includes(extraPath)) {
-        sandboxConfig.allowedPaths.push(extraPath);
-      }
-    }
-    const permConfig = this.permissionMgr.getConfig();
-    for (const allowedPath of permConfig.allowedPaths) {
-      if (!sandboxConfig.allowedPaths.includes(allowedPath)) {
-        sandboxConfig.allowedPaths.push(allowedPath);
-      }
-    }
     this.sandbox = new Sandbox(sandboxConfig);
     await this.sandbox.initialize();
-    printSuccess('Sandbox ready');
-    printInfo(`当前 artifact 输出目录: ${artifactOutputDir}`);
+    this.writeNotification('info', 'Sandbox ready');
+    this.writeNotification('info', `当前 artifact 输出目录: ${artifactOutputDir}`);
 
     await this.skillManager.initialize();
     const skills = await this.skillManager.listSkills();
     if (skills.length > 0) {
-      printSuccess(skills.length + ' skills loaded');
+      this.writeNotification('info', skills.length + ' skills loaded');
     }
 
     this.builtInTools = new BuiltInTools(this.sandbox, this.lspManager, {
@@ -279,7 +286,7 @@ export class CLI {
       workspace: this.workspace,
       config: config as unknown as Record<string, unknown>,
     });
-    printSuccess(this.builtInTools.getTools().length + ' built-in tools');
+    this.writeNotification('info', this.builtInTools.getTools().length + ' built-in tools');
     this.configureCronRuntime();
 
     if (config.mcp && config.mcp.length > 0) {
@@ -287,7 +294,7 @@ export class CLI {
       for (const mcpConfig of config.mcp) {
         try {
           await this.mcpManager.addServer(mcpConfig);
-          printSuccess('MCP server: ' + mcpConfig.name);
+          this.writeNotification('info', 'MCP server: ' + mcpConfig.name);
         } catch (error) {
           printError('MCP server ' + mcpConfig.name + ': ' + (error instanceof Error ? error.message : String(error)));
         }
@@ -301,7 +308,7 @@ export class CLI {
         config: config.memory,
         skillManager: this.skillManager,
       });
-      printSuccess(`Memory provider ready (${this.memoryProvider.backend})`);
+      this.writeNotification('info', `Memory provider ready (${this.memoryProvider.backend})`);
       await this.memoryProvider.store({
         kind: 'project',
         key: 'artifact_output_dir',
@@ -327,7 +334,7 @@ export class CLI {
       for (const lspConfig of config.lsp) {
         try {
           await this.lspManager.addServer(lspConfig, `file://${this.workspace}`);
-          printSuccess('LSP server: ' + lspConfig.name);
+          this.writeNotification('info', 'LSP server: ' + lspConfig.name);
         } catch (error) {
           printError('LSP server ' + lspConfig.name + ': ' + (error instanceof Error ? error.message : String(error)));
         }
@@ -353,7 +360,7 @@ export class CLI {
     if (restoredMessages.length > 0) {
       this.agent.setMessages(restoredMessages);
       await this.memoryProvider?.syncSession(restoredMessages);
-      printInfo(`Resumed session: ${this.memoryManager.getCurrentSessionId()} (${restoredMessages.length} messages)`);
+      this.writeNotification('info', `Resumed session: ${this.memoryManager.getCurrentSessionId()} (${restoredMessages.length} messages)`);
     }
 
     if (this.awaitingOnboardingInput) {
@@ -362,7 +369,7 @@ export class CLI {
 
     await this.restartLarkRelay(config);
 
-    printInfo(`当前模式: input=${this.currentInputMode}, function=${this.getFunctionMode()}`);
+    this.writeNotification('info', `当前模式: input=${this.currentInputMode}, function=${this.getFunctionMode()}`);
     console.log(chalk.gray('\nType /? for commands, or ask me anything!\n'));
   }
 
@@ -371,22 +378,43 @@ export class CLI {
     this.permissionHandlerSetup = true;
 
     this.permissionMgr.onPermissionRequest(async (request) => {
-      const prompt = this.permissionMgr!.showPermissionRequest(request);
-      console.log(prompt);
-      await this.sendPermissionPromptToActiveLarkTarget(prompt);
-
-      const answer = await this.requestInlineApprovalAnswer();
-      const result = this.permissionMgr!.parsePermissionAnswer(answer);
-
-      if (result.granted) {
-        if (result.permanent) {
-          this.permissionMgr!.grantPermission(request.type, request.resource);
-        } else if (result.expiresInMs) {
-          this.permissionMgr!.grantPermission(request.type, request.resource, result.expiresInMs);
-        }
+      if (this.hasTaskScopedPermissionApproval(request.type)) {
+        return true;
       }
 
-      return result.granted;
+      const prompt = this.permissionMgr!.showPermissionRequest(request);
+      const pauseOnPrompt = configManager.getAgentConfig().output?.pauseOnPermissionPrompt !== false;
+      const pauseToken = `permission:${request.id}`;
+      if (pauseOnPrompt) {
+        this.outputCoordinator.pause(pauseToken);
+        this.streamingOutput?.clear();
+      }
+
+      try {
+        this.outputCoordinator.write({ channel: 'permission', level: 'info', text: prompt });
+        await this.sendPermissionPromptToActiveLarkTarget(prompt);
+
+        const answer = await this.requestInlineApprovalAnswer();
+        const result = this.permissionMgr!.parsePermissionAnswer(answer);
+
+        if (result.granted && result.batchCurrentTask) {
+          this.addTaskScopedPermissionApproval(request.type);
+        }
+
+        if (result.granted) {
+          if (result.permanent) {
+            this.permissionMgr!.grantPermission(request.type, request.resource);
+          } else if (result.expiresInMs) {
+            this.permissionMgr!.grantPermission(request.type, request.resource, result.expiresInMs);
+          }
+        }
+
+        return result.granted;
+      } finally {
+        if (pauseOnPrompt) {
+          this.outputCoordinator.resume(pauseToken);
+        }
+      }
     });
   }
 
@@ -568,11 +596,11 @@ export class CLI {
           .filter(Boolean)
           .join(' | ');
         console.log();
-        printInfo(`[Lark Relay] 收到手机端消息${sourceParts ? ` (${sourceParts})` : ''}`);
+        this.writeNotification('info', `[Lark Relay] 收到手机端消息${sourceParts ? ` (${sourceParts})` : ''}`);
         console.log(chalk.gray(trimmed));
 
         if (this.currentInputMode !== 'feishu') {
-          printInfo('[Mode] 当前为 cli 模式，已忽略这条飞书消息。');
+          this.writeNotification('info', '[Mode] 当前为 cli 模式，已忽略这条飞书消息。');
           return;
         }
       }
@@ -583,7 +611,7 @@ export class CLI {
       }
 
       if (source === 'cli' && this.currentInputMode === 'feishu') {
-        printInfo('当前为 feishu 模式，命令行仅接收 / 命令。输入 /mode switch cli 可切回命令行交互。');
+        this.writeNotification('info', '当前为 feishu 模式，命令行仅接收 / 命令。输入 /mode switch cli 可切回命令行交互。');
         return;
       }
 
@@ -621,18 +649,18 @@ export class CLI {
 
     this.larkRelay = new LarkRelayAgent(relayConfig);
     this.larkRelay.on('started', (summary: string) => {
-      printSuccess(`Lark relay subscribed (${summary})`);
+      this.writeNotification('info', `[Lark Relay] subscribed (${summary})`);
     });
     this.larkRelay.on('stderr', (message: string) => {
       if (!relayConfig.quiet) {
-        printInfo(`[Lark Relay] ${message}`);
+        this.writeNotification('info', `[Lark Relay] ${message}`);
       }
     });
     this.larkRelay.on('stopped', (detail: string) => {
-      printInfo(`[Lark Relay] stopped (${detail})`);
+      this.writeNotification('warning', `[Lark Relay] stopped (${detail})`);
     });
     this.larkRelay.on('error', (error: Error) => {
-      printWarning(`[Lark Relay] ${error.message}`);
+      this.writeNotification('warning', `[Lark Relay] ${error.message}`);
     });
     this.larkRelay.on('message', (message: LarkRelayMessage) => {
       void (async () => {
@@ -657,11 +685,11 @@ export class CLI {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (/another event \+subscribe instance is already running/i.test(message)) {
-        printWarning('[Lark Relay] 检测到已有 event +subscribe 实例占用飞书长连接。请先关闭旧订阅进程，再让当前 CLI 接管手机端消息。');
+        this.writeNotification('warning', '[Lark Relay] 检测到已有 event +subscribe 实例占用飞书长连接。请先关闭旧订阅进程，再让当前 CLI 接管手机端消息。');
       } else if (/exited shortly after startup/i.test(message)) {
-        printWarning('[Lark Relay] 订阅进程启动后立即退出，当前不会自动接管飞书输入。常见原因是已有旧的 event +subscribe 实例仍在运行。');
+        this.writeNotification('warning', '[Lark Relay] 订阅进程启动后立即退出，当前不会自动接管飞书输入。常见原因是已有旧的 event +subscribe 实例仍在运行。');
       } else {
-        printWarning(`[Lark Relay] subscribe failed: ${message}`);
+        this.writeNotification('warning', `[Lark Relay] subscribe failed: ${message}`);
       }
       await this.stopLarkRelay();
       return false;
@@ -776,13 +804,7 @@ export class CLI {
       return;
     }
     this.lastProcessLogMessage = normalized;
-
-    if (this.splitScreen?.isActive()) {
-      this.splitScreen.appendRight(repaired);
-      return;
-    }
-
-    console.log(repaired);
+    this.outputCoordinator.write({ channel: 'process', level: 'info', text: repaired });
   }
 
   private formatProcessEventContent(content: string | undefined, fallback: string): string {
@@ -807,7 +829,7 @@ export class CLI {
     const relayStatus = await this.getRelayStatusAgent().getStatus();
     console.log(`Relay Running: ${relayStatus.running ? 'yes' : 'no'}`);
     if (relayStatus.externalOccupancy) {
-      printWarning('[Mode] 检测到外部 event +subscribe 实例占用当前飞书长连接。');
+      this.writeNotification('warning', '[Mode] 检测到外部 event +subscribe 实例占用当前飞书长连接。');
     }
     console.log();
   }
@@ -964,7 +986,7 @@ export class CLI {
   }
 
   private async showRelayStatus(): Promise<void> {
-    printInfo('[Lark Relay] 正在检测 relay 状态...');
+    this.writeNotification('info', '[Lark Relay] 正在检测 relay 状态...');
     const relay = this.getRelayStatusAgent();
     const status = await relay.getStatus();
 
@@ -993,7 +1015,7 @@ export class CLI {
     }
 
     if (status.externalOccupancy) {
-      printWarning('[Lark Relay] 检测到外部 event +subscribe 实例占用。当前 CLI 不会强抢长连接。');
+      this.writeNotification('warning', '[Lark Relay] 检测到外部 event +subscribe 实例占用。当前 CLI 不会强抢长连接。');
     }
 
     console.log();
@@ -1001,7 +1023,7 @@ export class CLI {
 
   private async reconnectLarkRelay(): Promise<void> {
     if (this.currentInputMode !== 'feishu') {
-      printInfo('[Lark Relay] 当前为 cli 模式。若要让 Agent 接管飞书输入，请使用 /mode switch feishu。');
+      this.writeNotification('info', '[Lark Relay] 当前为 cli 模式。若要让 Agent 接管飞书输入，请使用 /mode switch feishu。');
       return;
     }
 
@@ -1009,12 +1031,12 @@ export class CLI {
     const relayConfig = this.buildModeRelayConfig(config);
 
     if (!relayConfig?.enabled) {
-      printWarning('[Lark Relay] 当前配置未启用 relay。');
+      this.writeNotification('warning', '[Lark Relay] 当前配置未启用 relay。');
       return;
     }
 
     if (relayConfig.autoSubscribe === false) {
-      printWarning('[Lark Relay] relay 已启用，但 autoSubscribe=false；当前不会自动订阅。');
+      this.writeNotification('warning', '[Lark Relay] relay 已启用，但 autoSubscribe=false；当前不会自动订阅。');
       return;
     }
 
@@ -1025,7 +1047,7 @@ export class CLI {
 
     const confirmed = await this.confirmRelayReconnect(before);
     if (!confirmed) {
-      printInfo('[Lark Relay] 已取消重连。');
+      this.writeNotification('info', '[Lark Relay] 已取消重连。');
       return;
     }
 
@@ -1038,16 +1060,16 @@ export class CLI {
     }
 
     if (after.externalOccupancy) {
-      printWarning('[Lark Relay] 重连后仍检测到外部实例占用，当前 CLI 尚未接管订阅。');
+      this.writeNotification('warning', '[Lark Relay] 重连后仍检测到外部实例占用，当前 CLI 尚未接管订阅。');
       return;
     }
 
-    printWarning('[Lark Relay] 重连已执行，但 relay 仍未处于运行状态。可先用 /relay status 查看详情。');
+    this.writeNotification('warning', '[Lark Relay] 重连已执行，但 relay 仍未处于运行状态。可先用 /relay status 查看详情。');
   }
 
   private async startLarkRelayFromCommand(): Promise<void> {
     if (this.currentInputMode !== 'feishu') {
-      printInfo('[Lark Relay] 当前为 cli 模式。若要让 Agent 接管飞书输入，请使用 /mode switch feishu。');
+      this.writeNotification('info', '[Lark Relay] 当前为 cli 模式。若要让 Agent 接管飞书输入，请使用 /mode switch feishu。');
       return;
     }
 
@@ -1055,18 +1077,18 @@ export class CLI {
     const relayConfig = this.buildModeRelayConfig(config);
 
     if (!relayConfig?.enabled) {
-      printWarning('[Lark Relay] 当前配置未启用 relay。');
+      this.writeNotification('warning', '[Lark Relay] 当前配置未启用 relay。');
       return;
     }
 
     if (relayConfig.autoSubscribe === false) {
-      printWarning('[Lark Relay] relay 已启用，但 autoSubscribe=false；当前不会自动订阅。');
+      this.writeNotification('warning', '[Lark Relay] relay 已启用，但 autoSubscribe=false；当前不会自动订阅。');
       return;
     }
 
     const status = await this.getRelayStatusAgent().getStatus();
     if (status.running) {
-      printInfo('[Lark Relay] 当前 relay 已在运行。');
+      this.writeNotification('info', '[Lark Relay] 当前 relay 已在运行。');
       return;
     }
 
@@ -1080,19 +1102,19 @@ export class CLI {
     }
 
     if (after.externalOccupancy) {
-      printWarning('[Lark Relay] 启动失败，仍检测到外部实例占用。');
+      this.writeNotification('warning', '[Lark Relay] 启动失败，仍检测到外部实例占用。');
       return;
     }
 
-    printWarning('[Lark Relay] 启动已执行，但 relay 仍未运行。可先用 /relay status 查看详情。');
+    this.writeNotification('warning', '[Lark Relay] 启动已执行，但 relay 仍未运行。可先用 /relay status 查看详情。');
   }
 
   private async stopLarkRelayFromCommand(): Promise<void> {
     const status = await this.getRelayStatusAgent().getStatus();
     if (!status.running) {
-      printInfo('[Lark Relay] 当前 CLI 没有正在运行的 relay。');
+      this.writeNotification('info', '[Lark Relay] 当前 CLI 没有正在运行的 relay。');
       if (status.externalOccupancy) {
-        printWarning('[Lark Relay] 仍检测到外部 subscribe 实例；/relay stop 不会停止外部进程。');
+        this.writeNotification('warning', '[Lark Relay] 仍检测到外部 subscribe 实例；/relay stop 不会停止外部进程。');
       }
       return;
     }
@@ -1119,7 +1141,7 @@ export class CLI {
     }
 
     for (const warning of warnings) {
-      printWarning(`[Lark Relay] ${warning}`);
+      this.writeNotification('warning', `[Lark Relay] ${warning}`);
     }
 
     const answer = await this.promptInline('确认执行 relay 重连？输入 yes 继续: ');
@@ -1131,13 +1153,13 @@ export class CLI {
     const actionLabel = action === 'start' ? '启动' : '重连';
 
     if (status.running) {
-      printInfo(`[Lark Relay] 当前 relay 正在运行 (pid=${status.currentPid || 'unknown'})，将执行${actionLabel}。`);
+      this.writeNotification('info', `[Lark Relay] 当前 relay 正在运行 (pid=${status.currentPid || 'unknown'})，将执行${actionLabel}。`);
     }
 
     if (externalProcesses.length > 0) {
-      printWarning(`[Lark Relay] 检测到 ${externalProcesses.length} 个外部 subscribe 实例:`);
+      this.writeNotification('warning', `[Lark Relay] 检测到 ${externalProcesses.length} 个外部 subscribe 实例:`);
       for (const processInfo of externalProcesses) {
-        printWarning(`[Lark Relay] external pid=${processInfo.pid} ${processInfo.commandLine}`);
+        this.writeNotification('warning', `[Lark Relay] external pid=${processInfo.pid} ${processInfo.commandLine}`);
       }
     }
   }
@@ -1465,6 +1487,9 @@ export class CLI {
       }
     });
 
+    const executionScopeId = this.createExecutionScopeId(taskBinding);
+    this.currentExecutionScopeId = executionScopeId;
+
     try {
       const functionMode = this.getFunctionMode();
       if (functionMode === 'chat') {
@@ -1493,6 +1518,11 @@ export class CLI {
       this.lastGraphState = undefined;
       await this.persistSessionTaskStack();
       printError('Failed to get response: ' + (error instanceof Error ? error.message : String(error)));
+    } finally {
+      this.taskScopedPermissionApprovals.splice(0, this.taskScopedPermissionApprovals.length, ...this.taskScopedPermissionApprovals.filter(item => item.scopeId !== executionScopeId));
+      if (this.currentExecutionScopeId === executionScopeId) {
+        this.currentExecutionScopeId = undefined;
+      }
     }
     
     console.log();
@@ -1510,11 +1540,11 @@ export class CLI {
     if (functionSwitch?.target === 'workflow' && config.functionRouting?.allowAutoSwitchFromChatToWorkflow !== false) {
       await this.switchFunctionMode('workflow', { resetTaskState: false, announce: false });
       if (functionSwitch.remainingInput) {
-        printInfo('检测到你要切回 workflow，已自动切换并继续按任务执行。');
+        this.writeNotification('info', '检测到你要切回 workflow，已自动切换并继续按任务执行。');
         const nextBinding = this.sessionTaskStack.resolveInput(functionSwitch.remainingInput);
         await this.handleTaskModeMessage(functionSwitch.remainingInput, nextBinding);
       } else {
-        printSuccess('已自动切换到 workflow 模式。');
+        this.writeNotification('info', '已自动切换到 workflow 模式。');
       }
       return;
     }
@@ -1524,7 +1554,7 @@ export class CLI {
     if (confirmationStatus.pending) {
       if (agent.shouldTreatPendingInputAsNewRequest(trimmed)) {
         agent.clearPendingInteraction();
-        printInfo('检测到这是一个新的独立请求，已跳过上一条待补充状态。');
+        this.writeNotification('info', '检测到这是一个新的独立请求，已跳过上一条待补充状态。');
       } else {
         const normalizedInput = trimmed.toLowerCase();
         const isConfirmed = normalizedInput === '是' || normalizedInput === 'yes' || normalizedInput === 'y';
@@ -1532,13 +1562,13 @@ export class CLI {
         let result: string | undefined;
 
         if (confirmationStatus.type === 'plan_execution' && (isConfirmed || isRejected)) {
-          printInfo(isConfirmed ? '确认执行计划...' : '取消执行计划');
+          this.writeNotification('info', isConfirmed ? '确认执行计划...' : '取消执行计划');
           result = await agent.confirmAction(isConfirmed);
           if (isRejected) {
             this.failTrackedTask('用户取消执行计划');
           }
         } else {
-          printInfo('继续处理待补充信息...');
+          this.writeNotification('info', '继续处理待补充信息...');
           result = await agent.respondToPendingInput(trimmed);
         }
 
@@ -1565,7 +1595,7 @@ export class CLI {
 
     while (autoContinueOnToolLimit && agent.needsContinuation() && continuationTurns < maxContinuationTurns) {
       continuationTurns++;
-      printInfo(`当前响应达到单轮工具上限，自动继续第 ${continuationTurns}/${maxContinuationTurns} 轮...`);
+      this.writeNotification('info', `当前响应达到单轮工具上限，自动继续第 ${continuationTurns}/${maxContinuationTurns} 轮...`);
       const continuedResponse = await agent.continueResponse();
       if (continuedResponse.trim()) {
         response = response.trim() ? `${response.trim()}\n${continuedResponse.trim()}` : continuedResponse.trim();
@@ -1573,7 +1603,7 @@ export class CLI {
     }
 
     if (agent.needsContinuation()) {
-      printWarning('当前任务在自动续跑后仍未完成。可直接回复“继续”，或切到 task 模式获得完整 workflow 控制。');
+      this.writeNotification('warning', '当前任务在自动续跑后仍未完成。可直接回复“继续”，或切到 task 模式获得完整 workflow 控制。');
     }
 
     this.memoryManager.setMessages(agent.getMessages());
@@ -1624,6 +1654,7 @@ export class CLI {
       agent,
       directActionRouter: this.directActionRouter,
       permissionManager: this.permissionMgr,
+      checkpoints: config.checkpoints,
       autoContinueOnToolLimit: config.autoContinueOnToolLimit ?? true,
       maxContinuationTurns: config.maxContinuationTurns ?? 3,
       memoryProvider: this.memoryProvider,
@@ -1641,16 +1672,12 @@ export class CLI {
     );
 
     if (result.executionContext.shouldAnnounceWorkflow && result.executionContext.mode !== 'pending_interaction') {
-      printInfo(result.executionContext.summary);
+      this.writeNotification('info', result.executionContext.summary);
     }
     this.reportTaskExecutionPolicy(result.executionPolicy);
 
     for (const notice of result.notices) {
-      if (notice.level === 'warning') {
-        printWarning(notice.message);
-      } else {
-        printInfo(notice.message);
-      }
+      this.writeNotification(notice.level === 'warning' ? 'warning' : 'info', notice.message);
     }
 
     if (result.route === 'direct_action' && result.directAction?.handled) {
@@ -1712,21 +1739,108 @@ export class CLI {
       return;
     }
 
-    printInfo(detail);
+    this.writeNotification('info', detail);
   }
 
   private reportTaskExecutionPolicy(policy: {
     toolBudget: { toolCallCount: number; maxToolCallsPerTurn: number; maxIterations: number; lastStopReason: string };
     permissionStrategy: string;
     checkpointResumeHint?: string;
+    checkpoints: { enabled: boolean; planApproval: boolean; continuationApproval: boolean; outboundApproval: boolean; riskyDirectActionApproval: boolean };
   }): void {
-    const detail = `[Workflow Policy] budget=${policy.toolBudget.toolCallCount}/${policy.toolBudget.maxToolCallsPerTurn} | iterations=${policy.toolBudget.maxIterations} | permissions=${policy.permissionStrategy}${policy.checkpointResumeHint ? ` | resume=${policy.checkpointResumeHint}` : ''}`;
+    const checkpointDetail = policy.checkpoints.enabled
+      ? ` | checkpoints=plan:${policy.checkpoints.planApproval ? 'manual' : 'auto'},continue:${policy.checkpoints.continuationApproval ? 'manual' : 'auto'},outbound:${policy.checkpoints.outboundApproval ? 'manual' : 'auto'},direct:${policy.checkpoints.riskyDirectActionApproval ? 'manual' : 'auto'}`
+      : ' | checkpoints=off';
+    const detail = `[Workflow Policy] budget=${policy.toolBudget.toolCallCount}/${policy.toolBudget.maxToolCallsPerTurn} | iterations=${policy.toolBudget.maxIterations} | permissions=${policy.permissionStrategy}${checkpointDetail}${policy.checkpointResumeHint ? ` | resume=${policy.checkpointResumeHint}` : ''}`;
     if (this.splitScreen?.isActive()) {
       this.writeProcessLog(detail);
       return;
     }
 
-    printInfo(detail);
+    this.writeNotification('info', detail);
+  }
+
+  private getOutputChannelPolicy(channel: 'process' | 'notification' | 'permission'): { enabled?: boolean; minLevel?: OutputLevel } | undefined {
+    const outputConfig = configManager.getAgentConfig().output;
+    switch (channel) {
+      case 'process':
+        return outputConfig?.process;
+      case 'notification':
+        return outputConfig?.notification;
+      case 'permission':
+        return outputConfig?.permission;
+    }
+  }
+
+  private renderOutputEntry(entry: OutputCoordinatorEntry): void {
+    const text = normalizeDisplayText(entry.text);
+    if (this.splitScreen?.isActive()) {
+      const decorated = entry.channel === 'permission'
+        ? `[permission] ${text}`
+        : entry.channel === 'notification'
+          ? `[notify:${entry.level}] ${text}`
+          : text;
+      this.splitScreen.appendRight(decorated);
+      return;
+    }
+
+    if (entry.channel === 'permission') {
+      console.log(text);
+      return;
+    }
+
+    if (entry.channel === 'process') {
+      console.log(text);
+      return;
+    }
+
+    switch (entry.level) {
+      case 'error':
+        printError(text);
+        break;
+      case 'warning':
+        printWarning(text);
+        break;
+      case 'debug':
+      case 'info':
+        printInfo(text);
+        break;
+    }
+  }
+
+  private writeNotification(level: OutputLevel, message: string): void {
+    this.outputCoordinator.write({ channel: 'notification', level, text: message });
+  }
+
+  private createExecutionScopeId(taskBinding: ReturnType<SessionTaskStackManager['resolveInput']>): string {
+    if (taskBinding.boundTask?.id) {
+      return `task:${taskBinding.boundTask.id}:${Date.now().toString(36)}`;
+    }
+
+    return `run:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  private hasTaskScopedPermissionApproval(type: PermissionType): boolean {
+    const scopeId = this.currentExecutionScopeId;
+    if (!scopeId) {
+      return false;
+    }
+
+    return this.taskScopedPermissionApprovals.some(item => item.scopeId === scopeId && item.type === type);
+  }
+
+  private addTaskScopedPermissionApproval(type: PermissionType): void {
+    const scopeId = this.currentExecutionScopeId;
+    if (!scopeId) {
+      return;
+    }
+
+    if (this.hasTaskScopedPermissionApproval(type)) {
+      return;
+    }
+
+    this.taskScopedPermissionApprovals.push({ scopeId, type });
+    this.writeNotification('info', `[Permission] 已批量授权当前任务内的 ${type} 操作。`);
   }
 
   private parseFunctionSwitchRequest(input: string): { target: FunctionMode; remainingInput?: string } | null {
@@ -1800,7 +1914,7 @@ export class CLI {
       if (this.splitScreen?.isActive()) {
         this.writeProcessLog(`[Hybrid] ${parts.join(' | ')}`);
       } else {
-        printInfo(`[Hybrid] ${parts.join(' | ')}`);
+        this.writeNotification('info', `[Hybrid] ${parts.join(' | ')}`);
       }
       return;
     }
@@ -1814,7 +1928,7 @@ export class CLI {
       if (this.splitScreen?.isActive()) {
         this.writeProcessLog(`[DeepSeek] target=${route.target} | model=${route.model} | reason=${this.describeDeepSeekRouteReason(route.reason)}`);
       } else {
-        printInfo(`[DeepSeek] target=${route.target} | model=${route.model} | reason=${this.describeDeepSeekRouteReason(route.reason)}`);
+        this.writeNotification('info', `[DeepSeek] target=${route.target} | model=${route.model} | reason=${this.describeDeepSeekRouteReason(route.reason)}`);
       }
     }
   }
@@ -2081,7 +2195,7 @@ export class CLI {
     });
 
     if (!silent) {
-      printSuccess(`Background daemon ready${status.pid > 0 ? ` (pid=${status.pid})` : ''}`);
+      this.writeNotification('info', `Background daemon ready${status.pid > 0 ? ` (pid=${status.pid})` : ''}`);
     }
 
     return status;
@@ -2111,9 +2225,9 @@ export class CLI {
 
     const stopped = await this.backgroundDaemon?.stop();
     if (stopped) {
-      printSuccess('Background daemon stopped');
+      this.writeNotification('info', 'Background daemon stopped');
     } else {
-      printInfo('Background daemon was not running');
+      this.writeNotification('info', 'Background daemon was not running');
     }
   }
 
@@ -2370,7 +2484,12 @@ export class CLI {
       const snapshot = this.sessionTaskStack.getContextSnapshot(10);
       const agentState = this.agent?.getUnifiedStateSnapshot(undefined, snapshot.checkpoint);
       const graphState = this.buildCurrentGraphState(agentState);
-      console.log(JSON.stringify(buildTaskContextJsonPayload(snapshot, graphState, agentState), null, 2));
+      console.log(JSON.stringify(buildTaskContextJsonPayload(snapshot, graphState, agentState, this.contextBus.exportState()), null, 2));
+      return;
+    }
+
+    if (mode === 'bus') {
+      this.printContextBusInspect();
       return;
     }
 
@@ -2474,6 +2593,40 @@ export class CLI {
       }
       console.log();
     }
+
+    const currentTaskSnapshot = this.contextBus.getCurrentSnapshot('task_stack', this.memoryManager.getCurrentSessionId());
+    if (currentTaskSnapshot) {
+      console.log(chalk.cyan('context bus'));
+      console.log(chalk.gray(`  currentTaskSnapshot=${currentTaskSnapshot.id}`));
+      console.log(chalk.gray(`  lineageDepth=${this.contextBus.getLineage(currentTaskSnapshot.id).length}`));
+      console.log(chalk.gray(`  children=${this.contextBus.getChildren(currentTaskSnapshot.id).length}`));
+      console.log();
+    }
+  }
+
+  private printContextBusInspect(): void {
+    const scopeId = this.memoryManager.getCurrentSessionId();
+    const snapshots = this.contextBus.findSnapshots({ scopeId, limit: 20 });
+    console.log(chalk.bold('\n🧠 Context Bus:\n'));
+
+    if (snapshots.length === 0) {
+      console.log(chalk.gray('当前还没有记录上下文快照。'));
+      return;
+    }
+
+    for (const snapshot of snapshots) {
+      console.log(chalk.cyan(`${snapshot.layer} ${snapshot.title || snapshot.id}`));
+      console.log(chalk.gray(`  id=${snapshot.id}`));
+      console.log(chalk.gray(`  rootId=${snapshot.rootId}`));
+      if (snapshot.parentId) {
+        console.log(chalk.gray(`  parentId=${snapshot.parentId}`));
+      }
+      if (snapshot.taskId) {
+        console.log(chalk.gray(`  taskId=${snapshot.taskId}`));
+      }
+      console.log(chalk.gray(`  updatedAt=${snapshot.updatedAt}`));
+      console.log();
+    }
   }
 
   private getSessionTaskStackPath(sessionId = this.memoryManager.getCurrentSessionId()): string {
@@ -2482,9 +2635,12 @@ export class CLI {
 
   private async loadPersistedSessionTaskStack(sessionId = this.memoryManager.getCurrentSessionId()): Promise<void> {
     await this.sessionTaskStack.loadFromFile(this.getSessionTaskStackPath(sessionId));
+    this.contextBus.replaceState(this.sessionTaskStack.getContextBusState());
   }
 
   private async persistSessionTaskStack(sessionId = this.memoryManager.getCurrentSessionId()): Promise<void> {
+    this.syncContextBus(sessionId);
+    this.sessionTaskStack.setContextBusState(this.contextBus.exportState());
     await this.sessionTaskStack.saveToFile(this.getSessionTaskStackPath(sessionId));
   }
 
@@ -2492,6 +2648,162 @@ export class CLI {
     this.lastGraphState = graphState;
     this.sessionTaskStack.setCheckpoint(graphState?.checkpoint);
     await this.persistSessionTaskStack();
+  }
+
+  private syncContextBus(sessionId = this.memoryManager.getCurrentSessionId()): void {
+    const taskContext = this.sessionTaskStack.getContextSnapshot(10);
+    const graphState = this.lastGraphState;
+    const agentState = this.agent?.getUnifiedStateSnapshot(graphState?.taskBinding, graphState?.checkpoint ?? taskContext.checkpoint);
+    const activeTask = taskContext.activeTask;
+    const parentTaskSnapshotId = this.resolveParentContextSnapshotId(taskContext, sessionId);
+
+    const taskSnapshot = this.contextBus.captureSnapshot({
+      layer: 'task_stack',
+      scopeId: sessionId,
+      externalKey: activeTask ? `task:${activeTask.id}` : `task-stack:${sessionId}`,
+      parentId: parentTaskSnapshotId,
+      taskId: activeTask?.id,
+      title: activeTask?.title || 'session task stack',
+      payload: {
+        taskContext,
+        checkpoint: taskContext.checkpoint,
+        metadata: {
+          activeTaskId: activeTask?.id,
+          recentTaskCount: taskContext.recentTasks.length,
+        },
+      },
+    });
+
+    if (activeTask) {
+      activeTask.metadata = {
+        ...(activeTask.metadata || {}),
+        contextSnapshotId: taskSnapshot.id,
+      };
+    }
+
+    if (graphState) {
+      const graphSnapshot = this.contextBus.captureSnapshot({
+        layer: 'graph',
+        scopeId: sessionId,
+        externalKey: `graph:${activeTask?.id || 'session'}:${graphState.checkpoint?.updatedAt || graphState.currentNode}`,
+        parentId: taskSnapshot.id,
+        taskId: activeTask?.id,
+        title: graphState.checkpoint?.summary || `${graphState.currentNode}:${graphState.status}`,
+        payload: {
+          taskContext,
+          graphState,
+          checkpoint: graphState.checkpoint,
+          metadata: {
+            route: graphState.route,
+            currentNode: graphState.currentNode,
+            status: graphState.status,
+          },
+        },
+      });
+
+      if (agentState) {
+        this.contextBus.captureSnapshot({
+          layer: 'agent',
+          scopeId: sessionId,
+          externalKey: `agent:${activeTask?.id || 'session'}:${graphState.checkpoint?.updatedAt || 'no-checkpoint'}:${agentState.toolBudget.iteration}`,
+          parentId: graphSnapshot.id,
+          taskId: activeTask?.id,
+          title: `agent:${agentState.state}`,
+          payload: {
+            taskContext,
+            graphState,
+            agentState,
+            checkpoint: agentState.checkpoint,
+            runtimeMemoryContext: agentState.runtimeMemoryContext,
+            metadata: {
+              state: agentState.state,
+              pendingInteractionType: agentState.pendingInteraction?.type,
+              toolCallCount: agentState.toolBudget.toolCallCount,
+            },
+          },
+        });
+      }
+      return;
+    }
+
+    if (agentState) {
+      this.contextBus.captureSnapshot({
+        layer: 'agent',
+        scopeId: sessionId,
+        externalKey: `agent:${activeTask?.id || 'session'}:standalone:${agentState.toolBudget.iteration}`,
+        parentId: taskSnapshot.id,
+        taskId: activeTask?.id,
+        title: `agent:${agentState.state}`,
+        payload: {
+          taskContext,
+          agentState,
+          checkpoint: agentState.checkpoint,
+          runtimeMemoryContext: agentState.runtimeMemoryContext,
+          metadata: {
+            state: agentState.state,
+            pendingInteractionType: agentState.pendingInteraction?.type,
+            toolCallCount: agentState.toolBudget.toolCallCount,
+          },
+        },
+      });
+    }
+  }
+
+  private buildRestrictedSandboxConfig(config: ReturnType<typeof configManager.getAgentConfig>): NonNullable<typeof config.sandbox> {
+    const workspace = config.workspace || this.workspace || process.cwd();
+    const artifactOutputDir = getArtifactOutputDir({
+      workspace: this.workspace,
+      appBaseDir: config.appBaseDir,
+      artifactOutputDir: config.artifactOutputDir,
+      documentOutputDir: config.documentOutputDir,
+    });
+    const cronStoreDir = this.cronManager?.getStoreDir() || path.join(this.appBaseDir, 'cron');
+    const configuredAllowedPaths = config.sandbox?.allowedPaths || [];
+    const allowedPaths = Array.from(new Set([
+      workspace,
+      artifactOutputDir,
+      cronStoreDir,
+      ...configuredAllowedPaths,
+    ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0)));
+
+    return {
+      enabled: config.sandbox?.enabled ?? true,
+      allowedPaths,
+      deniedPaths: config.sandbox?.deniedPaths,
+      timeout: config.sandbox?.timeout ?? 30000,
+      maxMemory: config.sandbox?.maxMemory,
+      allowCommandExecution: config.sandbox?.allowCommandExecution ?? true,
+      allowBash: config.sandbox?.allowBash ?? (process.platform !== 'win32'),
+      allowPowerShell: config.sandbox?.allowPowerShell ?? (process.platform === 'win32'),
+      commandExecutionMode: config.sandbox?.commandExecutionMode ?? 'shell',
+      commandAllowlist: config.sandbox?.commandAllowlist ?? [],
+      allowNetworkRequests: config.sandbox?.allowNetworkRequests ?? true,
+      allowBrowserOpen: config.sandbox?.allowBrowserOpen ?? true,
+      allowBrowserAutomation: config.sandbox?.allowBrowserAutomation ?? true,
+    };
+  }
+
+  private resolveParentContextSnapshotId(
+    taskContext: ReturnType<SessionTaskStackManager['getContextSnapshot']>,
+    sessionId: string,
+  ): string | undefined {
+    const activeTask = taskContext.activeTask;
+    if (!activeTask) {
+      return undefined;
+    }
+
+    const boundTaskId = typeof activeTask.metadata?.boundTaskId === 'string'
+      ? activeTask.metadata.boundTaskId
+      : undefined;
+    if (!boundTaskId) {
+      return undefined;
+    }
+
+    const boundTask = taskContext.recentBindings.find(binding => binding.sourceTask.id === activeTask.id)?.targetTask
+      || taskContext.recentTasks.find(task => task.id === boundTaskId);
+    return typeof boundTask?.metadata?.contextSnapshotId === 'string'
+      ? boundTask.metadata.contextSnapshotId
+      : undefined;
   }
 
   private buildCurrentGraphState(agentState?: ReturnType<Agent['getUnifiedStateSnapshot']>): AgentGraphState | undefined {
@@ -4636,7 +4948,7 @@ ${chalk.gray('/cron create-morning-feishu-group')}
         return;
       }
 
-      printInfo('当前启用了本地 cron 调度模式，/daemon start|stop|restart 不适用。');
+      this.writeNotification('info', '当前启用了本地 cron 调度模式，/daemon start|stop|restart 不适用。');
       return;
     }
 
@@ -4680,22 +4992,22 @@ ${chalk.gray('/cron create-morning-feishu-group')}
       }
       case 'start': {
         const status = await this.ensureBackgroundCronDaemon();
-        printSuccess(`Background daemon started${status?.pid ? ` (pid=${status.pid})` : ''}`);
+        this.writeNotification('info', `Background daemon started${status?.pid ? ` (pid=${status.pid})` : ''}`);
         break;
       }
       case 'stop': {
         const stopped = await this.backgroundDaemon?.stop();
         if (stopped) {
-          printSuccess('Background daemon stopped');
+          this.writeNotification('info', 'Background daemon stopped');
         } else {
-          printInfo('Background daemon was not running');
+          this.writeNotification('info', 'Background daemon was not running');
         }
         break;
       }
       case 'restart': {
         await this.backgroundDaemon?.stop();
         const status = await this.ensureBackgroundCronDaemon();
-        printSuccess(`Background daemon restarted${status?.pid ? ` (pid=${status.pid})` : ''}`);
+        this.writeNotification('info', `Background daemon restarted${status?.pid ? ` (pid=${status.pid})` : ''}`);
         break;
       }
       case 'help':
@@ -5068,10 +5380,10 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       console.log(chalk.cyan(logo));
 
       if (result.saved) {
-        printSuccess(`Config saved: ${configManager.getConfigPath()}`);
+        this.writeNotification('info', `Config saved: ${configManager.getConfigPath()}`);
         await this.reloadRuntimeConfig();
       } else {
-        printInfo('Config editor closed without saving.');
+        this.writeNotification('info', 'Config editor closed without saving.');
       }
     } catch (error) {
       console.clear();
@@ -5100,10 +5412,10 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       await this.rebuildRuntimeFromConfig(config, previousMessages);
       const connected = this.llm ? await this.llm.checkConnection().catch(() => false) : false;
       if (connected) {
-        printSuccess(`Config reloaded from ${configPath}`);
-        printInfo(`当前 provider: ${this.currentProvider} (${this.llm?.getModel() || 'unknown'})`);
+        this.writeNotification('info', `Config reloaded from ${configPath}`);
+        this.writeNotification('info', `当前 provider: ${this.currentProvider} (${this.llm?.getModel() || 'unknown'})`);
       } else {
-        printWarning(`Config reloaded from ${configPath}，但 ${this.currentProvider} 当前未连接`);
+        this.writeNotification('warning', `Config reloaded from ${configPath}，但 ${this.currentProvider} 当前未连接`);
       }
     } catch (error) {
       printError(`Runtime refresh failed after config reload: ${error instanceof Error ? error.message : String(error)}`);
@@ -5127,10 +5439,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
   }
 
   private async rebuildRuntimeFromConfig(config: any, messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: any[]; tool_call_id?: string; name?: string }>): Promise<void> {
-    const sandboxConfig = config.sandbox || { enabled: true, timeout: 30000 };
-    if (!sandboxConfig.allowedPaths) {
-      sandboxConfig.allowedPaths = [config.workspace || this.workspace || process.cwd()];
-    }
+    const sandboxConfig = this.buildRestrictedSandboxConfig(config);
 
     const artifactOutputDir = getArtifactOutputDir({
       workspace: this.workspace,
@@ -5138,19 +5447,6 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       artifactOutputDir: config.artifactOutputDir,
       documentOutputDir: config.documentOutputDir,
     });
-    const desktopPath = getDesktopPath();
-    const obsidianVaultPath = extractObsidianVaultPath(config);
-    for (const extraPath of [artifactOutputDir, desktopPath, obsidianVaultPath].filter(Boolean) as string[]) {
-      if (!sandboxConfig.allowedPaths.includes(extraPath)) {
-        sandboxConfig.allowedPaths.push(extraPath);
-      }
-    }
-    const permConfig = this.permissionMgr?.getConfig();
-    for (const allowedPath of permConfig?.allowedPaths || []) {
-      if (!sandboxConfig.allowedPaths.includes(allowedPath)) {
-        sandboxConfig.allowedPaths.push(allowedPath);
-      }
-    }
 
     this.sandbox = new Sandbox(sandboxConfig);
     await this.sandbox.initialize();
@@ -5239,7 +5535,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       try {
         await this.mcpManager.addServer(mcpConfig);
       } catch (error) {
-        printWarning(`MCP server ${mcpConfig.name} reload failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.writeNotification('warning', `MCP server ${mcpConfig.name} reload failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
@@ -5251,7 +5547,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
       try {
         await this.lspManager.addServer(lspConfig, `file://${this.workspace}`);
       } catch (error) {
-        printWarning(`LSP server ${lspConfig.name} reload failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.writeNotification('warning', `LSP server ${lspConfig.name} reload failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
@@ -5367,16 +5663,16 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
 
       if (connected) {
         if (normalizedProvider === 'deepseek') {
-          printSuccess(`Switched to provider: ${normalizedProvider} (${this.llm?.getModel() || 'unknown'})`);
-          printInfo('DeepSeek auto reasoning 已启用：将同时使用 deepseek-chat 和 deepseek-reasoner，并根据复杂度自动切换。');
+          this.writeNotification('info', `Switched to provider: ${normalizedProvider} (${this.llm?.getModel() || 'unknown'})`);
+          this.writeNotification('info', 'DeepSeek auto reasoning 已启用：将同时使用 deepseek-chat 和 deepseek-reasoner，并根据复杂度自动切换。');
         } else {
-          printSuccess(`Switched to provider: ${normalizedProvider} (${this.llm?.getModel() || 'unknown'})`);
+          this.writeNotification('info', `Switched to provider: ${normalizedProvider} (${this.llm?.getModel() || 'unknown'})`);
         }
       } else {
         if (normalizedProvider === 'deepseek') {
-          printWarning(`Switched to ${normalizedProvider} and enabled auto reasoning, but connection failed.`);
+          this.writeNotification('warning', `Switched to ${normalizedProvider} and enabled auto reasoning, but connection failed.`);
         } else {
-          printWarning(`Switched to ${normalizedProvider}, but connection failed.`);
+          this.writeNotification('warning', `Switched to ${normalizedProvider}, but connection failed.`);
         }
       }
     } catch (error) {
@@ -5476,7 +5772,7 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
           console.log(output);
         }
       } catch (error) {
-        printWarning(`MemPalace status failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.writeNotification('warning', `MemPalace status failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     } else if (serverName === 'lark') {
       try {
@@ -5487,8 +5783,8 @@ ${chalk.cyan('/daemon restart')}                 重启后台 daemon
           console.log(output);
         }
       } catch (error) {
-        printWarning(`Lark auth status failed: ${error instanceof Error ? error.message : String(error)}`);
-        printInfo('Try: /mcp reconnect lark');
+        this.writeNotification('warning', `Lark auth status failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.writeNotification('info', 'Try: /mcp reconnect lark');
       }
     } else if (tools.length > 0) {
       console.log();

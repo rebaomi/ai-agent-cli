@@ -1,18 +1,21 @@
 import type { Plan } from './planner.js';
 import type { AgentState } from './agent.js';
 import type { PlanResumeState } from './plan-execution-service.js';
+import type { DirectActionRiskSummary } from './checkpoint-risk.js';
 import { resolveKnownWebsiteUrl } from './site-aliases.js';
 import type { AgentPendingInteractionSnapshot, AgentPlanResumeSnapshot } from '../types/index.js';
 
-export type PendingInteractionType = 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume';
+export type PendingInteractionType = 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume' | 'direct_action_execution';
 
 export interface PendingInteraction {
   type: PendingInteractionType;
   callback?: (confirmed: boolean, params?: any) => void;
   plan?: Plan;
   originalTask?: string;
+  effectiveInput?: string;
   prompt?: string;
   resumeState?: PlanResumeState;
+  directActionRiskSummary?: DirectActionRiskSummary;
 }
 
 export interface AgentInteractionServiceOptions {

@@ -166,6 +166,42 @@ functionRouting:
     - 切换workflow
     - 切换到工作流
 
+checkpoints:
+  enabled: true
+  planApproval: true
+  continuationApproval: true
+  outboundApproval: true
+  riskyDirectActionApproval: true
+  announceCheckpoints: true
+
+output:
+  pauseOnPermissionPrompt: true
+  separateChannels: true
+  process:
+    enabled: true
+    minLevel: info
+  notification:
+    enabled: true
+    minLevel: warning
+  permission:
+    enabled: true
+    minLevel: info
+
+sandbox:
+  enabled: true
+  timeout: 30000
+  allowedPaths: []
+  allowCommandExecution: true
+  # shell: 保持现有 shell 包装执行；direct-only: 只允许可执行文件 + 参数；allowlist: 仅允许白名单命令直执行
+  commandExecutionMode: shell
+  commandAllowlist: []
+  # Windows 推荐 allowBash=false, allowPowerShell=true；Linux/macOS 推荐 allowBash=true, allowPowerShell=false
+  allowBash: false
+  allowPowerShell: true
+  allowNetworkRequests: true
+  allowBrowserOpen: true
+  allowBrowserAutomation: true
+
 browserAgent:
   enabled: true
   mode: smart
@@ -367,11 +403,11 @@ artifactOutputDir: C:/Users/your-name/.ai-agent-cli/outputs
 # documentOutputDir: C:/Users/your-name/Documents/coolAI
 
 # 单轮最多执行多少次工具调用。不是模型供应商限制，是 CLI 本地控制阈值。
-maxToolCallsPerTurn: 20
+maxToolCallsPerTurn: 8
 # 达到单轮上限后，CLI 是否自动开启下一轮继续执行。
-autoContinueOnToolLimit: true
+autoContinueOnToolLimit: false
 # 自动续跑的最大轮数。总工具预算约等于 maxToolCallsPerTurn * (1 + maxContinuationTurns)
-maxContinuationTurns: 5
+maxContinuationTurns: 1
 
 sandbox:
   enabled: true
@@ -382,13 +418,21 @@ sandbox:
   deniedPaths:
     - /etc
     - /sys
+  allowCommandExecution: true
+  commandExecutionMode: shell
+  commandAllowlist: []
+  allowBash: false
+  allowPowerShell: true
+  allowNetworkRequests: true
+  allowBrowserOpen: true
+  allowBrowserAutomation: true
 ```
 
 ## 其他配置
 
 ```yaml
 workspace: .
-maxIterations: 100
+maxIterations: 40
 toolTimeout: 60000
 
 notifications:

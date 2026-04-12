@@ -2,7 +2,7 @@ import type { MemoryProvider } from './memory-provider.js';
 import type { DirectActionRouter } from './direct-action-router.js';
 import type { Agent } from './agent.js';
 import { createAgentGraphRunner } from './agent-graph-runner.js';
-import type { AgentGraphCheckpoint, AgentGraphState, AgentTaskBindingSnapshot } from '../types/index.js';
+import type { AgentGraphCheckpoint, AgentGraphState, AgentTaskBindingSnapshot, WorkflowCheckpointConfig } from '../types/index.js';
 import type { AgentGraphTurnResult } from './agent-graph-runner.js';
 import type { PermissionManager } from './permission-manager.js';
 
@@ -14,6 +14,7 @@ export interface TaskExecutorServiceOptions {
   recallLimit: number;
   autoContinueOnToolLimit: boolean;
   maxContinuationTurns: number;
+  checkpoints?: WorkflowCheckpointConfig;
   onStateChange?: (graphState: AgentGraphState) => Promise<void> | void;
 }
 
@@ -35,6 +36,13 @@ export interface TaskExecutorTurnResult extends AgentGraphTurnResult {
     };
     permissionStrategy: 'auto_grant_dangerous' | 'ask_dangerous' | 'deny_dangerous' | 'unknown';
     checkpointResumeHint?: string;
+    checkpoints: {
+      enabled: boolean;
+      planApproval: boolean;
+      continuationApproval: boolean;
+      outboundApproval: boolean;
+      riskyDirectActionApproval: boolean;
+    };
   };
 }
 
@@ -83,8 +91,10 @@ export class TaskExecutorService {
     const runner = createAgentGraphRunner({
       agent: this.options.agent,
       directActionRouter: this.options.directActionRouter,
-      autoContinueOnToolLimit: this.options.autoContinueOnToolLimit,
+      autoContinueOnToolLimit: this.shouldAutoContinueOnToolLimit(),
       maxContinuationTurns: this.options.maxContinuationTurns,
+      autoConfirmPlanExecution: !this.requiresPlanApproval(),
+      checkpoints: this.options.checkpoints,
       getMemoryContext: async (originalInput, effectiveInput) => {
         return this.options.memoryProvider?.buildContext(originalInput || effectiveInput, this.options.recallLimit) || '';
       },
@@ -96,6 +106,21 @@ export class TaskExecutorService {
       taskBinding,
       checkpoint,
     });
+
+    if (this.options.checkpoints?.announceCheckpoints !== false) {
+      const pending = this.options.agent.getConfirmationStatus();
+      if (pending.pending && pending.type === 'plan_execution') {
+        turnResult.notices.push({ level: 'info', message: '已进入计划确认检查点，等待你确认后继续执行。' });
+      }
+
+      if (this.requiresContinuationApproval() && this.options.agent.needsContinuation()) {
+        turnResult.notices.push({ level: 'info', message: '已进入续跑检查点。回复“继续”后再进入下一轮工具执行。' });
+      }
+
+      if (pending.pending && pending.type === 'direct_action_execution') {
+        turnResult.notices.push({ level: 'info', message: '已进入 direct action 检查点，等待你确认高风险或外发操作。' });
+      }
+    }
 
     return {
       ...turnResult,
@@ -128,6 +153,33 @@ export class TaskExecutorService {
       },
       permissionStrategy,
       checkpointResumeHint: executionContext.isResuming ? executionContext.summary : undefined,
+      checkpoints: {
+        enabled: this.options.checkpoints?.enabled !== false,
+        planApproval: this.requiresPlanApproval(),
+        continuationApproval: this.requiresContinuationApproval(),
+        outboundApproval: this.requiresOutboundApproval(),
+        riskyDirectActionApproval: this.requiresRiskyDirectActionApproval(),
+      },
     };
+  }
+
+  private requiresPlanApproval(): boolean {
+    return this.options.checkpoints?.enabled !== false && this.options.checkpoints?.planApproval !== false;
+  }
+
+  private requiresContinuationApproval(): boolean {
+    return this.options.checkpoints?.enabled !== false && this.options.checkpoints?.continuationApproval === true;
+  }
+
+  private requiresOutboundApproval(): boolean {
+    return this.options.checkpoints?.enabled !== false && this.options.checkpoints?.outboundApproval !== false;
+  }
+
+  private requiresRiskyDirectActionApproval(): boolean {
+    return this.options.checkpoints?.enabled !== false && this.options.checkpoints?.riskyDirectActionApproval !== false;
+  }
+
+  private shouldAutoContinueOnToolLimit(): boolean {
+    return this.requiresContinuationApproval() ? false : this.options.autoContinueOnToolLimit;
   }
 }

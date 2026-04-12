@@ -7,8 +7,7 @@ import { MCPManager } from '../mcp/client.js';
 import { LSPManager } from '../lsp/client.js';
 import { Sandbox } from '../sandbox/executor.js';
 import { BuiltInTools } from '../tools/builtin.js';
-import { getArtifactOutputDir, getDesktopPath } from '../utils/path-resolution.js';
-import { extractObsidianVaultPath } from '../core/obsidian-config.js';
+import { getArtifactOutputDir } from '../utils/path-resolution.js';
 import type { BackgroundServiceConnection } from '../core/background-daemon.js';
 
 export async function runBackgroundDaemonService(): Promise<void> {
@@ -31,25 +30,33 @@ export async function runBackgroundDaemonService(): Promise<void> {
 
   await cronManager.initialize();
 
-  const sandboxConfig = config.sandbox || { enabled: true, timeout: 30000 };
-  if (!sandboxConfig.allowedPaths) {
-    sandboxConfig.allowedPaths = [workspace];
-  }
-
   const artifactOutputDir = getArtifactOutputDir({
     workspace,
     appBaseDir: config.appBaseDir,
     artifactOutputDir: config.artifactOutputDir,
     documentOutputDir: config.documentOutputDir,
   });
-  const desktopPath = getDesktopPath();
   const cronStoreDir = cronManager.getStoreDir();
-  const obsidianVaultPath = extractObsidianVaultPath(config);
-  for (const extraPath of [artifactOutputDir, desktopPath, cronStoreDir, obsidianVaultPath].filter(Boolean) as string[]) {
-    if (!sandboxConfig.allowedPaths.includes(extraPath)) {
-      sandboxConfig.allowedPaths.push(extraPath);
-    }
-  }
+  const sandboxConfig = {
+    enabled: config.sandbox?.enabled ?? true,
+    allowedPaths: Array.from(new Set([
+      workspace,
+      artifactOutputDir,
+      cronStoreDir,
+      ...(config.sandbox?.allowedPaths || []),
+    ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0))),
+    deniedPaths: config.sandbox?.deniedPaths,
+    timeout: config.sandbox?.timeout ?? 30000,
+    maxMemory: config.sandbox?.maxMemory,
+    allowCommandExecution: config.sandbox?.allowCommandExecution ?? true,
+    allowBash: config.sandbox?.allowBash ?? (process.platform !== 'win32'),
+    allowPowerShell: config.sandbox?.allowPowerShell ?? (process.platform === 'win32'),
+    commandExecutionMode: config.sandbox?.commandExecutionMode ?? 'shell',
+    commandAllowlist: config.sandbox?.commandAllowlist ?? [],
+    allowNetworkRequests: config.sandbox?.allowNetworkRequests ?? true,
+    allowBrowserOpen: config.sandbox?.allowBrowserOpen ?? true,
+    allowBrowserAutomation: config.sandbox?.allowBrowserAutomation ?? true,
+  };
 
   const sandbox = new Sandbox(sandboxConfig);
   await sandbox.initialize();

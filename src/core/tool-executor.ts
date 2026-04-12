@@ -5,6 +5,7 @@ import type { SkillManager, SkillContext } from './skills.js';
 import type { RegisteredTool } from './tool-registry.js';
 import { normalizeSkillExecutionError } from './skill-execution-error.js';
 import { executeSkillToolWithContext } from './skill-tool-execution.js';
+import { validateToolArgsAgainstSchema } from './tool-schema-validator.js';
 import { sanitizeForUtf8 } from '../utils/unicode.js';
 
 export interface ToolExecutionContext {
@@ -87,6 +88,7 @@ export class ToolExecutor {
       createExecutionErrorBoundaryMiddleware(),
       ...(options.onExecutionEvent ? [createExecutionLifecycleMiddleware(options.onExecutionEvent)] : []),
       ...(options.onAuditRecord ? [createExecutionAuditMiddleware(options.onAuditRecord, options.auditOptions)] : []),
+      createExecutionSchemaValidationMiddleware(),
       ...(options.middlewares ?? []),
     ];
   }
@@ -187,6 +189,21 @@ export class ToolExecutor {
       .join('\n');
   }
 
+}
+
+export function createExecutionSchemaValidationMiddleware(): ToolExecutionMiddleware {
+  return async (context, next) => {
+    const validation = validateToolArgsAgainstSchema(context.tool.input_schema, context.args);
+    if (!validation.valid) {
+      return {
+        tool_call_id: '',
+        output: `Invalid arguments for tool ${context.name}: ${validation.errors.join('; ')}`,
+        is_error: true,
+      };
+    }
+
+    return next(context);
+  };
 }
 
 export function createExecutionLifecycleMiddleware(onEvent: ToolExecutionEventHandler): ToolExecutionMiddleware {

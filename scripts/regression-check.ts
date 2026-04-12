@@ -11,6 +11,7 @@ import { APP_VERSION, buildCliLogo, getFullHelpText, getQuickHelpText, isFullHel
 import { createAgent } from '../src/core/agent.js';
 import { createOllamaVisionService } from '../src/core/ollama-vision-service.js';
 import { createDirectActionRouter } from '../src/core/direct-action-router.js';
+import { buildDirectActionRiskSummary, buildPlanCheckpointRiskText, summarizePlanCheckpointRisks } from '../src/core/checkpoint-risk.js';
 import { IntentResolver } from '../src/core/intent-resolver.js';
 import { BrowserSession, buildChromiumExtensionArgs } from '../src/browser-agent/runtime/browser-session.js';
 import { createContextManager } from '../src/core/context-manager.js';
@@ -29,6 +30,7 @@ import { createToolRegistry } from '../src/core/tool-registry.js';
 import { createMemoryProvider } from '../src/core/memory-provider.js';
 import { BuiltInTools } from '../src/tools/builtin.js';
 import { progressTracker } from '../src/utils/progress.js';
+import { createOutputCoordinator } from '../src/utils/output.js';
 import { getArtifactOutputDir, getDesktopPath, resolveOutputPath, resolveUserPath } from '../src/utils/path-resolution.js';
 import { detectRequestedExportFormat, selectPreferredExportTool } from '../src/core/export-intent.js';
 import { buildFallbackIntentContract } from '../src/core/tool-intent-contract.js';
@@ -330,6 +332,40 @@ async function testPermissionManagerAllowsLarkCliHelpCommands(tempDir: string): 
   assert.equal(await manager.requestPermission('command_execute', 'lark-cli im +messages-send --chat-id oc_xxx --text hi'), false);
 }
 
+function testPermissionManagerParsesTaskScopedBatchAnswer(): void {
+  const manager = new PermissionManager(path.join(os.tmpdir(), 'permission-parse-only'));
+  const taskResult = manager.parsePermissionAnswer('task');
+  assert.equal(taskResult.granted, true);
+  assert.equal(taskResult.batchCurrentTask, true);
+
+  const batchResult = manager.parsePermissionAnswer('batch');
+  assert.equal(batchResult.granted, true);
+  assert.equal(batchResult.batchCurrentTask, true);
+}
+
+function testOutputCoordinatorPausesNonPermissionChannels(): void {
+  const delivered: Array<{ channel: string; text: string }> = [];
+  const coordinator = createOutputCoordinator({
+    write: (entry) => {
+      delivered.push({ channel: entry.channel, text: entry.text });
+    },
+  });
+
+  coordinator.pause('permission:req_1');
+  coordinator.write({ channel: 'process', level: 'info', text: 'process line' });
+  coordinator.write({ channel: 'notification', level: 'warning', text: 'notify line' });
+  coordinator.write({ channel: 'permission', level: 'info', text: 'permission line' });
+
+  assert.deepEqual(delivered, [{ channel: 'permission', text: 'permission line' }]);
+
+  coordinator.resume('permission:req_1');
+  assert.deepEqual(delivered, [
+    { channel: 'permission', text: 'permission line' },
+    { channel: 'process', text: 'process line' },
+    { channel: 'notification', text: 'notify line' },
+  ]);
+}
+
 async function testSandboxAllowedPathNormalization(tempDir: string): Promise<void> {
   const allowedDir = path.join(tempDir, 'sandbox');
   const siblingDir = path.join(tempDir, 'sandbox-other');
@@ -352,6 +388,73 @@ async function testSandboxAllowedPathNormalization(tempDir: string): Promise<voi
   await assert.rejects(
     sandbox.readFile(siblingFile),
     /Path not allowed/,
+  );
+}
+
+async function testSandboxDefaultsToWorkspaceWhitelist(tempDir: string): Promise<void> {
+  const originalCwd = process.cwd();
+  const workspaceDir = path.join(tempDir, 'workspace-default');
+  const outsideDir = path.join(tempDir, 'outside-default');
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(outsideDir, { recursive: true });
+  await fs.writeFile(path.join(workspaceDir, 'inside.txt'), 'inside', 'utf-8');
+  await fs.writeFile(path.join(outsideDir, 'outside.txt'), 'outside', 'utf-8');
+
+  process.chdir(workspaceDir);
+  try {
+    const sandbox = new Sandbox({ enabled: true });
+    await sandbox.initialize();
+    assert.equal(await sandbox.readFile(path.join(workspaceDir, 'inside.txt')), 'inside');
+    await assert.rejects(
+      sandbox.readFile(path.join(outsideDir, 'outside.txt')),
+      /Path not allowed/,
+    );
+  } finally {
+    process.chdir(originalCwd);
+  }
+}
+
+async function testSandboxRejectsCommandCwdOutsideWhitelist(tempDir: string): Promise<void> {
+  const workspaceDir = path.join(tempDir, 'workspace-cwd');
+  const outsideDir = path.join(tempDir, 'outside-cwd');
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(outsideDir, { recursive: true });
+
+  const sandbox = new Sandbox({ enabled: true, allowedPaths: [workspaceDir] });
+  await sandbox.initialize();
+
+  await assert.rejects(
+    sandbox.execute(process.execPath, ['-e', 'console.log("ok")'], { cwd: outsideDir }),
+    /Command cwd not allowed/,
+  );
+}
+
+async function testSandboxHonorsShellCapabilities(tempDir: string): Promise<void> {
+  const workspaceDir = path.join(tempDir, 'workspace-shell-capabilities');
+  await fs.mkdir(workspaceDir, { recursive: true });
+
+  const sandbox = new Sandbox({
+    enabled: true,
+    allowedPaths: [workspaceDir],
+    allowCommandExecution: false,
+    allowBash: false,
+    allowPowerShell: false,
+  });
+  await sandbox.initialize();
+
+  await assert.rejects(
+    sandbox.execute(process.execPath, ['-e', 'console.log("ok")'], { cwd: workspaceDir }),
+    /Command execution is disabled/,
+  );
+
+  await assert.rejects(
+    sandbox.executeBash('echo hi'),
+    /Bash execution is disabled/,
+  );
+
+  await assert.rejects(
+    sandbox.executePowerShell('Write-Output hi'),
+    /PowerShell execution is disabled/,
   );
 }
 
@@ -785,6 +888,89 @@ async function testAgentGraphRunnerDirectAction(): Promise<void> {
   assert.equal(result.graphState.currentNode, 'finalize');
   assert.equal(result.graphState.status, 'completed');
   assert.equal(result.taskRecord?.channel, 'direct_action');
+}
+
+function testPlanCheckpointRiskSummary(): void {
+  const plan = {
+    originalTask: '执行部署并发到飞书',
+    steps: [
+      {
+        id: 'step_1',
+        description: '执行命令并通知飞书',
+        status: 'pending',
+        toolCalls: [
+          { name: 'execute_command', args: { command: 'npm publish' } },
+          { name: 'send_lark_message', args: { chatId: 'oc_xxx', text: 'done' } },
+        ],
+      },
+    ],
+  } as any;
+
+  const summary = summarizePlanCheckpointRisks(plan);
+  const text = buildPlanCheckpointRiskText(plan) || '';
+  assert.equal(summary.hasRiskyActions, true);
+  assert.equal(summary.hasOutboundDelivery, true);
+  assert.match(text, /执行命令/);
+  assert.match(text, /对外发送内容/);
+}
+
+async function testAgentGraphRunnerDirectActionApprovalCheckpoint(): Promise<void> {
+  const agent = createAgent({ llm: new StubLLM() });
+  let executed = 0;
+  const runner = createAgentGraphRunner({
+    agent,
+    checkpoints: {
+      enabled: true,
+      outboundApproval: true,
+      riskyDirectActionApproval: true,
+    },
+    directActionRouter: {
+      async preview() {
+        return {
+          handlerName: 'lark-workflow',
+          category: 'lark-workflow',
+          riskSummary: buildDirectActionRiskSummary('lark-workflow', '把内容发到飞书'),
+        };
+      },
+      async tryHandle() {
+        executed += 1;
+        return {
+          handled: true,
+          title: 'send lark',
+          output: 'sent',
+          category: 'lark-workflow',
+          handlerName: 'lark-workflow',
+        };
+      },
+    } as any,
+  });
+
+  const first = await runner.runTurn({
+    input: '把上面的内容发到飞书',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '把上面的内容发到飞书',
+    },
+  });
+
+  assert.equal(first.graphState.currentNode, 'direct_action');
+  assert.equal(first.graphState.status, 'waiting');
+  assert.equal(agent.getPendingInteractionDetails()?.type, 'direct_action_execution');
+  assert.match(first.output || '', /待确认的 direct action/);
+
+  const second = await runner.runTurn({
+    input: '是',
+    taskBinding: {
+      isFollowUp: false,
+      effectiveInput: '是',
+    },
+    checkpoint: first.checkpoint,
+  });
+
+  assert.equal(second.graphState.currentNode, 'finalize');
+  assert.equal(second.graphState.status, 'completed');
+  assert.equal(second.route, 'direct_action');
+  assert.equal(executed, 1);
 }
 
 async function testAgentGraphRunnerMainChain(): Promise<void> {
@@ -1756,17 +1942,31 @@ async function testUnifiedToolRegistry(tempDir: string): Promise<void> {
   const readResult = await registry.execute('read_file', { path: filePath });
   assert.equal(readResult.output, 'registry read');
 
+  const invalidArgsResult = await registry.execute('read_file', {
+    path: 123 as unknown as string,
+    unexpected: true,
+  } as Record<string, unknown>);
+  assert.equal(invalidArgsResult.is_error, true);
+  assert.match(invalidArgsResult.output || '', /Invalid arguments for tool read_file/);
+  assert.match(invalidArgsResult.output || '', /\$\.path expected string, got number/);
+  assert.match(invalidArgsResult.output || '', /\$\.unexpected is not allowed/);
+
   const skillResult = await registry.execute('hello_world', { name: 'Registry' });
   assert.match(skillResult.output || '', /Hello, Registry!/);
-  assert.equal(auditRecords.length >= 2, true);
+  assert.equal(auditRecords.length >= 3, true);
   assert.equal(auditRecords[0]?.toolName, 'read_file');
   assert.equal(auditRecords[0]?.toolSource, 'builtin');
   assert.equal(auditRecords[0]?.isError, false);
   assert.match(auditRecords[0]?.argsPreview || '', /registry\.txt/);
   assert.match(auditRecords[0]?.outputPreview || '', /registry read/);
-  assert.equal(auditRecords[1]?.toolName, 'hello_world');
-  assert.equal(auditRecords[1]?.toolSource, 'skill');
+  assert.equal(auditRecords[1]?.toolName, 'read_file');
+  assert.equal(auditRecords[1]?.toolSource, 'builtin');
+  assert.equal(auditRecords[1]?.isError, true);
   assert.equal(auditRecords[1]?.status, 'completed');
+  assert.match(auditRecords[1]?.outputPreview || '', /Invalid arguments for tool read_file/);
+  assert.equal(auditRecords[2]?.toolName, 'hello_world');
+  assert.equal(auditRecords[2]?.toolSource, 'skill');
+  assert.equal(auditRecords[2]?.status, 'completed');
 
   const originalExecuteTool = builtInTools.executeTool.bind(builtInTools);
   (builtInTools as any).executeTool = async (name: string, args: Record<string, unknown>) => {
@@ -1779,9 +1979,9 @@ async function testUnifiedToolRegistry(tempDir: string): Promise<void> {
   const builtinFailureResult = await registry.execute('read_file', { path: '__boom__' });
   assert.equal(builtinFailureResult.is_error, true);
   assert.match(builtinFailureResult.output || '', /Built-in tool error: simulated builtin failure/);
-  assert.equal(auditRecords[2]?.toolName, 'read_file');
-  assert.equal(auditRecords[2]?.status, 'threw');
-  assert.equal(auditRecords[2]?.isError, true);
+  assert.equal(auditRecords[3]?.toolName, 'read_file');
+  assert.equal(auditRecords[3]?.status, 'threw');
+  assert.equal(auditRecords[3]?.isError, true);
 
   const permissionAwareRegistry = createToolRegistry({
     builtInTools,
@@ -1836,6 +2036,79 @@ async function testUnifiedToolRegistry(tempDir: string): Promise<void> {
   assert.equal(xlsxResult.is_error, undefined);
   assert.match(xlsxResult.output || '', /Created spreadsheet document:/);
   assert.equal(await extractXlsxText(registryXlsxPath), '列A\t列B\n中文\t123');
+}
+
+async function testBuiltInToolsAllowlistCommandMode(tempDir: string): Promise<void> {
+  const sandbox = new Sandbox({ enabled: true, allowedPaths: [tempDir] });
+  await sandbox.initialize();
+  const tools = new BuiltInTools(sandbox, new LSPManager(), {
+    workspace: tempDir,
+    config: {
+      sandbox: {
+        commandExecutionMode: 'allowlist',
+        commandAllowlist: ['node'],
+      },
+    },
+  });
+
+  const allowed = await tools.executeTool('execute_command', {
+    command: `"${process.execPath}" -e "console.log('ok')"`,
+    timeout: 10000,
+  });
+  assert.equal(allowed.is_error, undefined);
+  assert.match(allowed.output || '', /ok/);
+
+  const blocked = await tools.executeTool('execute_command', {
+    command: 'powershell -NoProfile -Command Get-Date',
+    timeout: 1000,
+  });
+  assert.equal(blocked.is_error, true);
+  assert.match(blocked.output || '', /allowlist/);
+}
+
+async function testBuiltInToolsBrowserNetworkCapabilities(tempDir: string): Promise<void> {
+  const sandbox = new Sandbox({ enabled: true, allowedPaths: [tempDir] });
+  await sandbox.initialize();
+  const tools = new BuiltInTools(sandbox, new LSPManager(), {
+    workspace: tempDir,
+    config: {
+      sandbox: {
+        allowNetworkRequests: false,
+        allowBrowserOpen: false,
+        allowBrowserAutomation: false,
+      },
+    },
+  });
+
+  const network = await tools.executeTool('fetch_url', { url: 'https://example.com' });
+  assert.equal(network.is_error, true);
+  assert.match(network.output || '', /Network requests are disabled by sandbox policy/);
+
+  const browserOpen = await tools.executeTool('open_browser', { url: 'https://example.com' });
+  assert.equal(browserOpen.is_error, true);
+  assert.match(browserOpen.output || '', /Browser open is disabled by sandbox policy/);
+
+  const browserAutomation = await tools.executeTool('browser_automate', { url: 'https://example.com', actions: [] });
+  assert.equal(browserAutomation.is_error, true);
+  assert.match(browserAutomation.output || '', /Browser automation is disabled by sandbox policy/);
+}
+
+async function testConfigDefaultsFavorConservativeExecution(tempDir: string): Promise<void> {
+  const originalConfig = configManager.getAll();
+  const configPath = path.join(tempDir, 'default-config.yaml');
+
+  await fs.writeFile(configPath, '{}\n', 'utf-8');
+  await configManager.loadFromFile(configPath);
+
+  try {
+    assert.equal(configManager.get('maxIterations'), 40);
+    assert.equal(configManager.get('maxToolCallsPerTurn'), 8);
+    assert.equal(configManager.get('autoContinueOnToolLimit'), false);
+    assert.equal(configManager.get('maxContinuationTurns'), 1);
+    assert.equal(configManager.get('checkpoints').continuationApproval, true);
+  } finally {
+    configManager.setAll(originalConfig);
+  }
 }
 
 async function testTaskAndCronTools(tempDir: string): Promise<void> {
@@ -6283,12 +6556,19 @@ async function main(): Promise<void> {
     await runRegressionStep('testPermissionManagerAllowsLarkCliLocatorProbe', () => testPermissionManagerAllowsLarkCliLocatorProbe(tempDir));
     await runRegressionStep('testPermissionManagerAllowsReadOnlyShellCommands', () => testPermissionManagerAllowsReadOnlyShellCommands(tempDir));
     await runRegressionStep('testPermissionManagerAllowsLarkCliHelpCommands', () => testPermissionManagerAllowsLarkCliHelpCommands(tempDir));
+    await runRegressionStep('testPermissionManagerParsesTaskScopedBatchAnswer', () => testPermissionManagerParsesTaskScopedBatchAnswer());
+    await runRegressionStep('testOutputCoordinatorPausesNonPermissionChannels', () => testOutputCoordinatorPausesNonPermissionChannels());
     await runRegressionStep('testSandboxAllowedPathNormalization', () => testSandboxAllowedPathNormalization(tempDir));
+    await runRegressionStep('testSandboxDefaultsToWorkspaceWhitelist', () => testSandboxDefaultsToWorkspaceWhitelist(tempDir));
+    await runRegressionStep('testSandboxRejectsCommandCwdOutsideWhitelist', () => testSandboxRejectsCommandCwdOutsideWhitelist(tempDir));
+    await runRegressionStep('testSandboxHonorsShellCapabilities', () => testSandboxHonorsShellCapabilities(tempDir));
     await runRegressionStep('testPhaseAwareWorkflowLintAndQuickFixes', () => testPhaseAwareWorkflowLintAndQuickFixes(tempDir));
     await runRegressionStep('testSessionTaskStackContextSnapshot', () => testSessionTaskStackContextSnapshot());
     await runRegressionStep('testSessionTaskStackPersistence', () => testSessionTaskStackPersistence(tempDir));
     await runRegressionStep('testTaskContextJsonPayload', () => testTaskContextJsonPayload());
     await runRegressionStep('testAgentGraphRunnerDirectAction', () => testAgentGraphRunnerDirectAction());
+    await runRegressionStep('testPlanCheckpointRiskSummary', () => testPlanCheckpointRiskSummary());
+    await runRegressionStep('testAgentGraphRunnerDirectActionApprovalCheckpoint', () => testAgentGraphRunnerDirectActionApprovalCheckpoint());
     await runRegressionStep('testAgentGraphRunnerMainChain', () => testAgentGraphRunnerMainChain());
     await runRegressionStep('testAgentGraphRunnerAutoConfirmPlanExecutionOption', () => testAgentGraphRunnerAutoConfirmPlanExecutionOption());
     await runRegressionStep('testAgentGraphRunnerCheckpointRestorePlan', () => testAgentGraphRunnerCheckpointRestorePlan());
@@ -6310,6 +6590,9 @@ async function main(): Promise<void> {
     await runRegressionStep('testLearnedSkillCandidateLifecycle', () => testLearnedSkillCandidateLifecycle(tempDir));
     await runRegressionStep('testMemoryManagerResume', () => testMemoryManagerResume(tempDir));
     await runRegressionStep('testUnifiedToolRegistry', () => testUnifiedToolRegistry(tempDir));
+    await runRegressionStep('testBuiltInToolsAllowlistCommandMode', () => testBuiltInToolsAllowlistCommandMode(tempDir));
+    await runRegressionStep('testBuiltInToolsBrowserNetworkCapabilities', () => testBuiltInToolsBrowserNetworkCapabilities(tempDir));
+    await runRegressionStep('testConfigDefaultsFavorConservativeExecution', () => testConfigDefaultsFavorConservativeExecution(tempDir));
     await runRegressionStep('testHybridMemoryProviderRecall', () => testHybridMemoryProviderRecall(tempDir));
     await runRegressionStep('testMemoryProviderBuildsThreeLayerContext', () => testMemoryProviderBuildsThreeLayerContext(tempDir));
     await runRegressionStep('testAgentRuntimeMemoryContextInjection', () => testAgentRuntimeMemoryContextInjection());

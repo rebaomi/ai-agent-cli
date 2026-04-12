@@ -120,7 +120,13 @@ export class Agent {
     this.llm = options.llm;
     const mcpManager = options.mcpManager ?? new MCPManager();
     const lspManager = options.lspManager ?? new LSPManager();
-    const sandbox = options.sandbox ?? new Sandbox({ enabled: true });
+    const sandbox = options.sandbox ?? new Sandbox({
+      enabled: true,
+      allowedPaths: [process.cwd()],
+      allowCommandExecution: true,
+      allowBash: process.platform !== 'win32',
+      allowPowerShell: process.platform === 'win32',
+    });
     let builtInTools: BuiltInTools;
     if (options.builtInTools) {
       builtInTools = options.builtInTools;

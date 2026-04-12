@@ -2,6 +2,7 @@ import type { LLMProviderInterface } from '../llm/types.js';
 import type { Plan, Planner } from './planner.js';
 import type { PendingInteraction } from './agent-interaction-service.js';
 import type { IntentResolver } from './intent-resolver.js';
+import { buildPlanCheckpointRiskText } from './checkpoint-risk.js';
 import { resolveKnownWebsiteUrl } from './site-aliases.js';
 
 export interface AgentPlanningServiceOptions {
@@ -186,6 +187,10 @@ export class AgentPlanningService {
       if (step) {
         summary += `${index + 1}. ${step.description}\n`;
       }
+    }
+    const riskText = buildPlanCheckpointRiskText(plan);
+    if (riskText) {
+      summary += `\n${riskText}\n`;
     }
     summary += '\n请确认是否执行上述计划（回复 "是" 或 "否"）。如果你还想补充输出目录、权限范围、约束或验收标准，也可以直接继续说，我会据此重规划。';
     return summary;

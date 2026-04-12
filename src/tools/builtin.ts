@@ -115,6 +115,65 @@ export class BuiltInTools {
   private resolveOutputFilePath(filePath: string): string {
     return resolveOutputPath(filePath, this.getPathResolutionOptions());
   }
+  private getSandboxPolicy(): AgentConfig['sandbox'] {
+    const config = this.config && typeof this.config === 'object' ? this.config as unknown as AgentConfig : undefined;
+    return config?.sandbox;
+  }
+  
+  private ensureCapability(enabled: boolean | undefined, message: string): void {
+    if (enabled === false) {
+      throw new Error(message);
+    }
+  }
+  
+  private parseCommandTokens(command: string): string[] {
+    const tokens = command.match(/"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+/g) || [];
+    return tokens.map((token) => token.replace(/^['"]|['"]$/g, ''));
+  }
+  
+  private containsShellMetacharacters(command: string): boolean {
+    return /[|&;<>`$()]/.test(command);
+  }
+  
+  private normalizeExecutableName(executable: string): string {
+    return path.basename(executable).replace(/\.(exe|cmd|bat|ps1)$/i, '').toLowerCase();
+  }
+  
+  private async executeConfiguredCommand(command: string, timeout?: number): Promise<string> {
+    const policy = this.getSandboxPolicy();
+    const mode = policy?.commandExecutionMode || 'shell';
+    const cwd = this.getCurrentCronJobWorkDir() || this.workspace || process.cwd();
+    await fs.mkdir(cwd, { recursive: true });
+    
+    if (mode === 'shell') {
+      const isWindows = process.platform === 'win32';
+      const execResult = isWindows
+        ? await this.sandbox.execute('powershell', ['-NoProfile', '-Command', command], { cwd, timeout })
+        : await this.sandbox.execute('bash', ['-lc', command], { cwd, timeout });
+      return `Exit code: ${execResult.exitCode}\n\nStdout:\n${execResult.stdout}\n\nStderr:\n${execResult.stderr}`;
+    }
+    
+    if (this.containsShellMetacharacters(command)) {
+      throw new Error(`execute_command 当前配置为 ${mode}，不允许 shell 元字符。请改为显式可执行文件和参数。`);
+    }
+    
+    const tokens = this.parseCommandTokens(command);
+    const executable = tokens[0];
+    if (!executable) {
+      throw new Error('execute_command 缺少可执行程序。');
+    }
+    
+    if (mode === 'allowlist') {
+      const allowlist = (policy?.commandAllowlist || []).map((item) => item.trim().toLowerCase()).filter(Boolean);
+      const normalized = this.normalizeExecutableName(executable);
+      if (allowlist.length === 0 || !allowlist.includes(normalized)) {
+        throw new Error(`execute_command 当前只允许命令白名单。${normalized} 不在 allowlist 中。`);
+      }
+    }
+    
+    const execResult = await this.sandbox.execute(executable, tokens.slice(1), { cwd, timeout });
+    return `Exit code: ${execResult.exitCode}\n\nStdout:\n${execResult.stdout}\n\nStderr:\n${execResult.stderr}`;
+  }
 
   private isStructuredDocumentExtension(filePath: string): boolean {
     return /\.(docx|pdf|xlsx|pptx)$/i.test(filePath);
@@ -1383,13 +1442,7 @@ export class BuiltInTools {
 
         case 'execute_command': {
           const { command, timeout } = args as { command: string; timeout?: number };
-          const isWindows = process.platform === 'win32';
-          const cwd = this.getCurrentCronJobWorkDir() || process.cwd();
-          await fs.mkdir(cwd, { recursive: true });
-          const execResult = isWindows
-            ? await this.sandbox.execute('powershell', ['-NoProfile', '-Command', command], { cwd, timeout })
-            : await this.sandbox.execute('bash', ['-lc', command], { cwd, timeout });
-          result = `Exit code: ${execResult.exitCode}\n\nStdout:\n${execResult.stdout}\n\nStderr:\n${execResult.stderr}`;
+          result = await this.executeConfiguredCommand(command, timeout);
           break;
         }
 
@@ -1478,18 +1531,21 @@ export class BuiltInTools {
         }
 
         case 'web_search': {
+          this.ensureCapability(this.getSandboxPolicy()?.allowNetworkRequests, 'Network requests are disabled by sandbox policy');
           const { query, numResults } = args as { query: string; numResults?: number };
           result = await this.webSearch(query, numResults ?? 5);
           break;
         }
 
         case 'fetch_url': {
+          this.ensureCapability(this.getSandboxPolicy()?.allowNetworkRequests, 'Network requests are disabled by sandbox policy');
           const { url, maxLength } = args as { url: string; maxLength?: number };
           result = await this.fetchUrl(url, maxLength ?? 10000);
           break;
         }
 
         case 'open_browser': {
+          this.ensureCapability(this.getSandboxPolicy()?.allowBrowserOpen, 'Browser open is disabled by sandbox policy');
           const { url, background, browser } = args as { url: string; background?: boolean; browser?: BrowserTarget | 'default' };
           result = await this.openBrowser(url, background ?? false, browser ?? 'default');
           break;
@@ -1502,6 +1558,7 @@ export class BuiltInTools {
         }
 
         case 'browser_automate': {
+          this.ensureCapability(this.getSandboxPolicy()?.allowBrowserAutomation, 'Browser automation is disabled by sandbox policy');
           const { url, actions, headless, keepOpen, timeoutMs, browser } = args as {
             url: string;
             actions?: BrowserAutomationAction[];
@@ -1515,6 +1572,7 @@ export class BuiltInTools {
         }
 
         case 'browser_agent_run': {
+          this.ensureCapability(this.getSandboxPolicy()?.allowBrowserAutomation, 'Browser automation is disabled by sandbox policy');
           const { goal, startUrl, maxSteps, workflow } = args as { goal: string; startUrl?: string; maxSteps?: number; workflow?: string };
           directResult = await this.browserAgentRun(goal, startUrl, maxSteps, workflow);
           break;

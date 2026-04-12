@@ -1,6 +1,14 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import type { AgentGraphCheckpoint, SessionTaskChannel, SessionTaskRecord, SessionTaskStatus } from '../types/index.js';
+import type {
+  AgentGraphCheckpoint,
+  ContextBusState,
+  SessionTaskBindingRelation,
+  SessionTaskChannel,
+  SessionTaskContextSnapshot,
+  SessionTaskRecord,
+  SessionTaskStatus,
+} from '../types/index.js';
 
 export interface SessionTaskBinding {
   isFollowUp: boolean;
@@ -19,30 +27,17 @@ export interface SessionTaskRecordInput {
   metadata?: Record<string, unknown>;
 }
 
-export interface SessionTaskBindingRelation {
-  sourceTask: SessionTaskRecord;
-  targetTask?: SessionTaskRecord;
-  targetTaskId: string;
-  targetTaskTitle?: string;
-}
-
-export interface SessionTaskContextSnapshot {
-  activeTask?: SessionTaskRecord;
-  bindableTask?: SessionTaskRecord;
-  recentTasks: SessionTaskRecord[];
-  recentBindings: SessionTaskBindingRelation[];
-  checkpoint?: AgentGraphCheckpoint;
-}
-
 interface PersistedSessionTaskStack {
-  version: '1.1';
+  version: '1.1' | '1.2';
   records: SessionTaskRecord[];
   checkpoint?: AgentGraphCheckpoint;
+  contextBus?: ContextBusState;
 }
 
 export class SessionTaskStackManager {
   private readonly records: SessionTaskRecord[] = [];
   private checkpoint?: AgentGraphCheckpoint;
+  private contextBusState?: ContextBusState;
 
   constructor(private readonly maxRecords = 12) {}
 
@@ -129,6 +124,14 @@ export class SessionTaskStackManager {
     this.checkpoint = checkpoint;
   }
 
+  getContextBusState(): ContextBusState | undefined {
+    return this.contextBusState;
+  }
+
+  setContextBusState(state?: ContextBusState): void {
+    this.contextBusState = state;
+  }
+
   async loadFromFile(filePath: string): Promise<void> {
     try {
       const raw = await fs.readFile(filePath, 'utf-8');
@@ -141,6 +144,7 @@ export class SessionTaskStackManager {
       this.records.length = 0;
       this.records.push(...parsed.records.filter(isSessionTaskRecord).slice(0, this.maxRecords));
       this.checkpoint = isAgentGraphCheckpoint(parsed.checkpoint) ? parsed.checkpoint : undefined;
+      this.contextBusState = isContextBusState(parsed.contextBus) ? parsed.contextBus : undefined;
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
         this.clear();
@@ -153,9 +157,10 @@ export class SessionTaskStackManager {
   async saveToFile(filePath: string): Promise<void> {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     const payload: PersistedSessionTaskStack = {
-      version: '1.1',
+      version: '1.2',
       records: this.listTasks(),
       checkpoint: this.checkpoint,
+      contextBus: this.contextBusState,
     };
     await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf-8');
   }
@@ -163,6 +168,7 @@ export class SessionTaskStackManager {
   clear(): void {
     this.records.length = 0;
     this.checkpoint = undefined;
+    this.contextBusState = undefined;
   }
 
   private findBindableTask(input: string): SessionTaskRecord | undefined {
@@ -251,4 +257,15 @@ function isAgentGraphCheckpoint(value: unknown): value is AgentGraphCheckpoint {
   return typeof checkpoint.node === 'string'
     && typeof checkpoint.status === 'string'
     && typeof checkpoint.updatedAt === 'string';
+}
+
+function isContextBusState(value: unknown): value is ContextBusState {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const state = value as Record<string, unknown>;
+  return typeof state.schemaVersion === 'string'
+    && Array.isArray(state.snapshots)
+    && Array.isArray(state.currentPointers);
 }

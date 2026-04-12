@@ -3,6 +3,7 @@ export { configManager } from './core/config.js';
 export { Agent, createAgent } from './core/agent.js';
 export { MemoryManager, createMemoryManager } from './core/memory.js';
 export { SkillManager, createSkillManager } from './core/skills.js';
+export { ContextBus } from './core/context-bus.js';
 export { OllamaClient, createOllamaClient } from './ollama/client.js';
 export { MCPClient, MCPManager, createMCPManager } from './mcp/client.js';
 export { LSPClient, LSPManager, createLSPManager } from './lsp/client.js';

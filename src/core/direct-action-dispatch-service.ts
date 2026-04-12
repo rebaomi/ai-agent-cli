@@ -1,4 +1,6 @@
 import type { DirectActionResult } from './direct-action-router.js';
+import type { DirectActionRiskSummary } from './checkpoint-risk.js';
+import { buildDirectActionRiskSummary } from './checkpoint-risk.js';
 import type { DirectActionHandler } from './direct-actions/request-handler.js';
 import type { ResolvedIntent } from './intent-resolver.js';
 import type { SessionTaskRecord } from '../types/index.js';
@@ -12,6 +14,12 @@ export interface DirectActionDispatchInput {
 
 export interface DirectActionDispatchContext extends DirectActionDispatchInput {
   intent?: ResolvedIntent;
+}
+
+export interface DirectActionDispatchPreview {
+  handlerName: string;
+  category: string;
+  riskSummary: DirectActionRiskSummary;
 }
 
 export interface DirectActionDispatchServiceOptions {
@@ -28,7 +36,44 @@ export interface DirectActionDispatchServiceOptions {
 export class DirectActionDispatchService {
   constructor(private readonly options: DirectActionDispatchServiceOptions) {}
 
+  async preview(input: DirectActionDispatchInput): Promise<DirectActionDispatchPreview | null> {
+    const resolution = await this.resolveHandler(input);
+    if (!resolution) {
+      return null;
+    }
+
+    return {
+      handlerName: resolution.handler.name,
+      category: resolution.handler.name,
+      riskSummary: buildDirectActionRiskSummary(resolution.handler.name, resolution.context.originalInput),
+    };
+  }
+
   async tryHandle(input: DirectActionDispatchInput): Promise<DirectActionResult | null> {
+    const resolution = await this.resolveHandler(input);
+    if (!resolution) {
+      return this.options.tryLegacyFallbacks(input.effectiveInput.trim());
+    }
+
+    const { context, handler } = resolution;
+    const preamble = this.buildConversationPreamble(handler.name, context);
+      if (preamble) {
+        await this.options.onConversationPreamble?.(preamble);
+      }
+
+    const result = await handler.handle(context.effectiveInput, context.intent, context);
+    if (result) {
+      return {
+        ...result,
+        handlerName: result.handlerName || handler.name,
+        category: result.category || handler.name,
+      };
+    }
+
+    return this.options.tryLegacyFallbacks(context.effectiveInput);
+  }
+
+  private async resolveHandler(input: DirectActionDispatchInput): Promise<{ handler: DirectActionHandler; context: DirectActionDispatchContext } | null> {
     const trimmed = input.effectiveInput.trim();
     if (!trimmed) {
       return null;
@@ -46,22 +91,10 @@ export class DirectActionDispatchService {
         continue;
       }
 
-      const preamble = this.buildConversationPreamble(handler.name, context);
-      if (preamble) {
-        await this.options.onConversationPreamble?.(preamble);
-      }
-
-      const result = await handler.handle(trimmed, intent, context);
-      if (result) {
-        return {
-          ...result,
-          handlerName: result.handlerName || handler.name,
-          category: result.category || handler.name,
-        };
-      }
+      return { handler, context };
     }
 
-    return this.options.tryLegacyFallbacks(trimmed);
+    return null;
   }
 
   private buildConversationPreamble(handlerName: string, context: DirectActionDispatchContext): string | null {

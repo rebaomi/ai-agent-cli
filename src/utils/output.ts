@@ -1,5 +1,24 @@
 import chalk from 'chalk';
 
+export type OutputLevel = 'debug' | 'info' | 'warning' | 'error';
+export type OutputChannel = 'process' | 'notification' | 'permission';
+
+export interface OutputChannelPolicy {
+  enabled?: boolean;
+  minLevel?: OutputLevel;
+}
+
+export interface OutputCoordinatorEntry {
+  channel: OutputChannel;
+  level: OutputLevel;
+  text: string;
+}
+
+export interface OutputCoordinatorOptions {
+  getPolicy?: (channel: OutputChannel) => OutputChannelPolicy | undefined;
+  write: (entry: OutputCoordinatorEntry) => void;
+}
+
 export interface StreamOptions {
   prefix?: string;
   color?: 'cyan' | 'green' | 'yellow' | 'red' | 'blue' | 'magenta';
@@ -71,8 +90,75 @@ export class StreamingOutput {
   }
 }
 
+export class OutputCoordinator {
+  private readonly queued: OutputCoordinatorEntry[] = [];
+  private readonly pauseTokens = new Set<string>();
+
+  constructor(private readonly options: OutputCoordinatorOptions) {}
+
+  write(entry: OutputCoordinatorEntry): void {
+    if (!entry.text.trim()) {
+      return;
+    }
+
+    if (!this.shouldDeliver(entry)) {
+      return;
+    }
+
+    if (this.pauseTokens.size > 0 && entry.channel !== 'permission') {
+      this.queued.push(entry);
+      return;
+    }
+
+    this.options.write(entry);
+  }
+
+  pause(token: string): void {
+    this.pauseTokens.add(token);
+  }
+
+  resume(token: string): void {
+    this.pauseTokens.delete(token);
+    if (this.pauseTokens.size === 0) {
+      this.flush();
+    }
+  }
+
+  isPaused(): boolean {
+    return this.pauseTokens.size > 0;
+  }
+
+  flush(): void {
+    while (this.pauseTokens.size === 0 && this.queued.length > 0) {
+      const next = this.queued.shift();
+      if (next) {
+        this.options.write(next);
+      }
+    }
+  }
+
+  clear(): void {
+    this.queued.length = 0;
+    this.pauseTokens.clear();
+  }
+
+  private shouldDeliver(entry: OutputCoordinatorEntry): boolean {
+    const policy = this.options.getPolicy?.(entry.channel);
+    if (policy?.enabled === false) {
+      return false;
+    }
+
+    const minLevel = policy?.minLevel || 'info';
+    return compareOutputLevel(entry.level, minLevel) >= 0;
+  }
+}
+
 export function createStreamingOutput(options?: StreamOptions): StreamingOutput {
   return new StreamingOutput(options);
+}
+
+export function createOutputCoordinator(options: OutputCoordinatorOptions): OutputCoordinator {
+  return new OutputCoordinator(options);
 }
 
 export function printSuccess(message: string): void {
@@ -99,4 +185,21 @@ export async function printTypingEffect(text: string, speed = 15): Promise<void>
     }
   }
   console.log();
+}
+
+function compareOutputLevel(left: OutputLevel, right: OutputLevel): number {
+  return getOutputLevelWeight(left) - getOutputLevelWeight(right);
+}
+
+function getOutputLevelWeight(level: OutputLevel): number {
+  switch (level) {
+    case 'debug':
+      return 10;
+    case 'info':
+      return 20;
+    case 'warning':
+      return 30;
+    case 'error':
+      return 40;
+  }
 }

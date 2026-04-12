@@ -11,14 +11,20 @@ export class Sandbox {
   private timeout: number;
   private maxMemory?: number;
   private tempDir: string;
+  private allowCommandExecution: boolean;
+  private allowBash: boolean;
+  private allowPowerShell: boolean;
 
   constructor(config: SandboxConfig = { enabled: true }) {
     this.enabled = config.enabled ?? true;
-    this.allowedPaths = config.allowedPaths ?? [];
+    this.tempDir = path.join(os.tmpdir(), 'ai-agent-sandbox');
+    this.allowedPaths = this.buildAllowedPaths(config.allowedPaths);
     this.deniedPaths = config.deniedPaths ?? ['/etc', '/sys', '/root', '/proc', 'C:\\Windows', 'C:\\Program Files'];
     this.timeout = config.timeout ?? 30000;
     this.maxMemory = config.maxMemory;
-    this.tempDir = path.join(os.tmpdir(), 'ai-agent-sandbox');
+    this.allowCommandExecution = config.allowCommandExecution ?? true;
+    this.allowBash = config.allowBash ?? (process.platform !== 'win32');
+    this.allowPowerShell = config.allowPowerShell ?? (process.platform === 'win32');
   }
 
   async initialize(): Promise<void> {
@@ -59,7 +65,7 @@ export class Sandbox {
     }
 
     if (this.allowedPaths.length === 0) {
-      return true;
+      return false;
     }
 
     for (const allowed of this.allowedPaths) {
@@ -136,9 +142,19 @@ export class Sandbox {
     args: string[] = [],
     options: { cwd?: string; env?: Record<string, string>; timeout?: number } = {}
   ): Promise<ExecuteResult> {
+    if (this.enabled && !this.allowCommandExecution) {
+      throw new Error('Command execution is disabled by sandbox policy');
+    }
+
     const startTime = Date.now();
     const cwd = options.cwd ?? process.cwd();
     const timeoutMs = options.timeout === undefined ? this.timeout : options.timeout;
+
+    if (this.enabled && !this.isPathAllowed(cwd)) {
+      const resolved = this.normalizeComparisonPath(cwd);
+      const allowedList = this.allowedPaths.map(p => this.normalizeComparisonPath(p));
+      throw new Error(`Command cwd not allowed: ${cwd}\nResolved: ${resolved}\nAllowed: ${allowedList.join(', ')}`);
+    }
 
     return new Promise((resolve) => {
       const child = spawn(command, args, {
@@ -200,11 +216,19 @@ export class Sandbox {
   }
 
   async executeBash(script: string): Promise<ExecuteResult> {
-    return this.execute('bash', ['-c', script], { cwd: this.allowedPaths[0] });
+    if (this.enabled && !this.allowBash) {
+      throw new Error('Bash execution is disabled by sandbox policy');
+    }
+
+    return this.execute('bash', ['-c', script], { cwd: this.getPreferredExecutionCwd() });
   }
 
   async executePowerShell(script: string): Promise<ExecuteResult> {
-    return this.execute('powershell', ['-Command', script]);
+    if (this.enabled && !this.allowPowerShell) {
+      throw new Error('PowerShell execution is disabled by sandbox policy');
+    }
+
+    return this.execute('powershell', ['-Command', script], { cwd: this.getPreferredExecutionCwd() });
   }
 
   async executePython(script: string): Promise<ExecuteResult> {
@@ -228,9 +252,14 @@ export class Sandbox {
   }
 
   addAllowedPath(allowedPath: string): void {
-    if (!this.allowedPaths.includes(allowedPath)) {
-      this.allowedPaths.push(allowedPath);
+    const normalized = path.resolve(allowedPath);
+    if (!this.allowedPaths.includes(normalized)) {
+      this.allowedPaths.push(normalized);
     }
+  }
+
+  getAllowedPaths(): string[] {
+    return [...this.allowedPaths];
   }
 
   async cleanup(): Promise<void> {
@@ -241,6 +270,27 @@ export class Sandbox {
     } catch {
       // Ignore cleanup errors
     }
+  }
+
+  private buildAllowedPaths(configuredAllowedPaths?: string[]): string[] {
+    const defaults = configuredAllowedPaths && configuredAllowedPaths.length > 0
+      ? configuredAllowedPaths
+      : [process.cwd()];
+    const unique = new Set<string>();
+    for (const allowedPath of [...defaults, this.tempDir]) {
+      unique.add(path.resolve(allowedPath));
+    }
+    return Array.from(unique);
+  }
+
+  private getPreferredExecutionCwd(): string {
+    for (const candidate of this.allowedPaths) {
+      if (candidate !== this.tempDir) {
+        return candidate;
+      }
+    }
+
+    return this.tempDir;
   }
 }
 

@@ -88,6 +88,8 @@ export interface DirectActionConfig {
   conversationMode?: DirectActionConversationModeConfig;
 }
 
+export type CommandExecutionMode = 'shell' | 'direct-only' | 'allowlist';
+
 export type AgentInteractionMode = 'auto' | 'chat' | 'task';
 export type FunctionMode = 'chat' | 'workflow';
 
@@ -105,6 +107,7 @@ export interface FunctionRoutingConfig {
 
 export const TASK_CONTEXT_SCHEMA_VERSION = 'task-context/v1' as const;
 export const AGENT_GRAPH_STATE_SCHEMA_VERSION = 'agent-graph-state/v1' as const;
+export const CONTEXT_BUS_SCHEMA_VERSION = 'context-bus/v1' as const;
 
 export type AgentGraphNode = 'direct_action' | 'clarify' | 'plan' | 'execute_step' | 'pause_for_input' | 'resume' | 'finalize';
 export type AgentCheckpointStatus = 'running' | 'waiting' | 'completed' | 'failed';
@@ -127,7 +130,7 @@ export interface AgentTaskBindingSnapshot {
 }
 
 export interface AgentPendingInteractionSnapshot {
-  type: 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume';
+  type: 'plan_execution' | 'write_file' | 'task_clarification' | 'plan_resume' | 'direct_action_execution';
   prompt?: string;
   originalTask?: string;
   hasPlan: boolean;
@@ -189,6 +192,68 @@ export interface SessionTaskRecord {
   metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SessionTaskBindingRelation {
+  sourceTask: SessionTaskRecord;
+  targetTask?: SessionTaskRecord;
+  targetTaskId: string;
+  targetTaskTitle?: string;
+}
+
+export interface SessionTaskContextSnapshot {
+  activeTask?: SessionTaskRecord;
+  bindableTask?: SessionTaskRecord;
+  recentTasks: SessionTaskRecord[];
+  recentBindings: SessionTaskBindingRelation[];
+  checkpoint?: AgentGraphCheckpoint;
+}
+
+export type ContextBusLayer = 'session' | 'task_stack' | 'graph' | 'agent' | 'cli';
+
+export interface ContextBusSnapshotPayload {
+  taskContext?: SessionTaskContextSnapshot;
+  graphState?: AgentGraphState;
+  agentState?: UnifiedAgentState;
+  checkpoint?: AgentGraphCheckpoint;
+  runtimeMemoryContext?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ContextBusSnapshot {
+  id: string;
+  layer: ContextBusLayer;
+  scopeId: string;
+  rootId: string;
+  parentId?: string;
+  taskId?: string;
+  externalKey?: string;
+  title?: string;
+  payload: ContextBusSnapshotPayload;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ContextBusCurrentPointer {
+  layer: ContextBusLayer;
+  scopeId: string;
+  snapshotId: string;
+}
+
+export interface ContextBusState {
+  schemaVersion: typeof CONTEXT_BUS_SCHEMA_VERSION;
+  snapshots: ContextBusSnapshot[];
+  currentPointers: ContextBusCurrentPointer[];
+}
+
+export interface ContextBusQuery {
+  layer?: ContextBusLayer | ContextBusLayer[];
+  scopeId?: string;
+  rootId?: string;
+  parentId?: string;
+  taskId?: string;
+  text?: string;
+  limit?: number;
 }
 
 export interface BrowserAgentObserveConfig {
@@ -316,6 +381,30 @@ export interface NotificationsConfig {
   };
 }
 
+export interface WorkflowCheckpointConfig {
+  enabled?: boolean;
+  planApproval?: boolean;
+  continuationApproval?: boolean;
+  outboundApproval?: boolean;
+  riskyDirectActionApproval?: boolean;
+  announceCheckpoints?: boolean;
+}
+
+export type OutputChannelLevel = 'debug' | 'info' | 'warning' | 'error';
+
+export interface OutputChannelConfig {
+  enabled?: boolean;
+  minLevel?: OutputChannelLevel;
+}
+
+export interface OutputConfig {
+  pauseOnPermissionPrompt?: boolean;
+  separateChannels?: boolean;
+  process?: OutputChannelConfig;
+  notification?: OutputChannelConfig;
+  permission?: OutputChannelConfig;
+}
+
 export interface AgentConfig {
   defaultProvider?: string;
   ollama: LLMConfig;
@@ -347,6 +436,8 @@ export interface AgentConfig {
   maxContinuationTurns?: number;
   toolTimeout?: number;
   notifications?: NotificationsConfig;
+  checkpoints?: WorkflowCheckpointConfig;
+  output?: OutputConfig;
 }
 
 export interface MCPConfig {
@@ -383,6 +474,14 @@ export interface SandboxConfig {
   deniedPaths?: string[];
   timeout?: number;
   maxMemory?: number;
+  allowCommandExecution?: boolean;
+  allowBash?: boolean;
+  allowPowerShell?: boolean;
+  commandExecutionMode?: CommandExecutionMode;
+  commandAllowlist?: string[];
+  allowNetworkRequests?: boolean;
+  allowBrowserOpen?: boolean;
+  allowBrowserAutomation?: boolean;
 }
 
 export interface FileEdit {
